@@ -187,10 +187,15 @@ func getNginxConfigFromVersion() (string, error) {
 // getCommonNginxPaths 获取常见的 Nginx 配置路径
 func getCommonNginxPaths() []string {
 	if runtime.GOOS == "windows" {
-		return []string{
+		paths := []string{
 			`C:\nginx\conf\nginx.conf`,
 			`C:\Program Files\nginx\conf\nginx.conf`,
 		}
+		// phpStudy
+		if matches, _ := filepath.Glob(`C:\phpstudy_pro\Extensions\Nginx*\conf\nginx.conf`); len(matches) > 0 {
+			paths = append(paths, matches...)
+		}
+		return paths
 	}
 	return []string{
 		"/etc/nginx/nginx.conf",
@@ -840,6 +845,10 @@ func findNginxBinary() string {
 			`C:\nginx\nginx.exe`,
 			`C:\Program Files\nginx\nginx.exe`,
 			`C:\Program Files (x86)\nginx\nginx.exe`,
+		}
+		// phpStudy
+		if matches, _ := filepath.Glob(`C:\phpstudy_pro\Extensions\Nginx*\nginx.exe`); len(matches) > 0 {
+			paths = append(paths, matches...)
 		}
 	} else {
 		paths = []string{

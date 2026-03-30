@@ -29,6 +29,12 @@ param(
 #Requires -RunAsAdministrator
 $ErrorActionPreference = "Stop"
 
+# 兼容 Linux 风格 --flag 参数（PowerShell 可能将 --dev 等误解析为 $Version 值）
+if ($Version -eq "--dev") { $Dev = [switch]::new($true); $Version = "" }
+if ($Version -eq "--stable") { $Stable = [switch]::new($true); $Version = "" }
+if ($Version -eq "--force") { $Force = [switch]::new($true); $Version = "" }
+if ($Version -eq "--help") { $Help = [switch]::new($true); $Version = "" }
+
 # 强制启用 TLS 1.2（PowerShell 5.1 默认仅 SSL3/TLS 1.0，无法连接现代 HTTPS 服务）
 try {
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
@@ -87,7 +93,7 @@ if ($Help) {
     Write-Host ""
     Write-Host "示例:"
     Write-Host "  .\install.ps1 -ReleaseHost release.example.com              # 安装最新稳定版"
-    Write-Host "  .\install.ps1 -ReleaseHost release.example.com -Dev         # 安装最新测试版"
+    Write-Host "  .\install.ps1 -ReleaseHost release.example.com -Dev         # 安装最新测试版（或 --dev）"
     Write-Host "  .\install.ps1 -ReleaseHost release.example.com -Version 1.0.0  # 安装指定版本"
     Write-Host "  .\install.ps1 -ReleaseHost cdn.example.com/mirror           # 多层目录"
     Write-Host ""
@@ -176,18 +182,18 @@ function Get-TargetVersion {
         }
 
         if ($UseDev) {
-            $targetVersion = $releaseInfo.latest_dev
             $channel = "dev"
+            $targetVersion = $releaseInfo.$channel.latest
         } elseif ($UseStable) {
-            $targetVersion = $releaseInfo.latest_main
             $channel = "main"
+            $targetVersion = $releaseInfo.$channel.latest
         } else {
             # 默认：优先 main
-            $targetVersion = $releaseInfo.latest_main
             $channel = "main"
+            $targetVersion = $releaseInfo.$channel.latest
             if (-not $targetVersion) {
-                $targetVersion = $releaseInfo.latest_dev
                 $channel = "dev"
+                $targetVersion = $releaseInfo.$channel.latest
             }
         }
     }
@@ -197,7 +203,7 @@ function Get-TargetVersion {
     }
 
     return @{
-        Version     = $targetVersion
+        Version     = Normalize-Version $targetVersion
         Channel     = $channel
         ReleaseInfo = $releaseInfo
     }
@@ -350,11 +356,16 @@ if (-not $downloaded) {
 $expectedChecksum = ""
 if ($releaseInfo) {
     try {
-        $versions = $releaseInfo.versions
-        if ($versions -and $versions.$TargetVersion) {
-            $checksums = $versions.$TargetVersion.checksums
-            if ($checksums -and $checksums.$Filename) {
-                $expectedChecksum = $checksums.$Filename
+        $channelData = $releaseInfo.$Channel
+        if ($channelData -and $channelData.versions) {
+            $versionNoV = $TargetVersion -replace '^v', ''
+            foreach ($v in $channelData.versions) {
+                if ($v.version -eq $versionNoV) {
+                    if ($v.checksums -and $v.checksums.$Filename) {
+                        $expectedChecksum = $v.checksums.$Filename
+                    }
+                    break
+                }
             }
         }
     } catch {}

@@ -178,11 +178,18 @@ func getApacheConfigFromCommand(cmdName string) (string, string, error) {
 // getCommonApachePaths 获取常见的 Apache 配置路径
 func getCommonApachePaths() []apacheConfig {
 	if runtime.GOOS == "windows" {
-		return []apacheConfig{
+		paths := []apacheConfig{
 			{`C:\Apache24\conf\httpd.conf`, `C:\Apache24`},
 			{`C:\Apache\conf\httpd.conf`, `C:\Apache`},
 			{`C:\Program Files\Apache24\conf\httpd.conf`, `C:\Program Files\Apache24`},
 		}
+		// phpStudy（路径含版本号，需 glob 匹配）
+		matches, _ := filepath.Glob(`C:\phpstudy_pro\Extensions\Apache*\conf\httpd.conf`)
+		for _, m := range matches {
+			root := filepath.Dir(filepath.Dir(m))
+			paths = append(paths, apacheConfig{m, root})
+		}
+		return paths
 	}
 	return []apacheConfig{
 		// Debian/Ubuntu
@@ -751,6 +758,10 @@ func findApacheBinary() string {
 			`C:\Program Files\Apache24\bin\httpd.exe`,
 			`C:\Program Files (x86)\Apache24\bin\httpd.exe`,
 			`C:\xampp\apache\bin\httpd.exe`,
+		}
+		// phpStudy
+		if matches, _ := filepath.Glob(`C:\phpstudy_pro\Extensions\Apache*\bin\httpd.exe`); len(matches) > 0 {
+			paths = append(paths, matches...)
 		}
 	} else {
 		paths = []string{

@@ -125,11 +125,13 @@ func Run(args []string, version, buildTime string, debug bool) {
 }
 
 // nextRandomDaily 计算到明天随机时刻的延迟
-// 在明天 00:00~23:59 之间随机选择一个时间点，最短不低于 1 小时
+// 在明天 09:00~23:59 之间随机选择一个时间点，最短不低于 1 小时
+// 避开 0:00~8:59：服务端 0:00~7:59 执行续签，预留 1 小时签发时间
 func nextRandomDaily() time.Duration {
 	now := time.Now()
+	hour := 9 + rand.IntN(15) // 9~23
 	tomorrow := time.Date(now.Year(), now.Month(), now.Day()+1,
-		rand.IntN(24), rand.IntN(60), 0, 0, now.Location())
+		hour, rand.IntN(60), 0, 0, now.Location())
 	delay := tomorrow.Sub(now)
 	if delay < time.Hour {
 		delay += 24 * time.Hour
@@ -155,12 +157,34 @@ func calcCheckTimeout(certCount int) time.Duration {
 }
 
 // checkAndDeploy 检查并部署证书
+// 使用文件锁防止多进程同时执行续签
 func checkAndDeploy(parentCtx context.Context, svc *certops.Service, cfgManager *config.ConfigManager, log *logger.Logger) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Error("检查任务 panic: %v", r)
 		}
 	}()
+
+	// 进程级文件锁：防止 cron 重叠、手动与 daemon 并发
+	lockPath := filepath.Join(cfgManager.GetWorkDir(), "renewal.lock")
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		log.Warn("创建锁文件失败: %v，继续执行", err)
+	} else {
+		locked, lockErr := config.TryLockFile(lockFile)
+		if lockErr != nil {
+			_ = lockFile.Close()
+			log.Warn("获取文件锁失败: %v，继续执行", lockErr)
+		} else if !locked {
+			_ = lockFile.Close()
+			log.Info("另一个续签进程正在运行，跳过本次检查")
+			return
+		} else {
+			defer func() {
+				_ = lockFile.Close() // 关闭文件自动释放锁
+			}()
+		}
+	}
 
 	// 动态计算超时：根据证书数量调整，防止大量证书场景超时
 	certCount := 0

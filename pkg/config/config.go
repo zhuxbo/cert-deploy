@@ -155,10 +155,14 @@ func (c *CertConfig) GetRenewMode(schedule *ScheduleConfig) string {
 }
 
 // NeedsRenewal 判断是否需要续期
+// 已过期证书（days < 0）不再触发续签
 func (c *CertConfig) NeedsRenewal(schedule *ScheduleConfig) bool {
 	days := c.DaysUntilExpiry()
+	if days < 0 {
+		return false
+	}
 	renewDays := schedule.RenewBeforeDays
-	if renewDays == 0 || renewDays > MaxRenewBeforeDays {
+	if renewDays <= 0 {
 		renewDays = DefaultRenewBeforeDays
 	}
 	return days <= renewDays

@@ -196,14 +196,24 @@ get_target_version() {
     fi
 
     local version=""
-    if [ "$CHANNEL" = "dev" ]; then
-        version=$(echo "$json" | grep -o '"latest_dev" *: *"[^"]*"' | cut -d'"' -f4)
-    elif [ "$CHANNEL" = "main" ]; then
-        version=$(echo "$json" | grep -o '"latest_main" *: *"[^"]*"' | cut -d'"' -f4)
+    local ch="${CHANNEL:-main}"
+    if command -v python3 >/dev/null 2>&1; then
+        version=$(echo "$json" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    ch = '$ch'
+    if ch in d and 'latest' in d[ch]:
+        print(d[ch]['latest'])
+    elif ch == '' or ch == 'main':
+        for c in ['main', 'dev']:
+            if c in d and 'latest' in d[c]:
+                print(d[c]['latest']); break
+except: pass
+" 2>/dev/null)
     else
-        # 默认：优先 main
-        version=$(echo "$json" | grep -o '"latest_main" *: *"[^"]*"' | cut -d'"' -f4)
-        [ -z "$version" ] && version=$(echo "$json" | grep -o '"latest_dev" *: *"[^"]*"' | cut -d'"' -f4)
+        # 无 python3 时用 grep 回退（仅支持简单格式）
+        version=$(echo "$json" | grep -o "\"$ch\"" -A 5 | grep -o '"latest" *: *"[^"]*"' | head -1 | cut -d'"' -f4)
     fi
 
     # 自动推断通道
@@ -215,7 +225,7 @@ get_target_version() {
         fi
     fi
 
-    echo "$version"
+    echo "$(normalize_version "$version")"
 }
 
 BINARY_DST="/usr/local/bin/sslctl"
@@ -275,7 +285,7 @@ if ! curl -fsSL --connect-timeout $TIMEOUT "$DOWNLOAD_URL" -o "/tmp/$FILENAME" 2
     exit 1
 fi
 
-# SHA256 校验（从 versions.$VERSION.checksums.$FILENAME 精确提取）
+# SHA256 校验（从 {channel}.versions[].checksums.{filename} 提取）
 EXPECTED_HASH=""
 if command -v python3 >/dev/null 2>&1; then
     EXPECTED_HASH=$(curl -s --connect-timeout $TIMEOUT "$RELEASE_URL/releases.json" 2>/dev/null | \
@@ -283,9 +293,13 @@ if command -v python3 >/dev/null 2>&1; then
 import sys, json
 try:
     d = json.load(sys.stdin)
-    h = d.get('versions',{}).get('$VERSION',{}).get('checksums',{}).get('$FILENAME','')
-    if h.startswith('sha256:'):
-        print(h[7:])
+    ch = d.get('$CHANNEL', {})
+    for v in ch.get('versions', []):
+        if v.get('version') == '${VERSION#v}':
+            h = v.get('checksums', {}).get('$FILENAME', '')
+            if h.startswith('sha256:'):
+                print(h[7:])
+            break
 except: pass
 " 2>/dev/null)
 fi

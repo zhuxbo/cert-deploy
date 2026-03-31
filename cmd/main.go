@@ -5,6 +5,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -78,7 +79,7 @@ func main() {
 	case "deploy":
 		deploy.Run(subArgs, version, buildTime, debug)
 	case "daemon":
-		daemon.Run(subArgs, version, buildTime, debug)
+		daemon.Run(context.Background(), subArgs, version, buildTime, debug)
 	case "status":
 		runStatus()
 	case "upgrade":
@@ -153,8 +154,8 @@ func printUsage() {
 
 // runWindowsService 以 Windows 服务方式运行
 func runWindowsService() {
-	err := service.RunAsService("sslctl", func() {
-		daemon.Run(nil, version, buildTime, false)
+	err := service.RunAsService("sslctl", func(ctx context.Context) {
+		daemon.Run(ctx, nil, version, buildTime, false)
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Windows 服务运行失败: %v\n", err)
@@ -375,10 +376,10 @@ func repairService() {
 		os.Exit(1)
 	}
 
-	// 停止现有服务
+	// 停止现有服务（忽略错误，可能不存在）
 	_ = svcMgr.Stop()
 
-	// 安装服务
+	// 安装服务（已存在时自动删除重建）
 	if err := svcMgr.Install(); err != nil {
 		fmt.Fprintf(os.Stderr, "安装服务失败: %v\n", err)
 		os.Exit(1)
@@ -477,8 +478,9 @@ func runUpgrade(args []string) {
 
 	result, err := upgrade.Execute(opts, logFunc)
 	if err != nil {
-		// 升级失败，交互终端下提示输入新域名重试
-		if isTerminalFunc() {
+		// 仅发布源相关错误（地址/网络/版本）才提示换域名重试
+		var releaseErr *upgrade.ErrReleaseSource
+		if isTerminalFunc() && errors.As(err, &releaseErr) {
 			newURL := promptNewReleaseURL(err)
 			if newURL != "" {
 				opts.ReleaseURL = newURL

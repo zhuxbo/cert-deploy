@@ -284,6 +284,10 @@ if ! curl -fsSL --connect-timeout $TIMEOUT "$DOWNLOAD_URL" -o "/tmp/$FILENAME" 2
     echo_error "下载失败: $DOWNLOAD_URL"
     exit 1
 fi
+FILE_SIZE=$(stat -c%s "/tmp/$FILENAME" 2>/dev/null || stat -f%z "/tmp/$FILENAME" 2>/dev/null || echo "")
+if [ -n "$FILE_SIZE" ]; then
+    echo_info "下载完成 ($(awk "BEGIN{printf \"%.2f\", $FILE_SIZE/1048576}") MB)"
+fi
 
 # SHA256 校验（从 {channel}.versions[].checksums.{filename} 提取）
 EXPECTED_HASH=""
@@ -401,7 +405,7 @@ CONFIG_FILE="/opt/sslctl/config.json"
 if [ -f "$CONFIG_FILE" ]; then
     # 配置已存在，合并 release_url（不覆盖其他字段）
     if command -v python3 >/dev/null 2>&1; then
-        if ! python3 - "$CONFIG_FILE" "$RELEASE_URL" << 'PYEOF'
+        if ! python3 - "$CONFIG_FILE" "$RELEASE_URL" "${CHANNEL:-main}" << 'PYEOF'
 import json, os, sys, tempfile
 config_path, release_url = sys.argv[1], sys.argv[2]
 try:
@@ -411,6 +415,8 @@ except (json.JSONDecodeError, FileNotFoundError):
     print("配置解析失败，未修改 release_url", file=sys.stderr)
     sys.exit(1)
 cfg["release_url"] = release_url
+channel = sys.argv[3] if len(sys.argv) > 3 else "main"
+cfg["upgrade_channel"] = channel
 dir_path = os.path.dirname(config_path) or "."
 with tempfile.NamedTemporaryFile("w", delete=False, dir=dir_path, encoding="utf-8") as tmp:
     json.dump(cfg, tmp, indent=2, ensure_ascii=False)
@@ -424,7 +430,7 @@ PYEOF
         chmod 600 "$CONFIG_FILE"
     elif command -v jq >/dev/null 2>&1; then
         tmp_file=$(mktemp)
-        if jq --arg url "$RELEASE_URL" '.release_url = $url' "$CONFIG_FILE" > "$tmp_file"; then
+        if jq --arg url "$RELEASE_URL" --arg ch "${CHANNEL:-main}" '.release_url = $url | .upgrade_channel = $ch' "$CONFIG_FILE" > "$tmp_file"; then
             mv "$tmp_file" "$CONFIG_FILE"
             chmod 600 "$CONFIG_FILE"
         else
@@ -440,7 +446,8 @@ else
     # 首次安装，创建配置
     cat > "$CONFIG_FILE" << CFGEOF
 {
-  "release_url": "$RELEASE_URL"
+  "release_url": "$RELEASE_URL",
+  "upgrade_channel": "${CHANNEL:-main}"
 }
 CFGEOF
     chmod 600 "$CONFIG_FILE"
@@ -488,7 +495,10 @@ install_service() {
 
     case "$INIT_SYSTEM" in
         systemd)
-            if [ ! -f /etc/systemd/system/sslctl.service ]; then
+            if [ -f /etc/systemd/system/sslctl.service ]; then
+                # 升级：重启服务加载新二进制
+                systemctl restart sslctl 2>/dev/null && echo_info "已重启 systemd 服务" || true
+            else
                 cat > /etc/systemd/system/sslctl.service << EOF
 [Unit]
 Description=SSL Certificate Manager
@@ -519,7 +529,9 @@ EOF
             fi
             ;;
         openrc)
-            if [ ! -f /etc/init.d/sslctl ]; then
+            if [ -f /etc/init.d/sslctl ]; then
+                rc-service sslctl restart 2>/dev/null && echo_info "已重启 OpenRC 服务" || true
+            else
                 cat > /etc/init.d/sslctl << 'EOF'
 #!/sbin/openrc-run
 
@@ -543,7 +555,9 @@ EOF
             fi
             ;;
         sysvinit)
-            if [ ! -f /etc/init.d/sslctl ]; then
+            if [ -f /etc/init.d/sslctl ]; then
+                /etc/init.d/sslctl restart 2>/dev/null && echo_info "已重启 SysVinit 服务" || true
+            else
                 cat > /etc/init.d/sslctl << 'EOF'
 #!/bin/sh
 ### BEGIN INIT INFO

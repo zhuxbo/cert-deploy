@@ -222,20 +222,36 @@ func TestGetSignature(t *testing.T) {
 	index := ReleaseIndex{
 		"main": &ChannelInfo{
 			Versions: []VersionInfo{
-				{Version: "1.0.0", Signature: "ed25519:testSig"},
+				{
+					Version: "1.0.0",
+					Signatures: map[string]string{
+						"sslctl-linux-amd64.gz":       "ed25519:key-1:sigLinux",
+						"sslctl-windows-amd64.exe.gz": "ed25519:key-1:sigWindows",
+					},
+				},
 				{Version: "0.9.0"}, // 无签名
 			},
 		},
 	}
 
-	if got := index.GetSignature("main", "v1.0.0"); got != "ed25519:testSig" {
-		t.Errorf("GetSignature(v1.0.0) = %q, want ed25519:testSig", got)
+	// 按文件名查找
+	if got := index.GetSignature("main", "v1.0.0", "sslctl-linux-amd64.gz"); got != "ed25519:key-1:sigLinux" {
+		t.Errorf("GetSignature(linux) = %q, want sigLinux", got)
 	}
-	if got := index.GetSignature("main", "v0.9.0"); got != "" {
-		t.Errorf("GetSignature(v0.9.0) = %q, want empty", got)
+	if got := index.GetSignature("main", "v1.0.0", "sslctl-windows-amd64.exe.gz"); got != "ed25519:key-1:sigWindows" {
+		t.Errorf("GetSignature(windows) = %q, want sigWindows", got)
 	}
-	if got := index.GetSignature("main", "v9.9.9"); got != "" {
-		t.Errorf("GetSignature(v9.9.9) = %q, want empty", got)
+	// 不存在的文件名
+	if got := index.GetSignature("main", "v1.0.0", "sslctl-darwin-amd64.gz"); got != "" {
+		t.Errorf("GetSignature(darwin) = %q, want empty", got)
+	}
+	// 无签名
+	if got := index.GetSignature("main", "v0.9.0", "sslctl-linux-amd64.gz"); got != "" {
+		t.Errorf("GetSignature(none) = %q, want empty", got)
+	}
+	// 不存在的版本
+	if got := index.GetSignature("main", "v9.9.9", "sslctl-linux-amd64.gz"); got != "" {
+		t.Errorf("GetSignature(missing) = %q, want empty", got)
 	}
 }
 

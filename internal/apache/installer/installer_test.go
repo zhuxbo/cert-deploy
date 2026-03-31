@@ -70,7 +70,7 @@ func TestExtractVirtualHost80_Simple(t *testing.T) {
     DocumentRoot /var/www/html
 </VirtualHost>`
 
-	vhost, err := inst.extractVirtualHost80(content)
+	vhost, err := inst.extractHTTPVirtualHost(content)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -82,35 +82,38 @@ func TestExtractVirtualHost80_Simple(t *testing.T) {
 	}
 }
 
-func TestExtractVirtualHost80_Port8080(t *testing.T) {
+func TestExtractHTTPVirtualHost_CustomPort(t *testing.T) {
 	inst := NewApacheInstaller("", "", "", "", "example.com", "")
-	content := `<VirtualHost *:8080>
+	// 自定义端口（如与 IIS 冲突改为 1800 等）应被匹配
+	for _, port := range []string{"8080", "180", "1800"} {
+		content := `<VirtualHost *:` + port + `>
     ServerName example.com
     DocumentRoot /var/www/html
 </VirtualHost>`
 
-	vhost, err := inst.extractVirtualHost80(content)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if vhost != "" {
-		t.Error("expected empty result for :8080 VirtualHost")
+		vhost, err := inst.extractHTTPVirtualHost(content)
+		if err != nil {
+			t.Fatalf("port %s: unexpected error: %v", port, err)
+		}
+		if vhost == "" {
+			t.Errorf("port %s: expected non-empty result for custom port VirtualHost", port)
+		}
 	}
 }
 
-func TestExtractVirtualHost80_Port180(t *testing.T) {
+func TestExtractHTTPVirtualHost_Skip443(t *testing.T) {
 	inst := NewApacheInstaller("", "", "", "", "example.com", "")
-	content := `<VirtualHost *:180>
+	content := `<VirtualHost *:443>
     ServerName example.com
-    DocumentRoot /var/www/html
+    SSLEngine on
 </VirtualHost>`
 
-	vhost, err := inst.extractVirtualHost80(content)
+	vhost, err := inst.extractHTTPVirtualHost(content)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if vhost != "" {
-		t.Error("expected empty result for :180 VirtualHost")
+		t.Error("expected empty result for :443 VirtualHost")
 	}
 }
 
@@ -121,7 +124,7 @@ func TestExtractVirtualHost80_WildcardHost(t *testing.T) {
     DocumentRoot /var/www/html
 </VirtualHost>`
 
-	vhost, err := inst.extractVirtualHost80(content)
+	vhost, err := inst.extractHTTPVirtualHost(content)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -147,7 +150,7 @@ func TestExtractVirtualHost80_MultipleVHosts(t *testing.T) {
     DocumentRoot /var/www/third
 </VirtualHost>`
 
-	vhost, err := inst.extractVirtualHost80(content)
+	vhost, err := inst.extractHTTPVirtualHost(content)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -166,7 +169,7 @@ func TestExtractVirtualHost80_NotFound(t *testing.T) {
     DocumentRoot /var/www/html
 </VirtualHost>`
 
-	vhost, err := inst.extractVirtualHost80(content)
+	vhost, err := inst.extractHTTPVirtualHost(content)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

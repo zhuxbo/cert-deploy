@@ -260,6 +260,12 @@ func runSingle(p *setupParams, orderID int) {
 		for _, b := range bindings {
 			fmt.Printf("  - %s (%s)\n", b.ServerName, b.ServerType)
 		}
+		// Windows 非服务模式提示：部署过程需要重启进程，会短暂中断服务
+		if runtime.GOOS == "windows" {
+			if name := processRestartServerName(bindings); name != "" {
+				fmt.Printf("\n  ⚠ %s 未注册为系统服务，部署过程将通过重启进程重载配置，服务会短暂中断数秒\n", name)
+			}
+		}
 		if !confirm("\n确认部署?") {
 			fmt.Println("已取消")
 			os.Exit(0)
@@ -540,6 +546,20 @@ func createBinding(site *matcher.ScannedSiteInfo, cm *config.ConfigManager) conf
 	return binding
 }
 
+// processRestartServerName 检测是否需要进程重启，返回服务器名称（如 "Apache"/"Nginx"），无需则返回空
+func processRestartServerName(bindings []config.SiteBinding) string {
+	for _, b := range bindings {
+		cmd := b.Reload.ReloadCommand
+		if strings.Contains(cmd, "-k ") {
+			return "Apache"
+		}
+		if strings.Contains(cmd, "-s reload") {
+			return "Nginx"
+		}
+	}
+	return ""
+}
+
 // deployToSiteBinding 部署证书到单个站点绑定
 func deployToSiteBinding(ctx context.Context, binding *config.SiteBinding, certData *fetcher.CertData, privateKey string, log *logger.Logger) error {
 	// 确保目录存在
@@ -571,10 +591,10 @@ func installService() error {
 		return err
 	}
 
-	// 停止现有服务
+	// 停止现有服务（忽略错误，可能不存在）
 	_ = svcMgr.Stop()
 
-	// 安装服务
+	// 安装服务（已存在时自动删除重建）
 	if err := svcMgr.Install(); err != nil {
 		return err
 	}

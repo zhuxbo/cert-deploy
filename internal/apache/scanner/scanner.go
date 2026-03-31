@@ -183,7 +183,7 @@ func getCommonApachePaths() []apacheConfig {
 			{`C:\Apache\conf\httpd.conf`, `C:\Apache`},
 			{`C:\Program Files\Apache24\conf\httpd.conf`, `C:\Program Files\Apache24`},
 		}
-		// phpStudy（路径含版本号，需 glob 匹配）
+		// Windows 集成面板（路径含版本号，需 glob）
 		matches, _ := filepath.Glob(`C:\phpstudy_pro\Extensions\Apache*\conf\httpd.conf`)
 		for _, m := range matches {
 			root := filepath.Dir(filepath.Dir(m))
@@ -759,7 +759,7 @@ func findApacheBinary() string {
 			`C:\Program Files (x86)\Apache24\bin\httpd.exe`,
 			`C:\xampp\apache\bin\httpd.exe`,
 		}
-		// phpStudy
+		// Windows 集成面板
 		if matches, _ := filepath.Glob(`C:\phpstudy_pro\Extensions\Apache*\bin\httpd.exe`); len(matches) > 0 {
 			paths = append(paths, matches...)
 		}

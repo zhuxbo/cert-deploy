@@ -2,7 +2,10 @@
 
 package service
 
-import "fmt"
+import (
+	"context"
+	"fmt"
+)
 
 // WindowsManager Windows 服务管理器 (stub)
 type WindowsManager struct {
@@ -52,6 +55,6 @@ func IsWindowsService() bool {
 }
 
 // RunAsService 以 Windows 服务方式运行 (stub)
-func RunAsService(name string, handler func()) error {
+func RunAsService(name string, handler func(ctx context.Context)) error {
 	return fmt.Errorf("windows 服务仅在 Windows 系统上可用")
 }

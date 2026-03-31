@@ -202,7 +202,7 @@ func TestExecute_SignatureKeyNotFound_ReinstallHint(t *testing.T) {
 		"main": &ChannelInfo{
 			Latest: "2.0.0",
 			Versions: []VersionInfo{
-				{Version: "2.0.0", Checksums: map[string]string{filename: checksum}, Signature: sigStr},
+				{Version: "2.0.0", Checksums: map[string]string{filename: checksum}, Signatures: map[string]string{filename: sigStr}},
 			},
 		},
 	}
@@ -245,7 +245,7 @@ func TestDownloadVerifyInstall_ErrNoPublicKeys_ReinstallHint(t *testing.T) {
 		"main": &ChannelInfo{
 			Latest: "2.0.0",
 			Versions: []VersionInfo{
-				{Version: "2.0.0", Checksums: map[string]string{filename: checksum}, Signature: sigStr},
+				{Version: "2.0.0", Checksums: map[string]string{filename: checksum}, Signatures: map[string]string{filename: sigStr}},
 			},
 		},
 	}

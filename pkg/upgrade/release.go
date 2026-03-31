@@ -22,7 +22,7 @@ type VersionInfo struct {
 	Version    string            `json:"version"`              // 版本号（如 "1.2.0"，不带 v 前缀）
 	ReleasedAt string            `json:"released_at,omitempty"` // 发布日期（YYYY-MM-DD）
 	Checksums  map[string]string `json:"checksums"`             // 按文件名索引的 SHA256 哈希
-	Signature  string            `json:"signature,omitempty"`   // "ed25519:..." (平台扩展)
+	Signatures map[string]string `json:"signatures,omitempty"`  // 按文件名索引的 Ed25519 签名
 }
 
 // ChannelInfo 通道版本信息
@@ -38,11 +38,11 @@ type ReleaseIndex map[string]*ChannelInfo
 func FetchReleaseInfo(baseURL string) (ReleaseIndex, error) {
 	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
 	if baseURL == "" {
-		return nil, fmt.Errorf("未配置升级地址，请运行 sslctl upgrade 在交互终端中输入，或使用安装脚本升级")
+		return nil, &ErrReleaseSource{Msg: "未配置升级地址，请运行 sslctl upgrade 在交互终端中输入，或使用安装脚本升级"}
 	}
 	// 安全校验：强制 HTTPS（与 downloadBinaryWithClient 保持一致）
 	if !strings.HasPrefix(baseURL, "https://") {
-		return nil, fmt.Errorf("升级地址必须使用 HTTPS 协议")
+		return nil, &ErrReleaseSource{Msg: "升级地址必须使用 HTTPS 协议"}
 	}
 	return fetchReleaseInfoFrom(baseURL+"/releases.json", secureHTTPClient())
 }
@@ -51,12 +51,12 @@ func FetchReleaseInfo(baseURL string) (ReleaseIndex, error) {
 func fetchReleaseInfoFrom(url string, client *http.Client) (ReleaseIndex, error) {
 	resp, err := client.Get(url)
 	if err != nil {
-		return nil, fmt.Errorf("获取版本信息失败: %w", err)
+		return nil, &ErrReleaseSource{Msg: fmt.Sprintf("获取版本信息失败: %v", err)}
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("获取版本信息失败: HTTP %d", resp.StatusCode)
+		return nil, &ErrReleaseSource{Msg: fmt.Sprintf("获取版本信息失败: HTTP %d", resp.StatusCode)}
 	}
 
 	// 限制响应体大小，防止恶意服务器返回超大 JSON
@@ -108,7 +108,7 @@ func ResolveTarget(targetVersion, channel string, index ReleaseIndex) (string, s
 	if len(chInfo.Versions) > 0 {
 		return NormalizeVersion(chInfo.Versions[0].Version), ch, nil
 	}
-	return "", "", fmt.Errorf("通道 %q 中未找到可用版本", ch)
+	return "", "", &ErrReleaseSource{Msg: fmt.Sprintf("通道 %q 中未找到可用版本", ch)}
 }
 
 // FindVersion 在指定通道的版本列表中查找指定版本
@@ -135,13 +135,13 @@ func (index ReleaseIndex) GetChecksum(channel, version, filename string) string 
 	return v.Checksums[filename]
 }
 
-// GetSignature 获取指定版本的签名
-func (index ReleaseIndex) GetSignature(channel, version string) string {
+// GetSignature 获取指定文件的签名
+func (index ReleaseIndex) GetSignature(channel, version, filename string) string {
 	v := index.FindVersion(channel, version)
-	if v == nil {
+	if v == nil || v.Signatures == nil {
 		return ""
 	}
-	return v.Signature
+	return v.Signatures[filename]
 }
 
 // NormalizeVersion 规范化版本号（确保带 v 前缀）

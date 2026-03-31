@@ -161,32 +161,34 @@ func (i *ApacheInstaller) backup(content string) (string, error) {
 
 // addSSLVirtualHost 添加 SSL VirtualHost
 func (i *ApacheInstaller) addSSLVirtualHost(content string) (string, error) {
-	// 查找 :80 VirtualHost
-	vhost80, err := i.extractVirtualHost80(content)
+	// 查找该站点的非 SSL VirtualHost（任意非 443 端口）
+	vhostHTTP, err := i.extractHTTPVirtualHost(content)
 	if err != nil {
 		return "", err
 	}
 
-	if vhost80 == "" {
-		return "", fmt.Errorf("未找到 :80 VirtualHost")
+	if vhostHTTP == "" {
+		return "", fmt.Errorf("未找到该站点的 VirtualHost（需要非 :443 的 VirtualHost）")
 	}
 
 	// 生成 :443 VirtualHost
-	vhost443 := i.generateSSLVirtualHost(vhost80)
+	vhost443 := i.generateSSLVirtualHost(vhostHTTP)
 
 	// 在文件末尾添加
 	return content + "\n" + vhost443, nil
 }
 
-// extractVirtualHost80 提取 :80 VirtualHost
-func (i *ApacheInstaller) extractVirtualHost80(content string) (string, error) {
+// extractHTTPVirtualHost 提取该站点的非 SSL VirtualHost
+// 匹配任意非 443 端口的 VirtualHost（支持 :80、:1800、:8080 等自定义端口）
+func (i *ApacheInstaller) extractHTTPVirtualHost(content string) (string, error) {
 	lines := strings.Split(content, "\n")
 	var result []string
 	inVhost := false
 	depth := 0
 
-	// 精确匹配端口 80，避免误匹配 8080/180 等
-	vhostStartRe := regexp.MustCompile(`(?i)^\s*<VirtualHost\s+[^>]*:80(?:[^0-9][^>]*)?>`)
+	// 匹配所有 VirtualHost（排除 :443）
+	vhostStartRe := regexp.MustCompile(`(?i)^\s*<VirtualHost\s+[^>]*>`)
+	vhostStartSSLRe := regexp.MustCompile(`(?i)^\s*<VirtualHost\s+[^>]*:443[^0-9]`)
 	vhostEndRe := regexp.MustCompile(`(?i)^\s*</VirtualHost>`)
 	serverNameRe := regexp.MustCompile(`(?i)^\s*ServerName\s+(.+)$`)
 
@@ -194,7 +196,7 @@ func (i *ApacheInstaller) extractVirtualHost80(content string) (string, error) {
 	foundServerName := false
 
 	for _, line := range lines {
-		if vhostStartRe.MatchString(line) {
+		if vhostStartRe.MatchString(line) && !vhostStartSSLRe.MatchString(line) {
 			inVhost = true
 			depth = 1
 			currentVhost = []string{line}

@@ -3,6 +3,7 @@
 package service
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -37,26 +38,44 @@ func (m *WindowsManager) Install() error {
 	}
 	defer manager.Disconnect()
 
-	// 检查服务是否已存在
-	s, err := manager.OpenService(m.cfg.Name)
-	if err == nil {
-		s.Close()
-		return fmt.Errorf("服务已存在")
+	// 如果服务已存在，先停止并删除（支持 repair 场景）
+	if existing, openErr := manager.OpenService(m.cfg.Name); openErr == nil {
+		_, _ = existing.Control(svc.Stop)
+		_ = existing.Delete()
+		existing.Close()
 	}
 
-	// 创建服务
-	s, err = manager.CreateService(m.cfg.Name, m.cfg.ExecPath,
-		mgr.Config{
-			DisplayName:  m.cfg.DisplayName,
-			Description:  m.cfg.Description,
-			StartType:    mgr.StartAutomatic,
-			ServiceStartName: "LocalSystem",
-		},
-		"daemon",
-	)
-	if err != nil {
-		return fmt.Errorf("创建服务失败: %w", err)
+	// 创建服务（重试最多 60 秒，等待旧服务进程退出释放句柄）
+	var s *mgr.Service
+	var createErr error
+	for i := 0; i < 60; i++ {
+		s, createErr = manager.CreateService(m.cfg.Name, m.cfg.ExecPath,
+			mgr.Config{
+				DisplayName:      m.cfg.DisplayName,
+				Description:      m.cfg.Description,
+				StartType:        mgr.StartAutomatic,
+				ServiceStartName: "LocalSystem",
+			},
+			"daemon",
+		)
+		if createErr == nil {
+			break
+		}
+		if i == 0 {
+			fmt.Fprint(os.Stderr, "等待旧服务退出")
+		}
+		fmt.Fprint(os.Stderr, ".")
+		time.Sleep(time.Second)
 	}
+	if createErr != nil {
+		fmt.Fprintln(os.Stderr)
+		return fmt.Errorf("创建服务失败: %w", createErr)
+	}
+	if s == nil {
+		return fmt.Errorf("创建服务失败")
+	}
+	// 清除等待输出
+	fmt.Fprint(os.Stderr, "\r                                                \r")
 	defer s.Close()
 
 	// 设置恢复选项（失败后自动重启）
@@ -86,11 +105,17 @@ func (m *WindowsManager) Uninstall() error {
 	}
 	defer s.Close()
 
-	// 停止服务（记录日志但继续，服务可能已停止）
-	if _, err := s.Control(svc.Stop); err != nil {
-		// 停止失败不阻塞卸载，服务可能已停止
+	// 停止服务并等待退出（忽略错误，服务可能已停止）
+	if _, err := s.Control(svc.Stop); err == nil {
+		deadline := time.Now().Add(15 * time.Second)
+		for time.Now().Before(deadline) {
+			st, qErr := s.Query()
+			if qErr != nil || st.State == svc.Stopped {
+				break
+			}
+			time.Sleep(time.Second)
+		}
 	}
-	time.Sleep(time.Second)
 
 	// 删除服务
 	if err := s.Delete(); err != nil {
@@ -121,7 +146,7 @@ func (m *WindowsManager) Start() error {
 	return nil
 }
 
-// Stop 停止服务
+// Stop 停止服务并等待进程完全退出
 func (m *WindowsManager) Stop() error {
 	manager, err := mgr.Connect()
 	if err != nil {
@@ -137,8 +162,30 @@ func (m *WindowsManager) Stop() error {
 	defer s.Close()
 
 	if _, err := s.Control(svc.Stop); err != nil {
+		// 可能已停止，检查状态
+		st, qErr := s.Query()
+		if qErr == nil && st.State == svc.Stopped {
+			return nil
+		}
 		return fmt.Errorf("停止服务失败: %w", err)
 	}
+
+	// 等待服务进程完全退出（StopPending → Stopped），最多 30 秒
+	for i := 0; i < 30; i++ {
+		st, err := s.Query()
+		if err != nil || st.State == svc.Stopped {
+			if i > 0 {
+				fmt.Fprintln(os.Stderr)
+			}
+			return nil
+		}
+		if i == 0 {
+			fmt.Fprint(os.Stderr, "等待服务退出")
+		}
+		fmt.Fprint(os.Stderr, ".")
+		time.Sleep(time.Second)
+	}
+	fmt.Fprintln(os.Stderr)
 	return nil
 }
 
@@ -147,7 +194,6 @@ func (m *WindowsManager) Restart() error {
 	if err := m.Stop(); err != nil {
 		return fmt.Errorf("停止服务失败: %w", err)
 	}
-	time.Sleep(time.Second)
 	return m.Start()
 }
 
@@ -246,12 +292,16 @@ func IsWindowsService() bool {
 }
 
 // RunAsService 以 Windows 服务方式运行
-func RunAsService(name string, handler func()) error {
-	return svc.Run(name, &serviceHandler{handler: handler})
+// handler 接收 context，服务停止时 context 被取消，handler 应在 ctx.Done() 后尽快返回
+func RunAsService(name string, handler func(ctx context.Context)) error {
+	ctx, cancel := context.WithCancel(context.Background())
+	return svc.Run(name, &serviceHandler{handler: handler, ctx: ctx, cancel: cancel})
 }
 
 type serviceHandler struct {
-	handler func()
+	handler func(ctx context.Context)
+	ctx     context.Context
+	cancel  context.CancelFunc
 }
 
 func (h *serviceHandler) Execute(args []string, r <-chan svc.ChangeRequest, changes chan<- svc.Status) (ssec bool, errno uint32) {
@@ -262,7 +312,7 @@ func (h *serviceHandler) Execute(args []string, r <-chan svc.ChangeRequest, chan
 	// 启动主逻辑
 	done := make(chan struct{})
 	go func() {
-		h.handler()
+		h.handler(h.ctx)
 		close(done)
 	}()
 
@@ -279,13 +329,12 @@ func (h *serviceHandler) Execute(args []string, r <-chan svc.ChangeRequest, chan
 				changes <- c.CurrentStatus
 			case svc.Stop, svc.Shutdown:
 				changes <- svc.Status{State: svc.StopPending}
-				// 等待 handler 完成（最多 30 秒），避免 goroutine 泄漏
-				// handler 内部会响应 SIGINT/SIGTERM 信号
+				// 通知 handler 停止
+				h.cancel()
+				// 等待 handler 完成（最多 30 秒）
 				select {
 				case <-done:
-					// handler 已完成
 				case <-time.After(30 * time.Second):
-					// 超时，强制退出
 				}
 				return
 			}

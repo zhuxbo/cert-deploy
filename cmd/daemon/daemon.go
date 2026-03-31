@@ -18,7 +18,8 @@ import (
 )
 
 // Run 运行守护进程
-func Run(args []string, version, buildTime string, debug bool) {
+// parentCtx 用于外部通知停止（Windows 服务通过 context 取消，命令行通过信号）
+func Run(parentCtx context.Context, args []string, version, buildTime string, debug bool) {
 	cfgManager, err := config.NewConfigManager()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "初始化失败: %v\n", err)
@@ -65,7 +66,7 @@ func Run(args []string, version, buildTime string, debug bool) {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(parentCtx)
 	defer cancel()
 
 	// 用于等待正在运行的任务完成
@@ -103,24 +104,31 @@ func Run(args []string, version, buildTime string, debug bool) {
 		case sig := <-sigCh:
 			timer.Stop()
 			log.Info("收到信号 %v，正在退出...", sig)
-			// 取消 context，通知正在运行的任务停止
 			cancel()
-
-			// 等待任务完成
-			done := make(chan struct{})
-			go func() {
-				wg.Wait()
-				close(done)
-			}()
-
-			select {
-			case <-done:
-				log.Info("所有任务已完成，退出")
-			case <-time.After(shutdownTimeout):
-				log.Warn("等待任务完成超时（%v），强制退出", shutdownTimeout)
-			}
+			gracefulShutdown(&wg, shutdownTimeout, log)
+			return
+		case <-parentCtx.Done():
+			timer.Stop()
+			log.Info("收到停止通知，正在退出...")
+			cancel()
+			gracefulShutdown(&wg, shutdownTimeout, log)
 			return
 		}
+	}
+}
+
+// gracefulShutdown 等待正在运行的任务完成
+func gracefulShutdown(wg *sync.WaitGroup, timeout time.Duration, log *logger.Logger) {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		log.Info("所有任务已完成，退出")
+	case <-time.After(timeout):
+		log.Warn("等待任务完成超时（%v），强制退出", timeout)
 	}
 }
 

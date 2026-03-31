@@ -295,8 +295,7 @@ func findNginxBin() string {
 	}
 
 	if runtime.GOOS == "windows" {
-		// Windows: 从运行中的进程获取路径
-		// tasklist 无法获取路径，用 wmic
+		// 从运行中的进程获取路径
 		cmd := exec.Command("wmic", "process", "where", "name='nginx.exe'", "get", "ExecutablePath")
 		if output, err := cmd.Output(); err == nil {
 			for _, line := range strings.Split(string(output), "\n") {
@@ -304,6 +303,20 @@ func findNginxBin() string {
 				if line != "" && line != "ExecutablePath" && strings.HasSuffix(strings.ToLower(line), "nginx.exe") {
 					return line
 				}
+			}
+		}
+		// 常见安装路径
+		paths := []string{
+			`C:\nginx\nginx.exe`,
+			`C:\Program Files\nginx\nginx.exe`,
+		}
+		// Windows 集成面板
+		if matches, _ := filepath.Glob(`C:\phpstudy_pro\Extensions\Nginx*\nginx.exe`); len(matches) > 0 {
+			paths = append(paths, matches...)
+		}
+		for _, p := range paths {
+			if _, err := os.Stat(p); err == nil {
+				return p
 			}
 		}
 		return "nginx"
@@ -338,7 +351,7 @@ func findNginxBin() string {
 }
 
 // DetectApacheCommands 检测当前系统可用的 Apache 命令
-// 检测顺序：apache2ctl (Debian/Ubuntu) → apachectl (CentOS/RHEL/通用) → httpd (CentOS/RHEL)
+// 检测顺序：apache2ctl (Debian/Ubuntu) → apachectl (CentOS/RHEL/通用) → httpd (CentOS/RHEL) → 完整路径查找
 func DetectApacheCommands() ServerCommands {
 	// Debian/Ubuntu: apache2ctl
 	if _, err := exec.LookPath("apache2ctl"); err == nil {
@@ -364,11 +377,69 @@ func DetectApacheCommands() ServerCommands {
 		}
 	}
 
+	// PATH 中找不到，尝试完整路径查找（集成面板等非标准安装）
+	if bin := findApacheBin(); bin != "apachectl" {
+		return ServerCommands{
+			TestCmd:   bin + " -t",
+			ReloadCmd: bin + " -k graceful",
+		}
+	}
+
 	// 回退默认值
 	return ServerCommands{
 		TestCmd:   "apachectl -t",
 		ReloadCmd: "apachectl graceful",
 	}
+}
+
+// findApacheBin 查找 Apache 可执行文件路径
+func findApacheBin() string {
+	if runtime.GOOS == "windows" {
+		// 常见安装路径
+		paths := []string{
+			`C:\Apache24\bin\httpd.exe`,
+			`C:\Apache\bin\httpd.exe`,
+			`C:\Program Files\Apache24\bin\httpd.exe`,
+			`C:\xampp\apache\bin\httpd.exe`,
+		}
+		// Windows 集成面板（路径含版本号，需 glob）
+		if matches, _ := filepath.Glob(`C:\phpstudy_pro\Extensions\Apache*\bin\httpd.exe`); len(matches) > 0 {
+			paths = append(paths, matches...)
+		}
+		for _, p := range paths {
+			if _, err := os.Stat(p); err == nil {
+				return p
+			}
+		}
+
+		// 从进程查找
+		cmd := exec.Command("wmic", "process", "where", "name='httpd.exe'", "get", "ExecutablePath")
+		if output, err := cmd.Output(); err == nil {
+			for _, line := range strings.Split(string(output), "\n") {
+				line = strings.TrimSpace(line)
+				if line != "" && line != "ExecutablePath" && strings.HasSuffix(strings.ToLower(line), "httpd.exe") {
+					return line
+				}
+			}
+		}
+		return "apachectl"
+	}
+
+	// Linux/macOS: 检查常见路径
+	for _, p := range []string{
+		"/usr/sbin/apachectl",
+		"/usr/sbin/httpd",
+		"/usr/local/apache2/bin/httpd",
+		"/usr/local/apache2/bin/apachectl",
+		"/www/server/apache/bin/httpd",
+		"/www/server/apache/bin/apachectl",
+	} {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+
+	return "apachectl"
 }
 
 // GetApacheSitesDir 获取 Apache 站点配置目录

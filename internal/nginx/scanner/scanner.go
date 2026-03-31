@@ -191,7 +191,7 @@ func getCommonNginxPaths() []string {
 			`C:\nginx\conf\nginx.conf`,
 			`C:\Program Files\nginx\conf\nginx.conf`,
 		}
-		// phpStudy
+		// Windows 集成面板
 		if matches, _ := filepath.Glob(`C:\phpstudy_pro\Extensions\Nginx*\conf\nginx.conf`); len(matches) > 0 {
 			paths = append(paths, matches...)
 		}
@@ -846,7 +846,7 @@ func findNginxBinary() string {
 			`C:\Program Files\nginx\nginx.exe`,
 			`C:\Program Files (x86)\nginx\nginx.exe`,
 		}
-		// phpStudy
+		// Windows 集成面板
 		if matches, _ := filepath.Glob(`C:\phpstudy_pro\Extensions\Nginx*\nginx.exe`); len(matches) > 0 {
 			paths = append(paths, matches...)
 		}

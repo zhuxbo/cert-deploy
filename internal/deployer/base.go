@@ -2,6 +2,14 @@
 package deployer
 
 import (
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"time"
+
 	"github.com/zhuxbo/sslctl/internal/executor"
 	"github.com/zhuxbo/sslctl/pkg/errors"
 	"github.com/zhuxbo/sslctl/pkg/util"
@@ -30,12 +38,92 @@ func (b *Base) TestConfig() error {
 	return executor.Run(b.TestCommand)
 }
 
+// NeedsProcessRestart 检测是否需要通过进程重启方式重载（Windows 非服务模式）
+// 返回 true 时部署过程会短暂中断服务
+func (b *Base) NeedsProcessRestart() bool {
+	if runtime.GOOS != "windows" || b.ReloadCommand == "" {
+		return false
+	}
+	// 尝试执行 reload 命令的 dry run：解析命令但不执行，
+	// 通过命令特征判断是否依赖服务注册（-k graceful / -s reload）
+	cmd := b.ReloadCommand
+	return strings.Contains(cmd, "-k ") || strings.Contains(cmd, "-s reload")
+}
+
 // ReloadService 重载服务
+// 优先使用服务管理命令；Windows 上服务未注册时回退到进程重启
 func (b *Base) ReloadService() error {
 	if b.ReloadCommand == "" {
 		return nil
 	}
-	return executor.Run(b.ReloadCommand)
+	err := executor.Run(b.ReloadCommand)
+	if err == nil {
+		return nil
+	}
+	// Windows 非服务模式：回退到进程重启
+	if runtime.GOOS != "windows" {
+		return err
+	}
+	errMsg := err.Error()
+	if !strings.Contains(errMsg, "No installed service") &&
+		!strings.Contains(errMsg, "could not open error log") {
+		return err
+	}
+
+	exe, _ := executor.ParseCommand(b.ReloadCommand)
+	if exe == "" {
+		return err
+	}
+
+	return restartProcessWindows(exe, err)
+}
+
+// restartProcessWindows 通过终止进程+重启实现重载（适用于 Apache/Nginx 非服务模式）
+// 流程：终止进程 → 等待退出 → 等守护进程自动拉起 → 否则手动启动
+func restartProcessWindows(exe string, origErr error) error {
+	// 提取进程名（如 httpd.exe、nginx.exe）
+	processName := filepath.Base(exe)
+
+	// 终止进程树
+	fmt.Fprintf(os.Stderr, "正在停止 %s 进程...\n", processName)
+	_ = executor.Run(fmt.Sprintf("taskkill /F /T /IM %s", processName))
+
+	// 等待进程退出（最多 10 秒）
+	for i := 0; i < 20; i++ {
+		time.Sleep(500 * time.Millisecond)
+		if !isProcessRunning(processName) {
+			break
+		}
+	}
+
+	// 等待守护进程自动拉起（面板等管理工具），最多 10 秒
+	fmt.Fprintf(os.Stderr, "等待 %s 重新启动...\n", processName)
+	for i := 0; i < 10; i++ {
+		time.Sleep(time.Second)
+		if isProcessRunning(processName) {
+			fmt.Fprintf(os.Stderr, "%s 已恢复运行\n", processName)
+			return nil
+		}
+	}
+
+	// 守护进程未拉起，手动启动
+	fmt.Fprintf(os.Stderr, "守护进程未自动拉起，手动启动 %s...\n", processName)
+	var args []string
+	if strings.Contains(strings.ToLower(processName), "httpd") {
+		// Apache 需要 -d 指定 ServerRoot
+		serverRoot := filepath.Dir(filepath.Dir(exe))
+		args = []string{"-d", serverRoot}
+	}
+	if startErr := executor.RunDetached(exe, args...); startErr != nil {
+		return fmt.Errorf("重启失败: %w（原始错误: %v）", startErr, origErr)
+	}
+
+	// 确认启动成功
+	time.Sleep(2 * time.Second)
+	if !isProcessRunning(processName) {
+		return fmt.Errorf("进程启动后退出（原始错误: %v）", origErr)
+	}
+	return nil
 }
 
 // TestAndReload 测试配置并重载服务
@@ -74,6 +162,15 @@ func (b *Base) TestAndReloadForRollback() error {
 		}
 	}
 	return nil
+}
+
+// isProcessRunning 检测指定名称的进程是否仍在运行（Windows）
+func isProcessRunning(name string) bool {
+	out, err := exec.Command("tasklist", "/FI", fmt.Sprintf("IMAGENAME eq %s", name), "/NH").Output()
+	if err != nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(string(out)), strings.ToLower(name))
 }
 
 // RestoreFile 恢复单个文件

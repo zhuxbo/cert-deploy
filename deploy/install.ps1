@@ -149,6 +149,7 @@ function Get-TargetVersion {
     $releaseInfo = $null
 
     # 获取 releases.json（指定版本时也需要，用于校验和）
+    $prevPref = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
     try {
         $releaseInfo = Invoke-RestMethod -Uri "$BaseUrl/releases.json" -TimeoutSec 30 -ErrorAction Stop
     } catch {
@@ -157,6 +158,7 @@ function Get-TargetVersion {
             return $null
         }
     }
+    $ProgressPreference = $prevPref
 
     $channel = ""
     $targetVersion = ""

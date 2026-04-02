@@ -28,6 +28,9 @@ param(
 
 #Requires -RunAsAdministrator
 $ErrorActionPreference = "Stop"
+# 全局禁用 Invoke-WebRequest / Invoke-RestMethod 的进度条
+# 在脚本级别设置，避免函数作用域导致 PowerShell 5.1 进度条仍然渲染覆盖控制台输出
+$ProgressPreference = 'SilentlyContinue'
 
 # 兼容 Linux 风格 --flag 参数（PowerShell 可能将 --dev 等误解析为 $Version 值）
 if ($Version -eq "--dev") { $Dev = [switch]::new($true); $Version = "" }
@@ -149,7 +152,6 @@ function Get-TargetVersion {
     $releaseInfo = $null
 
     # 获取 releases.json（指定版本时也需要，用于校验和）
-    $prevPref = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
     try {
         $releaseInfo = Invoke-RestMethod -Uri "$BaseUrl/releases.json" -TimeoutSec 30 -ErrorAction Stop
     } catch {
@@ -158,7 +160,6 @@ function Get-TargetVersion {
             return $null
         }
     }
-    $ProgressPreference = $prevPref
 
     $channel = ""
     $targetVersion = ""
@@ -344,15 +345,12 @@ $DownloadUrl = "$ReleaseUrl/$Channel/$TargetVersion/$Filename"
 Write-Info "下载 $Filename..."
 
 $downloaded = $false
-# PowerShell 5.1 的 Invoke-WebRequest 默认解析 DOM + 显示进度条，极慢
-# -UseBasicParsing 跳过 DOM 解析，SilentlyContinue 关闭进度条
-$oldProgress = $ProgressPreference
-$ProgressPreference = 'SilentlyContinue'
+# PowerShell 5.1 的 Invoke-WebRequest 默认解析 DOM，极慢
+# -UseBasicParsing 跳过 DOM 解析；进度条已在脚本级别全局禁用
 try {
     Invoke-WebRequest -Uri $DownloadUrl -OutFile $TempFile -TimeoutSec 120 -UseBasicParsing -ErrorAction Stop
     $downloaded = $true
 } catch {}
-$ProgressPreference = $oldProgress
 
 if (-not $downloaded) {
     Write-Err "下载失败: $DownloadUrl"

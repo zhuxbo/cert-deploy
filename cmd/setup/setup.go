@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/x509"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -26,14 +27,17 @@ import (
 
 // setupParams 保存 setup 命令的通用参数
 type setupParams struct {
-	apiURL    string
-	token     string
-	localKey  bool
-	yes       bool
-	noService bool
-	ctx       context.Context
-	cfgManager *config.ConfigManager
-	log       *logger.Logger
+	apiURL         string
+	token          string
+	localKey       bool
+	keyFile        string // --key 指定的私钥文件路径
+	fileValidation bool   // --file-validation 启用文件验证
+	webroot        string // --webroot 指定的 Web 根目录
+	yes            bool
+	noService      bool
+	ctx            context.Context
+	cfgManager     *config.ConfigManager
+	log            *logger.Logger
 }
 
 // Run 运行 setup 命令
@@ -43,6 +47,9 @@ func Run(args []string, debug bool) {
 	token := fs.String("token", "", "API 认证 Token")
 	order := fs.String("order", "", "订单 ID 或批量查询（支持 ID/域名/逗号分隔混合，不传则查询全部）")
 	localKey := fs.Bool("local-key", false, "使用本机提交")
+	keyFile := fs.String("key", "", "私钥文件路径（隐含 --local-key）")
+	fileValidation := fs.Bool("file-validation", false, "启用文件验证（隐含 --local-key）")
+	webroot := fs.String("webroot", "", "文件验证的 Web 根目录（隐含 --file-validation）")
 	yes := fs.Bool("yes", false, "跳过确认提示")
 	noService := fs.Bool("no-service", false, "不安装守护服务")
 
@@ -51,12 +58,29 @@ func Run(args []string, debug bool) {
 		fmt.Fprintf(os.Stderr, "  sslctl setup --url <base_url> --token <token> --order <order_id>          # 单证书部署\n")
 		fmt.Fprintf(os.Stderr, "  sslctl setup --url <base_url> --token <token> --order \"123,example.com\"    # 批量部署\n")
 		fmt.Fprintf(os.Stderr, "  sslctl setup --url <base_url> --token <token>                             # 部署所有证书\n")
+		fmt.Fprintf(os.Stderr, "  sslctl setup --key /path/key.pem --webroot /var/www/html --url <url> ...  # 指定私钥+文件验证\n")
 		fmt.Fprintf(os.Stderr, "\n选项:\n")
 		fs.PrintDefaults()
 	}
 
 	if err := fs.Parse(args); err != nil {
 		os.Exit(1)
+	}
+
+	// 隐含关系推导：--webroot → --file-validation → --local-key，--key → --local-key
+	if *webroot != "" {
+		*fileValidation = true
+	}
+	if *fileValidation || *keyFile != "" {
+		*localKey = true
+	}
+
+	// 校验 --webroot 路径
+	if *webroot != "" {
+		if fi, err := os.Stat(*webroot); err != nil || !fi.IsDir() {
+			fmt.Fprintf(os.Stderr, "--webroot 路径不存在或不是目录: %s\n", *webroot)
+			os.Exit(1)
+		}
 	}
 
 	if *apiURL == "" || *token == "" {
@@ -98,14 +122,17 @@ func Run(args []string, debug bool) {
 	}
 
 	params := &setupParams{
-		apiURL:     *apiURL,
-		token:      *token,
-		localKey:   *localKey,
-		yes:        *yes,
-		noService:  *noService,
-		ctx:        context.Background(),
-		cfgManager: cfgManager,
-		log:        log,
+		apiURL:         *apiURL,
+		token:          *token,
+		localKey:       *localKey,
+		keyFile:        *keyFile,
+		fileValidation: *fileValidation,
+		webroot:        *webroot,
+		yes:            *yes,
+		noService:      *noService,
+		ctx:            context.Background(),
+		cfgManager:     cfgManager,
+		log:            log,
 	}
 
 	// 路由：纯数字走单订单旧路径，其他走批量
@@ -239,9 +266,33 @@ func runSingle(p *setupParams, orderID int) {
 		os.Exit(1)
 	}
 
+	// 校验验证方式与域名兼容性（在部署前检查，避免部署后配置保存失败导致状态不一致）
+	if p.fileValidation {
+		for _, domain := range certDomains {
+			if errMsg := config.ValidateValidationMethod(domain, config.ValidationMethodFile); errMsg != "" {
+				fmt.Fprintf(os.Stderr, "域名 %s: %s\n", domain, errMsg)
+				os.Exit(1)
+			}
+		}
+		// --file-validation 无 --webroot 时，检查至少一个绑定有扫描到的 webroot
+		if p.webroot == "" {
+			hasWebroot := false
+			for _, b := range bindings {
+				if b.Paths.Webroot != "" {
+					hasWebroot = true
+					break
+				}
+			}
+			if !hasWebroot {
+				fmt.Fprintln(os.Stderr, "未扫描到 webroot，请使用 --webroot 指定")
+				os.Exit(1)
+			}
+		}
+	}
+
 	// 4. 验证私钥
 	fmt.Println("\n步骤 4/7: 验证私钥...")
-	privateKey, err := getAndValidatePrivateKey(bindings, certData, certValidator)
+	privateKey, err := getAndValidatePrivateKey(p.keyFile, bindings, certData, certValidator, true)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "  %v\n", err)
 		os.Exit(1)
@@ -375,6 +426,18 @@ func runSingle(p *setupParams, orderID int) {
 
 	if p.localKey {
 		certConfig.RenewMode = config.RenewModeLocal
+	}
+
+	// 验证方式和 webroot（域名兼容性已在部署前校验）
+	if p.fileValidation {
+		certConfig.ValidationMethod = config.ValidationMethodFile
+		if p.webroot != "" {
+			for i := range certConfig.Bindings {
+				certConfig.Bindings[i].Paths.Webroot = p.webroot
+			}
+		}
+	} else if p.localKey {
+		certConfig.ValidationMethod = config.ValidationMethodDelegation
 	}
 
 	if err := p.cfgManager.AddCert(certConfig); err != nil {
@@ -653,9 +716,13 @@ func updateSiteAfterInstall(site *matcher.ScannedSiteInfo, cm *config.ConfigMana
 	site.KeyPath = filepath.Join(certDir, "key.pem")
 }
 
+// errNeedPrivateKey 表示前 3 个来源均无可用私钥，需要用户提供
+var errNeedPrivateKey = errors.New("需要用户提供私钥")
+
 // getAndValidatePrivateKey 获取并验证私钥与证书匹配
-// 优先级: 1. API 返回 → 2. 本地文件 → 3. 用户输入（仅交互终端）
-func getAndValidatePrivateKey(bindings []config.SiteBinding, certData *fetcher.CertData, v *validator.Validator) (string, error) {
+// 优先级: 1. API 返回 → 2. --key 指定路径 → 3. 默认路径 → 4. 交互输入路径
+// interactive=false 时跳过第 4 步，返回 errNeedPrivateKey
+func getAndValidatePrivateKey(keyFile string, bindings []config.SiteBinding, certData *fetcher.CertData, v *validator.Validator, interactive bool) (string, error) {
 	// 1. API 返回了私钥
 	if certData.PrivateKey != "" {
 		if err := v.ValidateCertKeyPair(certData.Cert, certData.PrivateKey); err != nil {
@@ -664,47 +731,92 @@ func getAndValidatePrivateKey(bindings []config.SiteBinding, certData *fetcher.C
 		return certData.PrivateKey, nil
 	}
 
-	// 2. 检查本地私钥
 	fmt.Println("  API 未返回私钥，检查本地私钥...")
-	keyPath := ""
+
+	// 2. --key 指定了私钥路径
+	if keyFile != "" {
+		privateKey, err := readAndValidateKeyFile(keyFile, certData.Cert, v)
+		if err != nil {
+			return "", fmt.Errorf("--key 指定的私钥无效: %v", err)
+		}
+		return privateKey, nil
+	}
+
+	// 获取默认私钥路径（从 binding）
+	defaultKeyPath := ""
 	for _, b := range bindings {
 		if b.Enabled && b.Paths.PrivateKey != "" {
-			keyPath = b.Paths.PrivateKey
+			defaultKeyPath = b.Paths.PrivateKey
 			break
 		}
 	}
-	if keyPath == "" && len(bindings) > 0 {
-		keyPath = bindings[0].Paths.PrivateKey
+	if defaultKeyPath == "" && len(bindings) > 0 {
+		defaultKeyPath = bindings[0].Paths.PrivateKey
 	}
 
-	if keyPath != "" {
-		if _, err := os.Stat(keyPath); err == nil {
-			fmt.Printf("  本地私钥: %s\n", keyPath)
-			keyData, err := util.SafeReadFile(keyPath, config.MaxPrivateKeySize)
+	// 3. 默认路径存在则读取验证
+	if defaultKeyPath != "" {
+		if _, err := os.Stat(defaultKeyPath); err == nil {
+			fmt.Printf("  本地私钥: %s\n", defaultKeyPath)
+			privateKey, err := readAndValidateKeyFile(defaultKeyPath, certData.Cert, v)
 			if err != nil {
-				return "", fmt.Errorf("读取本地私钥失败: %v", err)
-			}
-			privateKey := string(keyData)
-			if err := v.ValidateCertKeyPair(certData.Cert, privateKey); err != nil {
-				fmt.Printf("  ⚠ 本地私钥与证书不匹配: %v\n", err)
+				fmt.Printf("  ⚠ 本地私钥不可用: %v\n", err)
 			} else {
 				return privateKey, nil
 			}
 		}
 	}
 
-	// 3. 交互终端：提示用户输入 PEM 私钥
-	if !isInteractiveTerminal() {
-		return "", fmt.Errorf("缺少私钥: API 未返回，本地不可用，且非交互终端无法输入")
+	// 4. 交互终端：提示用户输入私钥文件路径
+	if !interactive || !isInteractiveTerminal() {
+		return "", errNeedPrivateKey
 	}
 
-	fmt.Println("  请粘贴 PEM 格式私钥（以 -----END 行结束）:")
-	privateKey, err := readPEMFromStdin()
-	if err != nil {
-		return "", fmt.Errorf("读取私钥输入失败: %v", err)
+	absKeyPath := defaultKeyPath
+	if absKeyPath != "" {
+		absKeyPath, _ = filepath.Abs(absKeyPath)
+		fmt.Printf("  私钥文件不存在: %s\n", absKeyPath)
+		fmt.Println("  请输入私钥文件绝对路径（或将私钥放到上述路径后直接按回车）:")
+	} else {
+		fmt.Println("  请输入私钥文件绝对路径:")
 	}
-	if err := v.ValidateCertKeyPair(certData.Cert, privateKey); err != nil {
-		return "", fmt.Errorf("输入的私钥与证书不匹配: %v", err)
+	reader := bufio.NewReader(os.Stdin)
+	input, err := reader.ReadString('\n')
+	if err != nil {
+		return "", fmt.Errorf("读取输入失败: %v", err)
+	}
+	input = strings.TrimSpace(input)
+
+	// 用户直接按回车：重新检查默认路径
+	if input == "" {
+		if defaultKeyPath == "" {
+			return "", fmt.Errorf("缺少私钥路径")
+		}
+		privateKey, err := readAndValidateKeyFile(defaultKeyPath, certData.Cert, v)
+		if err != nil {
+			return "", fmt.Errorf("私钥文件仍不可用: %v", err)
+		}
+		return privateKey, nil
+	}
+
+	// 用户输入了路径
+	privateKey, err := readAndValidateKeyFile(input, certData.Cert, v)
+	if err != nil {
+		return "", fmt.Errorf("私钥文件无效: %v", err)
+	}
+	return privateKey, nil
+}
+
+// readAndValidateKeyFile 读取私钥文件并验证与证书匹配
+func readAndValidateKeyFile(keyPath, certPEM string, v *validator.Validator) (string, error) {
+	keyData, err := util.SafeReadFile(keyPath, config.MaxPrivateKeySize)
+	if err != nil {
+		return "", fmt.Errorf("读取私钥失败: %v", err)
+	}
+	privateKey := string(keyData)
+	clear(keyData)
+	if err := v.ValidateCertKeyPair(certPEM, privateKey); err != nil {
+		return "", fmt.Errorf("私钥与证书不匹配: %v", err)
 	}
 	return privateKey, nil
 }
@@ -716,26 +828,6 @@ func isInteractiveTerminal() bool {
 		return false
 	}
 	return fi.Mode()&os.ModeCharDevice != 0
-}
-
-// readPEMFromStdin 从 stdin 逐行读取 PEM 内容，遇到 -----END 行结束
-func readPEMFromStdin() (string, error) {
-	scanner := bufio.NewScanner(os.Stdin)
-	var lines []string
-	for scanner.Scan() {
-		line := scanner.Text()
-		lines = append(lines, line)
-		if strings.HasPrefix(line, "-----END ") {
-			break
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		return "", err
-	}
-	if len(lines) == 0 {
-		return "", fmt.Errorf("未读取到任何内容")
-	}
-	return strings.Join(lines, "\n") + "\n", nil
 }
 
 // confirm 确认提示

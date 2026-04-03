@@ -49,6 +49,7 @@ testdata/      # 测试数据和工具
 sslctl setup --url <url> --token <token> --order <order_id>          # 单证书部署
 sslctl setup --url <url> --token <token> --order "123,example.com"   # 批量部署
 sslctl setup --url <url> --token <token>                             # 部署所有证书
+sslctl setup --key /path/key.pem --webroot /var/www/html --url <url> --token <token> --order <id>  # 指定私钥+文件验证
 
 # 站点扫描
 sslctl scan                                      # 扫描站点（自动检测 Web 服务器）
@@ -133,7 +134,7 @@ docker/test/
 
 | 模式    | 说明             | 启用方式                 |
 | ------- | ---------------- | ------------------------ |
-| `local` | 本机提交         | `--local-key` 或配置文件 |
+| `local` | 本机提交         | `--local-key` / `--key` / `--file-validation` 或配置文件 |
 | `pull`  | 自动签发（默认） | 默认行为                 |
 
 - 两种模式统一：`renew_before_days` 默认 14 天，由服务端控制，每次 API 交互后更新本地配置

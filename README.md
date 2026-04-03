@@ -61,6 +61,9 @@ sslctl setup --url https://api.example.com --token your-token --order 12345
 选项：
 
 - `--local-key`: 使用本机提交
+- `--key <path>`: 私钥文件路径（隐含 `--local-key`）
+- `--file-validation`: 启用文件验证（隐含 `--local-key`）
+- `--webroot <path>`: 文件验证的 Web 根目录（隐含 `--file-validation`）
 - `--yes`: 跳过确认提示
 - `--no-service`: 不安装守护服务
 

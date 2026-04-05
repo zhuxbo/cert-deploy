@@ -3,11 +3,15 @@
 package internal
 
 import (
+	"context"
+
 	apacheDeployer "github.com/zhuxbo/sslctl/internal/apache/deployer"
+	apacheDocker "github.com/zhuxbo/sslctl/internal/apache/docker"
 	apacheInstaller "github.com/zhuxbo/sslctl/internal/apache/installer"
 	apacheScanner "github.com/zhuxbo/sslctl/internal/apache/scanner"
 	baseDeployer "github.com/zhuxbo/sslctl/internal/deployer"
 	nginxDeployer "github.com/zhuxbo/sslctl/internal/nginx/deployer"
+	nginxDocker "github.com/zhuxbo/sslctl/internal/nginx/docker"
 	nginxInstaller "github.com/zhuxbo/sslctl/internal/nginx/installer"
 	nginxScanner "github.com/zhuxbo/sslctl/internal/nginx/scanner"
 	"github.com/zhuxbo/sslctl/pkg/webserver"
@@ -71,19 +75,24 @@ type nginxScannerAdapter struct {
 }
 
 func (a *nginxScannerAdapter) Scan() ([]webserver.Site, error) {
-	// 统一扫描入口：先扫描本地，再扫描 Docker
-	localSites, err := a.ScanLocal()
-	if err != nil {
-		return nil, err
+	// 统一扫描入口：本地和 Docker 独立扫描，互不阻塞
+	localSites, localErr := a.ScanLocal()
+
+	dockerSites, _ := a.ScanDocker()
+
+	// 合并结果
+	var allSites []webserver.Site
+	if localErr == nil {
+		allSites = append(allSites, localSites...)
+	}
+	allSites = append(allSites, dockerSites...)
+
+	// 仅当本地失败且 Docker 也无结果时返回错误
+	if localErr != nil && len(dockerSites) == 0 {
+		return nil, localErr
 	}
 
-	dockerSites, err := a.ScanDocker()
-	if err != nil {
-		// Docker 扫描失败不影响本地结果
-		return localSites, nil
-	}
-
-	return append(localSites, dockerSites...), nil
+	return allSites, nil
 }
 
 func (a *nginxScannerAdapter) ScanLocal() ([]webserver.Site, error) {
@@ -108,8 +117,49 @@ func (a *nginxScannerAdapter) ScanLocal() ([]webserver.Site, error) {
 }
 
 func (a *nginxScannerAdapter) ScanDocker() ([]webserver.Site, error) {
-	// Docker 扫描暂不支持
-	return nil, nil
+	if !nginxDocker.CheckDockerAvailable() {
+		return nil, nil
+	}
+
+	ctx := context.Background()
+	containers, err := nginxDocker.DiscoverNginxContainers(ctx)
+	if err != nil || len(containers) == 0 {
+		return nil, nil
+	}
+
+	var sites []webserver.Site
+	for _, container := range containers {
+		client := nginxDocker.NewClient(container.ID)
+		if container.IsCompose {
+			client = nginxDocker.NewComposeClient(container.ComposeFile, container.ServiceName)
+			client.SetContainer(container.ID)
+		}
+
+		scanner := nginxDocker.NewScanner(client)
+		dockerSites, err := scanner.Scan(ctx)
+		if err != nil {
+			continue
+		}
+
+		for _, ds := range dockerSites {
+			sites = append(sites, webserver.Site{
+				ServerName:      ds.ServerName,
+				ServerAlias:     ds.ServerAlias,
+				ConfigFile:      ds.ConfigFile,
+				ListenPorts:     ds.ListenPorts,
+				CertificatePath: ds.CertificatePath,
+				PrivateKeyPath:  ds.PrivateKeyPath,
+				ServerType:      webserver.TypeDockerNginx,
+				ContainerID:     ds.ContainerID,
+				ContainerName:   ds.ContainerName,
+				HostCertPath:    ds.HostCertPath,
+				HostKeyPath:     ds.HostKeyPath,
+				VolumeMode:      ds.VolumeMode,
+			})
+		}
+	}
+
+	return sites, nil
 }
 
 func (a *nginxScannerAdapter) ServerType() webserver.ServerType {
@@ -169,7 +219,21 @@ type apacheScannerAdapter struct {
 }
 
 func (a *apacheScannerAdapter) Scan() ([]webserver.Site, error) {
-	return a.ScanLocal()
+	localSites, localErr := a.ScanLocal()
+
+	dockerSites, _ := a.ScanDocker()
+
+	var allSites []webserver.Site
+	if localErr == nil {
+		allSites = append(allSites, localSites...)
+	}
+	allSites = append(allSites, dockerSites...)
+
+	if localErr != nil && len(dockerSites) == 0 {
+		return nil, localErr
+	}
+
+	return allSites, nil
 }
 
 func (a *apacheScannerAdapter) ScanLocal() ([]webserver.Site, error) {
@@ -195,8 +259,50 @@ func (a *apacheScannerAdapter) ScanLocal() ([]webserver.Site, error) {
 }
 
 func (a *apacheScannerAdapter) ScanDocker() ([]webserver.Site, error) {
-	// Docker 扫描暂不支持
-	return nil, nil
+	if !apacheDocker.CheckDockerAvailable() {
+		return nil, nil
+	}
+
+	ctx := context.Background()
+	containers, err := apacheDocker.DiscoverApacheContainers(ctx)
+	if err != nil || len(containers) == 0 {
+		return nil, nil
+	}
+
+	var sites []webserver.Site
+	for _, container := range containers {
+		client := apacheDocker.NewClient(container.ID)
+		if container.IsCompose {
+			client = apacheDocker.NewComposeClient(container.ComposeFile, container.ServiceName)
+			client.SetContainer(container.ID)
+		}
+
+		scanner := apacheDocker.NewScanner(client)
+		dockerSites, err := scanner.Scan(ctx)
+		if err != nil {
+			continue
+		}
+
+		for _, ds := range dockerSites {
+			sites = append(sites, webserver.Site{
+				ServerName:      ds.ServerName,
+				ServerAlias:     ds.ServerAlias,
+				ConfigFile:      ds.ConfigFile,
+				ListenPorts:     []string{ds.ListenPort},
+				CertificatePath: ds.CertificatePath,
+				PrivateKeyPath:  ds.PrivateKeyPath,
+				ChainFile:       ds.ChainPath,
+				ServerType:      webserver.TypeDockerApache,
+				ContainerID:     ds.ContainerID,
+				ContainerName:   ds.ContainerName,
+				HostCertPath:    ds.HostCertPath,
+				HostKeyPath:     ds.HostKeyPath,
+				VolumeMode:      ds.VolumeMode,
+			})
+		}
+	}
+
+	return sites, nil
 }
 
 func (a *apacheScannerAdapter) ServerType() webserver.ServerType {

@@ -934,8 +934,8 @@ func findNginxFromProcessLinux() string {
 
 	pid := pids[0]
 
-	// 检查是否是容器进程（容器进程交给 Docker 扫描器处理）
-	if isContainerProcess(pid) {
+	// 宿主机上跳过容器进程（交给 Docker 扫描器），容器内不跳过
+	if util.ShouldSkipContainerProcess(pid) {
 		return ""
 	}
 
@@ -958,12 +958,6 @@ func findNginxFromProcessLinux() string {
 // 使用公共函数 util.FindBinaryFromPort
 func findBinaryFromPort(processName string) string {
 	return util.FindBinaryFromPort(processName)
-}
-
-// isContainerProcess 检查进程是否运行在容器内
-// 使用公共函数 util.IsContainerProcess
-func isContainerProcess(pid string) bool {
-	return util.IsContainerProcess(pid)
 }
 
 // findNginxFromProcessWindows 从 Windows 进程查找 nginx 路径

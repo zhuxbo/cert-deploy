@@ -172,6 +172,10 @@ type ScannedSiteInfo struct {
 	ChainPath   string   // 证书链路径（Apache SSLCertificateChainFile）
 	Webroot     string   // Web 根目录
 	ServerType  string   // 服务器类型
+
+	// Docker 特有
+	ContainerID string // 容器 ID（非空表示 Docker 站点）
+	VolumeMode  bool   // 证书路径是否挂载为卷
 }
 
 // MatchSites 批量匹配站点

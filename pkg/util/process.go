@@ -6,9 +6,26 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 
 	"github.com/zhuxbo/sslctl/internal/executor"
 )
+
+// isSelfInContainer 缓存当前进程是否在容器内的检测结果
+var isSelfInContainer = sync.OnceValue(func() bool {
+	// Docker 创建的标识文件
+	if _, err := os.Stat("/.dockerenv"); err == nil {
+		return true
+	}
+	// 检查自身 cgroup
+	return IsContainerProcess("self")
+})
+
+// IsSelfInContainer 检查当前进程是否运行在容器内
+// 当 sslctl 自身在容器中运行时，不应跳过同容器的 Web 服务器进程
+func IsSelfInContainer() bool {
+	return isSelfInContainer()
+}
 
 // IsContainerProcess 检查进程是否运行在容器内
 // 通过检查 /proc/<pid>/cgroup 判断是否为容器进程
@@ -36,10 +53,20 @@ func IsContainerProcess(pid string) bool {
 	return false
 }
 
+// ShouldSkipContainerProcess 判断是否应该跳过容器进程
+// 仅在宿主机上运行时跳过容器进程（交给 Docker 扫描器处理）
+// 当 sslctl 自身在容器内时，不跳过（同容器的进程应当扫描）
+func ShouldSkipContainerProcess(pid string) bool {
+	if IsSelfInContainer() {
+		return false
+	}
+	return IsContainerProcess(pid)
+}
+
 // FindBinaryFromPort 通过端口查找进程的可执行文件路径
 // processName: 进程名（如 nginx、httpd、apache2）
 // 返回可执行文件的完整路径，如果未找到则返回空字符串
-// 会自动跳过容器内的进程
+// 在宿主机上运行时跳过容器进程，在容器内运行时不跳过
 func FindBinaryFromPort(processName string) string {
 	// 尝试 ss 命令
 	output, err := executor.RunOutput("ss -tlnp")
@@ -72,8 +99,8 @@ func FindBinaryFromPort(processName string) string {
 				pid = matches[2]
 			}
 			if pid != "" {
-				// 跳过容器进程
-				if IsContainerProcess(pid) {
+				// 宿主机上跳过容器进程（交给 Docker 扫描器），容器内不跳过
+				if ShouldSkipContainerProcess(pid) {
 					continue
 				}
 

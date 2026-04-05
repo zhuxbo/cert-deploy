@@ -31,14 +31,23 @@ func (s *Service) ScanSites(ctx context.Context, opts ScanOptions) (*ScanResult,
 			s.log.Debug("扫描 %s 站点失败: %v", serverType, err)
 			continue
 		}
+		s.log.Debug("扫描 %s 完成，发现 %d 个站点", serverType, len(sites))
 
 		for _, site := range sites {
 			// 如果仅 SSL，过滤非 SSL 站点
 			if opts.SSLOnly && site.CertificatePath == "" {
 				continue
 			}
+
+			source := "local"
+			if site.ContainerID != "" {
+				source = "docker"
+			}
+
 			result.Sites = append(result.Sites, ScannedSite{
-				Source:          "local",
+				Source:          source,
+				ContainerID:     site.ContainerID,
+				ContainerName:   site.ContainerName,
 				ServerName:      site.ServerName,
 				ServerAlias:     site.ServerAlias,
 				ListenPorts:     site.ListenPorts,
@@ -46,6 +55,9 @@ func (s *Service) ScanSites(ctx context.Context, opts ScanOptions) (*ScanResult,
 				CertificatePath: site.CertificatePath,
 				PrivateKeyPath:  site.PrivateKeyPath,
 				ChainFilePath:   site.ChainFile,
+				HostCertPath:    site.HostCertPath,
+				HostKeyPath:     site.HostKeyPath,
+				VolumeMode:      site.VolumeMode,
 			})
 		}
 	}

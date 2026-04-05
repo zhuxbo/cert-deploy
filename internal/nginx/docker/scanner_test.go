@@ -74,15 +74,18 @@ server {
 }
 `
 	sites := s.parseConfig(config, "/etc/nginx/nginx.conf", info)
-	// HTTP-only server 没有 ssl_certificate，应该被过滤
-	if len(sites) != 2 {
-		t.Fatalf("expected 2 SSL sites, got %d", len(sites))
+	// 所有有效 server_name 的站点都应返回（包括非 SSL）
+	if len(sites) != 3 {
+		t.Fatalf("expected 3 sites, got %d", len(sites))
 	}
-	if sites[0].ServerName != "secure.example.com" {
+	if sites[0].ServerName != "example.com" {
 		t.Errorf("sites[0].ServerName = %q", sites[0].ServerName)
 	}
-	if sites[1].ServerName != "other.example.com" {
+	if sites[1].ServerName != "secure.example.com" {
 		t.Errorf("sites[1].ServerName = %q", sites[1].ServerName)
+	}
+	if sites[2].ServerName != "other.example.com" {
+		t.Errorf("sites[2].ServerName = %q", sites[2].ServerName)
 	}
 }
 
@@ -243,7 +246,7 @@ func TestParseConfig_IncompleteServer(t *testing.T) {
 	s := makeTestScanner("abc123", "test-nginx")
 	info := &ContainerInfo{ID: "abc123", Name: "test-nginx"}
 
-	// 只有 ssl_certificate 没有 ssl_certificate_key
+	// 只有 ssl_certificate 没有 ssl_certificate_key，仍有有效 server_name
 	config := `
 server {
     listen 443 ssl;
@@ -252,8 +255,9 @@ server {
 }
 `
 	sites := s.parseConfig(config, "/etc/nginx/conf.d/test.conf", info)
-	if len(sites) != 0 {
-		t.Errorf("expected 0 sites for incomplete server, got %d", len(sites))
+	// 有效 server_name 的站点应被保留（即使 SSL 配置不完整）
+	if len(sites) != 1 {
+		t.Errorf("expected 1 site for incomplete SSL server, got %d", len(sites))
 	}
 }
 

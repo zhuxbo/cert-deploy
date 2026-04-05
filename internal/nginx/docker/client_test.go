@@ -1,8 +1,11 @@
 package docker
 
 import (
+	"context"
 	"fmt"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/zhuxbo/sslctl/pkg/util"
 )
@@ -283,6 +286,482 @@ func TestIsNumeric(t *testing.T) {
 				t.Errorf("isNumeric(%q) = %v, want %v", tt.input, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestTruncateOutput(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"empty string", "", ""},
+		{"short string", "hello world", "hello world"},
+		{"exactly 200 chars", string(make([]byte, 200)), string(make([]byte, 200))}, // 200 个 null 字节
+		{"newline replaced", "line1\nline2\nline3", "line1 line2 line3"},
+		{"carriage return removed", "line1\r\nline2", "line1 line2"},
+		{"mixed newlines", "a\nb\rc\r\nd", "a bc d"},
+	}
+
+	// 生成超长字符串
+	longInput := strings.Repeat("x", 250)
+	tests = append(tests, struct {
+		name string
+		in   string
+		want string
+	}{"over 200 chars truncated", longInput, strings.Repeat("x", 200) + "..."})
+
+	// 含换行 + 超长
+	longWithNewlines := strings.Repeat("a\n", 150)
+	replaced := strings.ReplaceAll(longWithNewlines, "\n", " ")
+	tests = append(tests, struct {
+		name string
+		in   string
+		want string
+	}{"newlines replaced then truncated", longWithNewlines, replaced[:200] + "..."})
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := truncateOutput(tt.in)
+			if got != tt.want {
+				t.Errorf("truncateOutput() = %q (len %d), want %q (len %d)", got, len(got), tt.want, len(tt.want))
+			}
+		})
+	}
+}
+
+func TestTruncateOutput_NeverContainsNewlines(t *testing.T) {
+	inputs := []string{
+		"single\nline",
+		"multi\n\n\nlines",
+		"\n\n\n",
+		"cr\ronly",
+		"mixed\r\n\r\n",
+		strings.Repeat("line\n", 100),
+	}
+
+	for _, input := range inputs {
+		result := truncateOutput(input)
+		if strings.Contains(result, "\n") {
+			t.Errorf("truncateOutput(%q) contains \\n: %q", input, result)
+		}
+		if strings.Contains(result, "\r") {
+			t.Errorf("truncateOutput(%q) contains \\r: %q", input, result)
+		}
+	}
+}
+
+func TestEnsureTimeout(t *testing.T) {
+	t.Run("adds timeout when no deadline", func(t *testing.T) {
+		ctx := context.Background()
+		newCtx, cancel := ensureTimeout(ctx, 5*time.Second)
+		defer cancel()
+
+		deadline, ok := newCtx.Deadline()
+		if !ok {
+			t.Fatal("expected deadline to be set")
+		}
+		// deadline 应在 5 秒内
+		remaining := time.Until(deadline)
+		if remaining <= 0 || remaining > 5*time.Second {
+			t.Errorf("unexpected remaining time: %v", remaining)
+		}
+	})
+
+	t.Run("preserves existing deadline", func(t *testing.T) {
+		originalDeadline := time.Now().Add(10 * time.Second)
+		ctx, origCancel := context.WithDeadline(context.Background(), originalDeadline)
+		defer origCancel()
+
+		newCtx, cancel := ensureTimeout(ctx, 1*time.Second)
+		defer cancel()
+
+		deadline, ok := newCtx.Deadline()
+		if !ok {
+			t.Fatal("expected deadline to be set")
+		}
+		// 应保留原始的 10s deadline，而非新设 1s
+		if !deadline.Equal(originalDeadline) {
+			t.Errorf("deadline changed: got %v, want %v", deadline, originalDeadline)
+		}
+	})
+
+	t.Run("cancel func is safe to call", func(t *testing.T) {
+		// 有 deadline 时返回的 cancel 应是 no-op，调用不 panic
+		ctx, origCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer origCancel()
+
+		_, cancel := ensureTimeout(ctx, 1*time.Second)
+		cancel() // 不应 panic
+		cancel() // 多次调用也不 panic
+	})
+}
+
+func TestExecAux_Whitelist(t *testing.T) {
+	t.Run("allowed commands", func(t *testing.T) {
+		allowedCmds := []struct {
+			cmd  string
+			args []string
+		}{
+			{"mkdir", []string{"-p", "/etc/nginx/ssl"}},
+			{"chmod", []string{"644", "/etc/nginx/ssl/cert.pem"}},
+			{"chmod", []string{"600", "/etc/nginx/ssl/key.pem"}},
+			{"mkdir", []string{"/etc/nginx/certs"}},
+		}
+
+		// 使用空 client 测试白名单逻辑：允许的命令应走到 "no container" 错误而非白名单拒绝
+		client := NewClient("")
+		ctx := context.Background()
+
+		for _, tc := range allowedCmds {
+			t.Run(tc.cmd+" "+strings.Join(tc.args, " "), func(t *testing.T) {
+				_, err := client.ExecAux(ctx, tc.cmd, tc.args...)
+				if err == nil {
+					t.Fatal("expected error (no container), got nil")
+				}
+				// 应该是 "no container specified" 而不是 "command not allowed"
+				if strings.Contains(err.Error(), "not allowed") {
+					t.Errorf("command should be allowed but got: %v", err)
+				}
+				if !strings.Contains(err.Error(), "no container specified") {
+					t.Errorf("unexpected error: %v", err)
+				}
+			})
+		}
+	})
+
+	t.Run("disallowed commands", func(t *testing.T) {
+		disallowedCmds := []struct {
+			cmd  string
+			args []string
+		}{
+			{"rm", []string{"-rf", "/"}},
+			{"bash", []string{"-c", "whoami"}},
+			{"curl", []string{"http://evil.com"}},
+			{"cat", []string{"/etc/passwd"}},
+			{"wget", []string{"http://evil.com"}},
+			{"sh", []string{"-c", "id"}},
+			{"python", []string{"-c", "import os"}},
+		}
+
+		client := NewClient("test-container")
+		ctx := context.Background()
+
+		for _, tc := range disallowedCmds {
+			t.Run(tc.cmd, func(t *testing.T) {
+				_, err := client.ExecAux(ctx, tc.cmd, tc.args...)
+				if err == nil {
+					t.Fatalf("expected error for disallowed command %q", tc.cmd)
+				}
+				if !strings.Contains(err.Error(), "not allowed") {
+					t.Errorf("expected 'not allowed' error, got: %v", err)
+				}
+			})
+		}
+	})
+
+	t.Run("empty command", func(t *testing.T) {
+		client := NewClient("test-container")
+		_, err := client.ExecAux(context.Background(), "")
+		if err == nil {
+			t.Fatal("expected error for empty command")
+		}
+		if !strings.Contains(err.Error(), "not allowed") {
+			t.Errorf("expected 'not allowed' error, got: %v", err)
+		}
+	})
+
+	t.Run("no container specified", func(t *testing.T) {
+		client := &Client{} // 空 client，无 container 也无 compose
+		_, err := client.ExecAux(context.Background(), "mkdir", "-p", "/etc/nginx/ssl")
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		if !strings.Contains(err.Error(), "no container specified") {
+			t.Errorf("expected 'no container specified', got: %v", err)
+		}
+	})
+}
+
+func TestExecAux_PathValidation(t *testing.T) {
+	client := NewClient("") // 空 container 用于触发路径验证
+
+	tests := []struct {
+		name    string
+		cmd     string
+		args    []string
+		wantErr string
+	}{
+		{
+			name:    "invalid path with traversal",
+			cmd:     "mkdir",
+			args:    []string{"-p", "/etc/nginx/../../../etc/shadow"},
+			wantErr: "invalid path",
+		},
+		{
+			name:    "relative path rejected",
+			cmd:     "mkdir",
+			args:    []string{"etc/nginx"},
+			wantErr: "invalid path",
+		},
+		{
+			name:    "path with semicolon",
+			cmd:     "chmod",
+			args:    []string{"644", "/etc/nginx/;rm -rf /"},
+			wantErr: "invalid path",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := client.ExecAux(context.Background(), tt.cmd, tt.args...)
+			if err == nil {
+				t.Fatal("expected error")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("expected error containing %q, got: %v", tt.wantErr, err)
+			}
+		})
+	}
+}
+
+func TestExec_WhitelistReject(t *testing.T) {
+	// 测试 Exec 方法的白名单拒绝分支
+	client := NewClient("test-container")
+	ctx := context.Background()
+
+	tests := []struct {
+		name string
+		cmd  string
+	}{
+		{"rm command", "rm -rf /"},
+		{"curl command", "curl http://evil.com"},
+		{"empty command", ""},
+		{"bash command", "bash -c whoami"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := client.Exec(ctx, tt.cmd)
+			if err == nil {
+				t.Fatal("expected error for disallowed command")
+			}
+			// 应该是白名单拒绝错误，不是 docker exec 执行错误
+			errMsg := err.Error()
+			if !strings.Contains(errMsg, "not allowed") && !strings.Contains(errMsg, "empty command") {
+				t.Errorf("expected whitelist rejection, got: %v", err)
+			}
+		})
+	}
+}
+
+func TestExec_NoContainer(t *testing.T) {
+	client := &Client{} // 无 container 也无 compose
+	_, err := client.Exec(context.Background(), "nginx -t")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "no container specified") {
+		t.Errorf("expected 'no container specified', got: %v", err)
+	}
+}
+
+func TestExecAux_ComposeMode(t *testing.T) {
+	// compose 模式下，允许的命令应走到 docker-compose exec（会失败因为无 compose），
+	// 但不应被白名单拒绝
+	client := NewComposeClient("/path/docker-compose.yml", "web")
+
+	_, err := client.ExecAux(context.Background(), "mkdir", "-p", "/etc/nginx/ssl")
+	if err == nil {
+		t.Fatal("expected error (compose exec fails)")
+	}
+	// 不应是白名单错误或 container 错误
+	if strings.Contains(err.Error(), "not allowed") {
+		t.Errorf("command should be allowed: %v", err)
+	}
+	if strings.Contains(err.Error(), "no container specified") {
+		t.Errorf("compose mode should not require containerID: %v", err)
+	}
+}
+
+func TestExecAux_FlagArgs(t *testing.T) {
+	// 测试 flag 参数（-p）和数字参数（644）的特殊处理
+	client := NewClient("")
+	ctx := context.Background()
+
+	// flag 参数和数字参数应该跳过路径验证
+	tests := []struct {
+		name string
+		cmd  string
+		args []string
+	}{
+		{"mkdir with flag", "mkdir", []string{"-p", "/etc/nginx/ssl"}},
+		{"chmod with mode", "chmod", []string{"644", "/etc/nginx/ssl/cert.pem"}},
+		{"chmod with 600", "chmod", []string{"600", "/etc/nginx/ssl/key.pem"}},
+		{"chmod with 0755", "chmod", []string{"0755", "/etc/nginx/bin"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := client.ExecAux(ctx, tt.cmd, tt.args...)
+			if err == nil {
+				t.Fatal("expected error (no container)")
+			}
+			// 应该是 "no container" 而非路径验证错误
+			if strings.Contains(err.Error(), "invalid path") {
+				t.Errorf("flag/numeric args should skip path validation: %v", err)
+			}
+		})
+	}
+}
+
+func TestValidateExecCommand_ChainedCommands(t *testing.T) {
+	tests := []struct {
+		name    string
+		cmd     string
+		wantErr bool
+	}{
+		// && 链中不允许的命令
+		{"chain with disallowed rm", "test -f /file && rm -rf /", true},
+		{"chain with disallowed curl", "test -f /file && curl evil.com", true},
+		// && 链中允许 echo
+		{"chain with echo", "test -f /etc/nginx/nginx.conf && echo ok", false},
+		// 三段链都是允许的命令
+		{"triple chain all allowed", "test -f /file && echo exists && ls -1 /dir", false},
+		// 空链段（&& 之间无内容）
+		{"empty chain segment", "test -f /file && && echo ok", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateExecCommand(tt.cmd)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("validateExecCommand(%q) error = %v, wantErr %v", tt.cmd, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestCopyToContainer_NoContainer(t *testing.T) {
+	client := &Client{}
+	err := client.CopyToContainer(context.Background(), "/tmp/cert.pem", "/ssl/cert.pem")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "no container specified") {
+		t.Errorf("expected 'no container specified', got: %v", err)
+	}
+}
+
+func TestCopyToContainer_InvalidPath(t *testing.T) {
+	client := NewClient("test-container")
+	err := client.CopyToContainer(context.Background(), "/tmp/cert.pem", "/ssl/../../../etc/shadow")
+	if err == nil {
+		t.Fatal("expected error for path traversal")
+	}
+	if !strings.Contains(err.Error(), "invalid container path") {
+		t.Errorf("expected 'invalid container path', got: %v", err)
+	}
+}
+
+func TestCopyFromContainer_NoContainer(t *testing.T) {
+	client := &Client{}
+	err := client.CopyFromContainer(context.Background(), "/ssl/cert.pem", "/tmp/cert.pem")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "no container specified") {
+		t.Errorf("expected 'no container specified', got: %v", err)
+	}
+}
+
+func TestCopyFromContainer_InvalidPath(t *testing.T) {
+	client := NewClient("test-container")
+	err := client.CopyFromContainer(context.Background(), "/ssl/../../../etc/shadow", "/tmp/cert.pem")
+	if err == nil {
+		t.Fatal("expected error for path traversal")
+	}
+	if !strings.Contains(err.Error(), "invalid container path") {
+		t.Errorf("expected 'invalid container path', got: %v", err)
+	}
+}
+
+func TestCopyToContainer_RelativePath(t *testing.T) {
+	client := NewClient("test-container")
+	err := client.CopyToContainer(context.Background(), "/tmp/cert.pem", "relative/path")
+	if err == nil {
+		t.Fatal("expected error for relative path")
+	}
+	if !strings.Contains(err.Error(), "invalid container path") {
+		t.Errorf("expected 'invalid container path', got: %v", err)
+	}
+}
+
+func TestCopyFromContainer_EmptyPath(t *testing.T) {
+	client := NewClient("test-container")
+	err := client.CopyFromContainer(context.Background(), "", "/tmp/cert.pem")
+	if err == nil {
+		t.Fatal("expected error for empty path")
+	}
+}
+
+func TestExec_ComposeMode(t *testing.T) {
+	// compose 模式下，允许的命令应走到 docker-compose exec（会失败），不是白名单拒绝
+	client := NewComposeClient("/path/docker-compose.yml", "web")
+	_, err := client.Exec(context.Background(), "nginx -t")
+	if err == nil {
+		t.Fatal("expected error (compose exec fails)")
+	}
+	// 不应是白名单错误
+	if strings.Contains(err.Error(), "not allowed") {
+		t.Errorf("should not be whitelist rejection: %v", err)
+	}
+}
+
+func TestExec_ContainerMode(t *testing.T) {
+	// container 模式下，允许的命令应走到 docker exec（会失败）
+	client := NewClient("test-container-id")
+	_, err := client.Exec(context.Background(), "nginx -t")
+	if err == nil {
+		t.Fatal("expected error (docker exec fails)")
+	}
+	if strings.Contains(err.Error(), "not allowed") {
+		t.Errorf("should not be whitelist rejection: %v", err)
+	}
+}
+
+func TestCopyToContainer_ComposeMode(t *testing.T) {
+	client := NewComposeClient("/path/docker-compose.yml", "web")
+	// 合法容器路径，走到 compose cp（会失败）
+	err := client.CopyToContainer(context.Background(), "/tmp/cert.pem", "/etc/nginx/ssl/cert.pem")
+	if err == nil {
+		t.Fatal("expected error (compose cp fails)")
+	}
+	// 应是 docker cp 执行失败，不是路径验证错误
+	if strings.Contains(err.Error(), "invalid container path") {
+		t.Errorf("should not be path validation error: %v", err)
+	}
+}
+
+func TestCopyFromContainer_ComposeMode(t *testing.T) {
+	client := NewComposeClient("/path/docker-compose.yml", "web")
+	err := client.CopyFromContainer(context.Background(), "/etc/nginx/ssl/cert.pem", "/tmp/cert.pem")
+	if err == nil {
+		t.Fatal("expected error (compose cp fails)")
+	}
+	if strings.Contains(err.Error(), "invalid container path") {
+		t.Errorf("should not be path validation error: %v", err)
+	}
+}
+
+func TestGetContainerInfo_NoContainer(t *testing.T) {
+	client := &Client{}
+	_, err := client.GetContainerInfo(context.Background())
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "no container specified") {
+		t.Errorf("expected 'no container specified', got: %v", err)
 	}
 }
 

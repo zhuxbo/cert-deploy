@@ -3,6 +3,7 @@ package service
 
 import (
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -361,5 +362,61 @@ func TestDefaultConfig_NonNil(t *testing.T) {
 	}
 	if cfg.WorkDir == "" {
 		t.Error("WorkDir 不应为空")
+	}
+}
+
+// TestNew_InvalidServiceName 测试服务名格式校验
+func TestNew_InvalidServiceName(t *testing.T) {
+	tests := []struct {
+		name      string
+		svcName   string
+		wantErr   bool
+		errSubstr string // 期望错误信息包含的子串
+	}{
+		{"空服务名", "", true, "格式无效"},
+		{"含斜杠", "../evil", true, "格式无效"},
+		{"含空格", "my service", true, "格式无效"},
+		{"含分号", "svc;rm", true, "格式无效"},
+		{"含反引号", "svc`cmd`", true, "格式无效"},
+		{"含管道符", "svc|cat", true, "格式无效"},
+		{"含美元符号", "svc$HOME", true, "格式无效"},
+		{"含换行符", "svc\nname", true, "格式无效"},
+		{"含等号", "svc=1", true, "格式无效"},
+		{"含点号", "svc.name", true, "格式无效"},
+		{"超长服务名", strings.Repeat("a", 65), true, "过长"},
+		{"正好64字符", strings.Repeat("a", 64), false, ""},
+		{"正常名称_纯字母", "sslctl", false, ""},
+		{"正常名称_含连字符", "my-service", false, ""},
+		{"正常名称_含下划线", "my_service", false, ""},
+		{"正常名称_含数字", "svc123", false, ""},
+		{"正常名称_混合", "my-svc_01", false, ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &ServiceConfig{
+				Name:        tt.svcName,
+				DisplayName: "Test",
+				Description: "Test",
+				ExecPath:    "/usr/bin/test",
+				WorkDir:     "/tmp",
+			}
+
+			_, err := New(cfg)
+
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("期望错误但未返回，服务名: %q", tt.svcName)
+				}
+				if !strings.Contains(err.Error(), tt.errSubstr) {
+					t.Errorf("错误信息 %q 不包含 %q", err.Error(), tt.errSubstr)
+				}
+			} else {
+				// 校验通过后可能因 init 系统不支持而报错，这不是服务名校验错误
+				if err != nil && (strings.Contains(err.Error(), "格式无效") || strings.Contains(err.Error(), "过长")) {
+					t.Errorf("服务名 %q 不应触发名称校验错误: %v", tt.svcName, err)
+				}
+			}
+		})
 	}
 }

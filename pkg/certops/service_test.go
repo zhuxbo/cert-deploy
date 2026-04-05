@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/zhuxbo/sslctl/pkg/config"
+	"github.com/zhuxbo/sslctl/pkg/fetcher"
 	"github.com/zhuxbo/sslctl/pkg/logger"
 )
 
@@ -293,6 +294,209 @@ func TestCheckExpiry_ExpiredMessage(t *testing.T) {
 	}
 	if strings.Contains(output, "剩余 -") {
 		t.Errorf("不应出现'剩余 -'，实际输出:\n%s", output)
+	}
+}
+
+// TestSyncOrderID 测试同步 API 返回的订单号到本地配置
+func TestSyncOrderID(t *testing.T) {
+	tests := []struct {
+		name          string
+		certOrderID   int
+		certName      string
+		apiOrderID    int
+		wantOrderID   int
+		wantCertName  string // 期望的 cert_name（fixCertName 可能修改）
+		wantRenamed   bool   // 是否期望触发重命名
+	}{
+		{
+			name:         "订单号变化时更新",
+			certOrderID:  100,
+			certName:     "example.com-100",
+			apiOrderID:   200,
+			wantOrderID:  200,
+			wantCertName: "example.com-200",
+			wantRenamed:  true,
+		},
+		{
+			name:         "订单号为 0 时跳过不更新",
+			certOrderID:  100,
+			certName:     "example.com-100",
+			apiOrderID:   0,
+			wantOrderID:  100,
+			wantCertName: "example.com-100",
+			wantRenamed:  false,
+		},
+		{
+			name:         "订单号相同时不更新",
+			certOrderID:  100,
+			certName:     "example.com-100",
+			apiOrderID:   100,
+			wantOrderID:  100,
+			wantCertName: "example.com-100",
+			wantRenamed:  false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			cm, err := config.NewConfigManagerWithDir(dir)
+			if err != nil {
+				t.Fatalf("创建配置管理器失败: %v", err)
+			}
+
+			// 添加证书到配置
+			origCert := &config.CertConfig{
+				CertName: tt.certName,
+				OrderID:  tt.certOrderID,
+				Enabled:  true,
+			}
+			if err := cm.AddCert(origCert); err != nil {
+				t.Fatalf("添加证书失败: %v", err)
+			}
+
+			log := logger.NewNopLogger()
+			svc := NewService(cm, log)
+
+			// 构造内存中的 cert（模拟从 GetCert 返回的深拷贝）
+			cert := &config.CertConfig{
+				CertName: tt.certName,
+				OrderID:  tt.certOrderID,
+				Enabled:  true,
+			}
+
+			certData := &fetcher.CertData{
+				OrderID: tt.apiOrderID,
+			}
+
+			svc.syncOrderID(cert, certData)
+
+			if cert.OrderID != tt.wantOrderID {
+				t.Errorf("OrderID = %d, 期望 %d", cert.OrderID, tt.wantOrderID)
+			}
+			if cert.CertName != tt.wantCertName {
+				t.Errorf("CertName = %s, 期望 %s", cert.CertName, tt.wantCertName)
+			}
+		})
+	}
+}
+
+// TestFixCertName 测试修正 cert_name 中的订单号后缀
+func TestFixCertName(t *testing.T) {
+	tests := []struct {
+		name        string
+		certName    string
+		orderID     int
+		wantName    string
+		wantRenamed bool
+	}{
+		{
+			name:        "cert_name 不含 - 直接返回",
+			certName:    "example.com",
+			orderID:     123,
+			wantName:    "example.com",
+			wantRenamed: false,
+		},
+		{
+			name:        "订单号需要修正",
+			certName:    "example.com-100",
+			orderID:     200,
+			wantName:    "example.com-200",
+			wantRenamed: true,
+		},
+		{
+			name:        "订单号已正确不修改",
+			certName:    "example.com-123",
+			orderID:     123,
+			wantName:    "example.com-123",
+			wantRenamed: false,
+		},
+		{
+			name:        "多个 - 时只修改最后一段",
+			certName:    "sub-domain.example.com-100",
+			orderID:     300,
+			wantName:    "sub-domain.example.com-300",
+			wantRenamed: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			cm, err := config.NewConfigManagerWithDir(dir)
+			if err != nil {
+				t.Fatalf("创建配置管理器失败: %v", err)
+			}
+
+			// 添加证书到配置（RenameCert 需要能找到旧名称）
+			origCert := &config.CertConfig{
+				CertName: tt.certName,
+				OrderID:  tt.orderID,
+				Enabled:  true,
+			}
+			if err := cm.AddCert(origCert); err != nil {
+				t.Fatalf("添加证书失败: %v", err)
+			}
+
+			log := logger.NewNopLogger()
+			svc := NewService(cm, log)
+
+			cert := &config.CertConfig{
+				CertName: tt.certName,
+				OrderID:  tt.orderID,
+				Enabled:  true,
+			}
+
+			svc.fixCertName(cert)
+
+			if cert.CertName != tt.wantName {
+				t.Errorf("CertName = %s, 期望 %s", cert.CertName, tt.wantName)
+			}
+
+			// 如果期望重命名，验证配置中的证书名已更新
+			if tt.wantRenamed {
+				// 旧名称应该找不到
+				_, err := cm.GetCert(tt.certName)
+				if err == nil {
+					t.Error("旧名称应已不存在")
+				}
+				// 新名称应该能找到
+				updated, err := cm.GetCert(tt.wantName)
+				if err != nil {
+					t.Errorf("新名称应能找到: %v", err)
+				} else if updated.CertName != tt.wantName {
+					t.Errorf("配置中的 CertName = %s, 期望 %s", updated.CertName, tt.wantName)
+				}
+			}
+		})
+	}
+}
+
+// TestFixCertName_RenameFail 测试重命名失败时不 panic
+func TestFixCertName_RenameFail(t *testing.T) {
+	dir := t.TempDir()
+	cm, err := config.NewConfigManagerWithDir(dir)
+	if err != nil {
+		t.Fatalf("创建配置管理器失败: %v", err)
+	}
+
+	// 不添加证书到配置，让 RenameCert 找不到旧名称而失败
+
+	log := logger.NewNopLogger()
+	svc := NewService(cm, log)
+
+	cert := &config.CertConfig{
+		CertName: "example.com-100",
+		OrderID:  200,
+		Enabled:  true,
+	}
+
+	// 不应 panic，只是记录 warn 日志
+	svc.fixCertName(cert)
+
+	// cert.CertName 仍然会被修改（内存中）
+	if cert.CertName != "example.com-200" {
+		t.Errorf("CertName = %s, 期望 example.com-200", cert.CertName)
 	}
 }
 

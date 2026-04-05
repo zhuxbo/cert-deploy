@@ -2,6 +2,7 @@
 package backup
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -739,5 +740,595 @@ func TestManager_BackupChainNotExist(t *testing.T) {
 	meta, _ := m.LoadMetadata(result.BackupPath)
 	if meta.ChainPath != "" {
 		t.Errorf("ChainPath should be empty when chain backup fails, got %s", meta.ChainPath)
+	}
+}
+
+// TestRestore_PathTraversal 测试 Restore 拒绝含 .. 的 timestamp（路径穿越防护）
+func TestRestore_PathTraversal(t *testing.T) {
+	dir := t.TempDir()
+	m := NewManager(dir, 5)
+
+	// 这些 timestamp 与 siteName 拼接后会逃逸出 backupDir
+	traversalTimestamps := []string{
+		"../../etc",
+		"../../../tmp/evil",
+	}
+
+	for _, ts := range traversalTimestamps {
+		_, err := m.Restore("example.com", ts)
+		if err == nil {
+			t.Errorf("Restore() with timestamp %q should return error", ts)
+			continue
+		}
+		if !strings.Contains(err.Error(), "invalid backup path") {
+			t.Errorf("Restore() with timestamp %q: error = %v, want 'invalid backup path'", ts, err)
+		}
+	}
+
+	// 边界情况：timestamp 含 .. 但拼接后仍在 backupDir 下（如 ../secret 与 example.com 拼接后为 secret）
+	// 此时 JoinUnderDir 不会拒绝（结果仍在 baseDir 下），但备份不存在会返回其他错误
+	_, err := m.Restore("example.com", "../secret")
+	if err == nil {
+		t.Error("Restore() with ../secret should return error (backup does not exist)")
+	}
+}
+
+// TestDeleteBackup_PathTraversal 测试 DeleteBackup 拒绝含 .. 的 timestamp（路径穿越防护）
+func TestDeleteBackup_PathTraversal(t *testing.T) {
+	dir := t.TempDir()
+	m := NewManager(dir, 5)
+
+	// 这些 timestamp 与 siteName 拼接后会逃逸出 backupDir
+	traversalTimestamps := []string{
+		"../../etc",
+		"../../../tmp/evil",
+	}
+
+	for _, ts := range traversalTimestamps {
+		err := m.DeleteBackup("example.com", ts)
+		if err == nil {
+			t.Errorf("DeleteBackup() with timestamp %q should return error", ts)
+			continue
+		}
+		if !strings.Contains(err.Error(), "invalid backup path") {
+			t.Errorf("DeleteBackup() with timestamp %q: error = %v, want 'invalid backup path'", ts, err)
+		}
+	}
+}
+
+// TestDeleteAllBackups_PathTraversal 测试 DeleteAllBackups 拒绝含 .. 的 siteName（路径穿越防护）
+func TestDeleteAllBackups_PathTraversal(t *testing.T) {
+	dir := t.TempDir()
+	m := NewManager(dir, 5)
+
+	// 这些 siteName 会逃逸出 backupDir
+	traversalSiteNames := []string{
+		"../../etc",
+		"../secret",
+	}
+
+	for _, site := range traversalSiteNames {
+		err := m.DeleteAllBackups(site)
+		if err == nil {
+			t.Errorf("DeleteAllBackups() with siteName %q should return error", site)
+			continue
+		}
+		if !strings.Contains(err.Error(), "invalid site name") {
+			t.Errorf("DeleteAllBackups() with siteName %q: error = %v, want 'invalid site name'", site, err)
+		}
+	}
+}
+
+// TestNewManager_KeepVersionsBoundary 测试 keepVersions 边界值自动修正为 5
+func TestNewManager_KeepVersionsBoundary(t *testing.T) {
+	tests := []struct {
+		name         string
+		keepVersions int
+		want         int
+	}{
+		{"zero", 0, 5},
+		{"negative", -1, 5},
+		{"negative_large", -100, 5},
+		{"one", 1, 1},
+		{"normal", 3, 3},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := NewManager("/tmp/test", tt.keepVersions)
+			if m.keepVersions != tt.want {
+				t.Errorf("NewManager(keepVersions=%d).keepVersions = %d, want %d", tt.keepVersions, m.keepVersions, tt.want)
+			}
+		})
+	}
+}
+
+// TestRestore_MissingBackupFiles 测试备份目录存在但 cert.pem 缺失时 Restore 报错
+func TestRestore_MissingBackupFiles(t *testing.T) {
+	dir := t.TempDir()
+	backupDir := filepath.Join(dir, "backup")
+	siteName := "example.com"
+	timestamp := "20240101-120000"
+
+	// 手动构造备份目录：仅有 metadata.json，没有 cert.pem / key.pem
+	backupPath := filepath.Join(backupDir, siteName, timestamp)
+	_ = os.MkdirAll(backupPath, 0700)
+
+	metadata := &Metadata{
+		ServerName: siteName,
+		BackupAt:   time.Now(),
+		CertPath:   filepath.Join(dir, "src", "cert.pem"),
+		KeyPath:    filepath.Join(dir, "src", "key.pem"),
+	}
+	metaData, _ := json.MarshalIndent(metadata, "", "  ")
+	_ = os.WriteFile(filepath.Join(backupPath, "metadata.json"), metaData, 0600)
+
+	m := NewManager(backupDir, 5)
+
+	// cert.pem 不存在应报错
+	_, err := m.Restore(siteName, timestamp)
+	if err == nil {
+		t.Fatal("Restore() should fail when cert.pem is missing")
+	}
+	if !strings.Contains(err.Error(), "备份证书文件不存在") {
+		t.Errorf("error should mention missing cert, got: %v", err)
+	}
+
+	// 创建 cert.pem 但不创建 key.pem，验证 key.pem 缺失也报错
+	_ = os.WriteFile(filepath.Join(backupPath, "cert.pem"), []byte("cert"), 0644)
+	_, err = m.Restore(siteName, timestamp)
+	if err == nil {
+		t.Fatal("Restore() should fail when key.pem is missing")
+	}
+	if !strings.Contains(err.Error(), "备份私钥文件不存在") {
+		t.Errorf("error should mention missing key, got: %v", err)
+	}
+}
+
+// TestRestore_EmptyMetadataPaths 测试备份元数据中 CertPath/KeyPath 为空时 Restore 报错
+func TestRestore_EmptyMetadataPaths(t *testing.T) {
+	dir := t.TempDir()
+	backupDir := filepath.Join(dir, "backup")
+	siteName := "example.com"
+	timestamp := "20240101-120000"
+
+	backupPath := filepath.Join(backupDir, siteName, timestamp)
+	_ = os.MkdirAll(backupPath, 0700)
+
+	// 创建备份文件但 metadata 中路径为空
+	_ = os.WriteFile(filepath.Join(backupPath, "cert.pem"), []byte("cert"), 0644)
+	_ = os.WriteFile(filepath.Join(backupPath, "key.pem"), []byte("key"), 0600)
+
+	metadata := &Metadata{
+		ServerName: siteName,
+		BackupAt:   time.Now(),
+		CertPath:   "", // 空路径
+		KeyPath:    "", // 空路径
+	}
+	metaData, _ := json.MarshalIndent(metadata, "", "  ")
+	_ = os.WriteFile(filepath.Join(backupPath, "metadata.json"), metaData, 0600)
+
+	m := NewManager(backupDir, 5)
+
+	_, err := m.Restore(siteName, timestamp)
+	if err == nil {
+		t.Fatal("Restore() should fail when metadata paths are empty")
+	}
+	if !strings.Contains(err.Error(), "CertPath 或 KeyPath 为空") {
+		t.Errorf("error should mention empty paths, got: %v", err)
+	}
+}
+
+// TestRestore_WithChainFile 测试带证书链文件的完整恢复流程
+func TestRestore_WithChainFile(t *testing.T) {
+	dir := t.TempDir()
+	backupDir := filepath.Join(dir, "backup")
+	srcDir := filepath.Join(dir, "src")
+	_ = os.MkdirAll(srcDir, 0755)
+
+	certPath := filepath.Join(srcDir, "cert.pem")
+	keyPath := filepath.Join(srcDir, "key.pem")
+	chainPath := filepath.Join(srcDir, "chain.pem")
+	_ = os.WriteFile(certPath, []byte("original cert"), 0644)
+	_ = os.WriteFile(keyPath, []byte("original key"), 0600)
+	_ = os.WriteFile(chainPath, []byte("original chain"), 0644)
+
+	m := NewManager(backupDir, 5)
+
+	// 备份含 chain 的证书
+	result, err := m.Backup("example.com", certPath, keyPath, &CertInfo{Subject: "v1"}, chainPath)
+	if err != nil {
+		t.Fatalf("Backup() error = %v", err)
+	}
+	backupTS := filepath.Base(result.BackupPath)
+
+	time.Sleep(time.Second)
+
+	// 修改源文件
+	_ = os.WriteFile(certPath, []byte("new cert"), 0644)
+	_ = os.WriteFile(keyPath, []byte("new key"), 0600)
+	_ = os.WriteFile(chainPath, []byte("new chain"), 0644)
+
+	// 恢复
+	meta, err := m.Restore("example.com", backupTS)
+	if err != nil {
+		t.Fatalf("Restore() error = %v", err)
+	}
+	if meta.ChainPath != chainPath {
+		t.Errorf("restored ChainPath = %s, want %s", meta.ChainPath, chainPath)
+	}
+
+	// 验证证书链文件已恢复
+	chainData, _ := os.ReadFile(chainPath)
+	if string(chainData) != "original chain" {
+		t.Errorf("chain not restored, got %q", string(chainData))
+	}
+}
+
+// TestLoadMetadata_InvalidJSON 测试加载损坏的 JSON 元数据
+func TestLoadMetadata_InvalidJSON(t *testing.T) {
+	dir := t.TempDir()
+	backupPath := filepath.Join(dir, "backup")
+	_ = os.MkdirAll(backupPath, 0700)
+
+	// 写入无效 JSON
+	_ = os.WriteFile(filepath.Join(backupPath, "metadata.json"), []byte("not json{"), 0600)
+
+	m := NewManager(dir, 5)
+	_, err := m.LoadMetadata(backupPath)
+	if err == nil {
+		t.Fatal("LoadMetadata() should fail for invalid JSON")
+	}
+	if !strings.Contains(err.Error(), "failed to parse metadata") {
+		t.Errorf("error should mention parse failure, got: %v", err)
+	}
+}
+
+// TestRestore_LatestBackup 测试不指定 timestamp 时恢复最新备份
+func TestRestore_LatestBackup(t *testing.T) {
+	dir := t.TempDir()
+	backupDir := filepath.Join(dir, "backup")
+	srcDir := filepath.Join(dir, "src")
+	_ = os.MkdirAll(srcDir, 0755)
+
+	certPath := filepath.Join(srcDir, "cert.pem")
+	keyPath := filepath.Join(srcDir, "key.pem")
+	_ = os.WriteFile(certPath, []byte("cert v1"), 0644)
+	_ = os.WriteFile(keyPath, []byte("key v1"), 0600)
+
+	m := NewManager(backupDir, 5)
+
+	// 创建第一个备份
+	_, err := m.Backup("example.com", certPath, keyPath, &CertInfo{Subject: "v1"})
+	if err != nil {
+		t.Fatalf("Backup() v1 error = %v", err)
+	}
+
+	time.Sleep(time.Second)
+
+	// 创建第二个备份
+	_ = os.WriteFile(certPath, []byte("cert v2"), 0644)
+	_ = os.WriteFile(keyPath, []byte("key v2"), 0600)
+	_, err = m.Backup("example.com", certPath, keyPath, &CertInfo{Subject: "v2"})
+	if err != nil {
+		t.Fatalf("Backup() v2 error = %v", err)
+	}
+
+	// 等待确保恢复时内部备份的时间戳不同于 v2
+	time.Sleep(time.Second)
+
+	// 修改文件为 v3
+	_ = os.WriteFile(certPath, []byte("cert v3"), 0644)
+	_ = os.WriteFile(keyPath, []byte("key v3"), 0600)
+
+	// 不指定 timestamp，应恢复最新备份（v2）
+	meta, err := m.Restore("example.com")
+	if err != nil {
+		t.Fatalf("Restore() error = %v", err)
+	}
+	if meta.CertInfo.Subject != "v2" {
+		t.Errorf("restored Subject = %s, want v2", meta.CertInfo.Subject)
+	}
+
+	certData, _ := os.ReadFile(certPath)
+	if string(certData) != "cert v2" {
+		t.Errorf("cert not restored to v2, got %q", string(certData))
+	}
+}
+
+// TestRestore_TimestampNotExist 测试指定不存在的 timestamp 时 Restore 报错
+func TestRestore_TimestampNotExist(t *testing.T) {
+	dir := t.TempDir()
+	backupDir := filepath.Join(dir, "backup")
+	// 创建站点目录使其存在
+	_ = os.MkdirAll(filepath.Join(backupDir, "example.com"), 0755)
+
+	m := NewManager(backupDir, 5)
+
+	_, err := m.Restore("example.com", "99990101-000000")
+	if err == nil {
+		t.Fatal("Restore() should fail for nonexistent timestamp")
+	}
+	if !strings.Contains(err.Error(), "备份不存在") {
+		t.Errorf("error should mention backup not exist, got: %v", err)
+	}
+}
+
+// TestListBackups_ReadDirError 测试 ListBackups 对非目录的处理
+func TestListBackups_ReadDirError(t *testing.T) {
+	dir := t.TempDir()
+	// 创建一个文件代替目录
+	sitePath := filepath.Join(dir, "example.com")
+	_ = os.WriteFile(sitePath, []byte("not a dir"), 0644)
+
+	m := NewManager(dir, 5)
+
+	_, err := m.ListBackups("example.com")
+	if err == nil {
+		t.Fatal("ListBackups() should fail when site path is a file, not a directory")
+	}
+	if !strings.Contains(err.Error(), "failed to read backup directory") {
+		t.Errorf("error should mention read failure, got: %v", err)
+	}
+}
+
+// TestBackup_KeySymlink 测试 cert 正常但 key 为符号链接时备份失败
+func TestBackup_KeySymlink(t *testing.T) {
+	dir := t.TempDir()
+	backupDir := filepath.Join(dir, "backup")
+	srcDir := filepath.Join(dir, "src")
+	_ = os.MkdirAll(srcDir, 0755)
+
+	certPath := filepath.Join(srcDir, "cert.pem")
+	_ = os.WriteFile(certPath, []byte("cert content"), 0644)
+
+	// key 为符号链接
+	realKeyPath := filepath.Join(srcDir, "real-key.pem")
+	_ = os.WriteFile(realKeyPath, []byte("key content"), 0600)
+	keyPath := filepath.Join(srcDir, "key.pem")
+	if err := os.Symlink(realKeyPath, keyPath); err != nil {
+		t.Skip("无法创建符号链接:", err)
+	}
+
+	m := NewManager(backupDir, 3)
+
+	_, err := m.Backup("example.com", certPath, keyPath, nil)
+	if err == nil {
+		t.Error("Backup() should fail when key is symlink")
+	}
+	if !strings.Contains(err.Error(), "failed to hash private key file") {
+		t.Errorf("error should mention key hash failure, got: %v", err)
+	}
+}
+
+// TestGetLatestBackup_ListError 测试 GetLatestBackup 当目录不可读时
+func TestGetLatestBackup_ListError(t *testing.T) {
+	dir := t.TempDir()
+	// 创建一个文件代替目录，使 ListBackups 返回错误
+	sitePath := filepath.Join(dir, "example.com")
+	_ = os.WriteFile(sitePath, []byte("not a dir"), 0644)
+
+	m := NewManager(dir, 5)
+
+	_, err := m.GetLatestBackup("example.com")
+	if err == nil {
+		t.Fatal("GetLatestBackup() should fail when ListBackups fails")
+	}
+}
+
+// TestRestore_MetadataLoadError 测试 Restore 加载损坏元数据时报错
+func TestRestore_MetadataLoadError(t *testing.T) {
+	dir := t.TempDir()
+	backupDir := filepath.Join(dir, "backup")
+	siteName := "example.com"
+	timestamp := "20240101-120000"
+
+	backupPath := filepath.Join(backupDir, siteName, timestamp)
+	_ = os.MkdirAll(backupPath, 0700)
+
+	// 写入损坏的 metadata
+	_ = os.WriteFile(filepath.Join(backupPath, "metadata.json"), []byte("{invalid"), 0600)
+
+	m := NewManager(backupDir, 5)
+
+	_, err := m.Restore(siteName, timestamp)
+	if err == nil {
+		t.Fatal("Restore() should fail with invalid metadata")
+	}
+	if !strings.Contains(err.Error(), "加载备份元数据失败") {
+		t.Errorf("error should mention metadata load failure, got: %v", err)
+	}
+}
+
+// TestRestore_SkipPreBackupWhenFilesNotExist 测试 Restore 时目标文件不存在时跳过恢复前备份
+func TestRestore_SkipPreBackupWhenFilesNotExist(t *testing.T) {
+	dir := t.TempDir()
+	backupDir := filepath.Join(dir, "backup")
+	srcDir := filepath.Join(dir, "src")
+	siteName := "example.com"
+	timestamp := "20240101-120000"
+
+	backupPath := filepath.Join(backupDir, siteName, timestamp)
+	_ = os.MkdirAll(backupPath, 0700)
+
+	// 目标路径指向一个不存在的目录
+	certDest := filepath.Join(srcDir, "cert.pem")
+	keyDest := filepath.Join(srcDir, "key.pem")
+
+	// 创建完整的备份
+	_ = os.WriteFile(filepath.Join(backupPath, "cert.pem"), []byte("backup cert"), 0644)
+	_ = os.WriteFile(filepath.Join(backupPath, "key.pem"), []byte("backup key"), 0600)
+
+	metadata := &Metadata{
+		ServerName: siteName,
+		BackupAt:   time.Now(),
+		CertPath:   certDest,
+		KeyPath:    keyDest,
+	}
+	metaData, _ := json.MarshalIndent(metadata, "", "  ")
+	_ = os.WriteFile(filepath.Join(backupPath, "metadata.json"), metaData, 0600)
+
+	m := NewManager(backupDir, 5)
+
+	// 确保目标目录存在（CopyFile 需要）
+	_ = os.MkdirAll(srcDir, 0755)
+
+	// 目标文件不存在，应跳过恢复前备份，直接恢复
+	meta, err := m.Restore(siteName, timestamp)
+	if err != nil {
+		t.Fatalf("Restore() error = %v", err)
+	}
+	if meta.ServerName != siteName {
+		t.Errorf("restored ServerName = %s, want %s", meta.ServerName, siteName)
+	}
+
+	// 验证文件已恢复
+	certData, _ := os.ReadFile(certDest)
+	if string(certData) != "backup cert" {
+		t.Errorf("cert not restored, got %q", string(certData))
+	}
+}
+
+// TestRestore_CopyFail 测试 Restore 恢复证书文件失败（目标目录不存在）
+func TestRestore_CopyFail(t *testing.T) {
+	dir := t.TempDir()
+	backupDir := filepath.Join(dir, "backup")
+	siteName := "example.com"
+	timestamp := "20240101-120000"
+
+	backupPath := filepath.Join(backupDir, siteName, timestamp)
+	_ = os.MkdirAll(backupPath, 0700)
+
+	// 创建备份文件
+	_ = os.WriteFile(filepath.Join(backupPath, "cert.pem"), []byte("cert"), 0644)
+	_ = os.WriteFile(filepath.Join(backupPath, "key.pem"), []byte("key"), 0600)
+
+	// metadata 中 CertPath 指向一个不存在的目录（CopyFile 会失败）
+	metadata := &Metadata{
+		ServerName: siteName,
+		BackupAt:   time.Now(),
+		CertPath:   filepath.Join(dir, "nonexistent-dir", "cert.pem"),
+		KeyPath:    filepath.Join(dir, "nonexistent-dir", "key.pem"),
+	}
+	metaData, _ := json.MarshalIndent(metadata, "", "  ")
+	_ = os.WriteFile(filepath.Join(backupPath, "metadata.json"), metaData, 0600)
+
+	m := NewManager(backupDir, 5)
+
+	_, err := m.Restore(siteName, timestamp)
+	if err == nil {
+		t.Fatal("Restore() should fail when target directory does not exist")
+	}
+	if !strings.Contains(err.Error(), "恢复证书失败") {
+		t.Errorf("error should mention cert restore failure, got: %v", err)
+	}
+}
+
+// TestRestore_KeyCopyFail 测试 Restore 恢复私钥文件失败
+func TestRestore_KeyCopyFail(t *testing.T) {
+	dir := t.TempDir()
+	backupDir := filepath.Join(dir, "backup")
+	srcDir := filepath.Join(dir, "src")
+	siteName := "example.com"
+	timestamp := "20240101-120000"
+
+	backupPath := filepath.Join(backupDir, siteName, timestamp)
+	_ = os.MkdirAll(backupPath, 0700)
+	_ = os.MkdirAll(srcDir, 0755)
+
+	// 创建备份文件
+	_ = os.WriteFile(filepath.Join(backupPath, "cert.pem"), []byte("cert"), 0644)
+	_ = os.WriteFile(filepath.Join(backupPath, "key.pem"), []byte("key"), 0600)
+
+	// CertPath 正常，KeyPath 指向不存在的目录
+	metadata := &Metadata{
+		ServerName: siteName,
+		BackupAt:   time.Now(),
+		CertPath:   filepath.Join(srcDir, "cert.pem"),
+		KeyPath:    filepath.Join(dir, "nonexistent-dir", "key.pem"),
+	}
+	metaData, _ := json.MarshalIndent(metadata, "", "  ")
+	_ = os.WriteFile(filepath.Join(backupPath, "metadata.json"), metaData, 0600)
+
+	m := NewManager(backupDir, 5)
+
+	_, err := m.Restore(siteName, timestamp)
+	if err == nil {
+		t.Fatal("Restore() should fail when key target directory does not exist")
+	}
+	if !strings.Contains(err.Error(), "恢复私钥失败") {
+		t.Errorf("error should mention key restore failure, got: %v", err)
+	}
+}
+
+// TestRestore_PreBackupFail 测试 Restore 恢复前备份当前文件失败
+func TestRestore_PreBackupFail(t *testing.T) {
+	dir := t.TempDir()
+	backupDir := filepath.Join(dir, "backup")
+	srcDir := filepath.Join(dir, "src")
+	siteName := "example.com"
+	timestamp := "20240101-120000"
+	_ = os.MkdirAll(srcDir, 0755)
+
+	backupPath := filepath.Join(backupDir, siteName, timestamp)
+	_ = os.MkdirAll(backupPath, 0700)
+
+	certDest := filepath.Join(srcDir, "cert.pem")
+	keyDest := filepath.Join(srcDir, "key.pem")
+
+	// 备份文件
+	_ = os.WriteFile(filepath.Join(backupPath, "cert.pem"), []byte("backup cert"), 0644)
+	_ = os.WriteFile(filepath.Join(backupPath, "key.pem"), []byte("backup key"), 0600)
+
+	metadata := &Metadata{
+		ServerName: siteName,
+		BackupAt:   time.Now(),
+		CertPath:   certDest,
+		KeyPath:    keyDest,
+	}
+	metaData, _ := json.MarshalIndent(metadata, "", "  ")
+	_ = os.WriteFile(filepath.Join(backupPath, "metadata.json"), metaData, 0600)
+
+	// 当前目标文件存在（触发恢复前备份）
+	_ = os.WriteFile(certDest, []byte("current cert"), 0644)
+	_ = os.WriteFile(keyDest, []byte("current key"), 0600)
+
+	// 设置站点备份目录为只读，使 backupWithoutCleanup 创建新目录失败
+	siteBackupDir := filepath.Join(backupDir, siteName)
+	_ = os.Chmod(siteBackupDir, 0555)
+
+	m := NewManager(backupDir, 5)
+
+	_, err := m.Restore(siteName, timestamp)
+
+	// 恢复权限以便 TempDir 清理
+	_ = os.Chmod(siteBackupDir, 0755)
+
+	if err == nil {
+		t.Fatal("Restore() should fail when pre-backup fails")
+	}
+	if !strings.Contains(err.Error(), "恢复前备份当前文件失败") {
+		t.Errorf("error should mention pre-backup failure, got: %v", err)
+	}
+}
+
+// TestBackup_KeyNotExist 测试 cert 正常��� key 不存在时���份失败
+func TestBackup_KeyNotExist(t *testing.T) {
+	dir := t.TempDir()
+	backupDir := filepath.Join(dir, "backup")
+	srcDir := filepath.Join(dir, "src")
+	_ = os.MkdirAll(srcDir, 0755)
+
+	certPath := filepath.Join(srcDir, "cert.pem")
+	_ = os.WriteFile(certPath, []byte("cert content"), 0644)
+
+	m := NewManager(backupDir, 3)
+
+	_, err := m.Backup("example.com", certPath, filepath.Join(srcDir, "nonexistent-key.pem"), nil)
+	if err == nil {
+		t.Error("Backup() should fail when key file does not exist")
+	}
+	if !strings.Contains(err.Error(), "failed to hash private key file") {
+		t.Errorf("error should mention key hash failure, got: %v", err)
 	}
 }

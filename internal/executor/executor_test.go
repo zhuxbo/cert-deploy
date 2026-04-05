@@ -283,6 +283,186 @@ func TestRunScanContext_NotAllowed(t *testing.T) {
 	}
 }
 
+// TestRunScanContext_ArgsWithValueParam 测试带值参数跳过白名单检查逻辑
+func TestRunScanContext_ArgsWithValueParam(t *testing.T) {
+	ctx := t.Context()
+
+	tests := []struct {
+		name        string
+		executable  string
+		args        []string
+		shouldBlock bool // true 表示应被白名单拒绝
+	}{
+		{
+			name:        "-p带路径值应跳过",
+			executable:  "nginx",
+			args:        []string{"-p", "/custom/path"},
+			shouldBlock: false,
+		},
+		{
+			name:        "-k带信号值应跳过",
+			executable:  "nginx",
+			args:        []string{"-k", "reload"},
+			shouldBlock: false,
+		},
+		{
+			name:        "-p带Windows路径",
+			executable:  "nginx",
+			args:        []string{"-t", "-p", "C:\\nginx\\conf"},
+			shouldBlock: false,
+		},
+		{
+			name:        "-k带graceful",
+			executable:  "httpd",
+			args:        []string{"-k", "graceful"},
+			shouldBlock: false,
+		},
+		{
+			name:        "不带值的非法参数应拒绝",
+			executable:  "nginx",
+			args:        []string{"--evil-flag"},
+			shouldBlock: true,
+		},
+		{
+			name:        "非法参数在合法参数之后",
+			executable:  "nginx",
+			args:        []string{"-t", "--inject"},
+			shouldBlock: true,
+		},
+		{
+			name:        "-p后无值且后面跟非法参数",
+			executable:  "nginx",
+			args:        []string{"-p"},
+			shouldBlock: false, // -p 是合法参数，只是没有下一个值可跳过
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := RunScanContext(ctx, tt.executable, tt.args...)
+			if tt.shouldBlock {
+				if err == nil {
+					t.Errorf("RunScanContext(%q, %v) 应该返回错误", tt.executable, tt.args)
+				} else if !contains(err.Error(), "not in scan whitelist") {
+					t.Errorf("RunScanContext(%q, %v) 应因白名单拒绝，实际错误: %v", tt.executable, tt.args, err)
+				}
+			} else {
+				// 不应被白名单拒绝（命令执行失败是允许的）
+				if err != nil && contains(err.Error(), "not in scan whitelist") {
+					t.Errorf("RunScanContext(%q, %v) 不应被白名单拒绝，但收到: %v", tt.executable, tt.args, err)
+				}
+			}
+		})
+	}
+}
+
+// TestRunDetached_NotAllowed 测试 RunDetached 拒绝非白名单可执行文件
+func TestRunDetached_NotAllowed(t *testing.T) {
+	tests := []struct {
+		name       string
+		executable string
+		args       []string
+	}{
+		{"bash被拒绝", "bash", []string{"-c", "echo hacked"}},
+		{"rm被拒绝", "rm", []string{"-rf", "/"}},
+		{"python被拒绝", "python", []string{"-c", "print('hi')"}},
+		{"curl被拒绝", "curl", []string{"http://evil.com"}},
+		{"完整路径被拒绝", "/usr/bin/bash", []string{"-c", "echo"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := RunDetached(tt.executable, tt.args...)
+			if err == nil {
+				t.Errorf("RunDetached(%q, %v) 应该返回错误", tt.executable, tt.args)
+			}
+			if err != nil && !contains(err.Error(), "not in whitelist") {
+				t.Errorf("RunDetached(%q, %v) 错误应包含 'not in whitelist'，实际: %v", tt.executable, tt.args, err)
+			}
+		})
+	}
+}
+
+// TestRunDetached_Allowed 测试 RunDetached 允许白名单内的可执行文件
+func TestRunDetached_Allowed(t *testing.T) {
+	tests := []struct {
+		name       string
+		executable string
+		args       []string
+	}{
+		{"nginx直接名称", "nginx", []string{"-s", "reload"}},
+		{"httpd直接名称", "httpd", nil},
+		{"绝对路径提取basename", "/usr/sbin/nginx", []string{"-t"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := RunDetached(tt.executable, tt.args...)
+			// 不应因白名单拒绝（实际执行失败是预期的，如可执行文件不存在）
+			if err != nil && contains(err.Error(), "not in whitelist") {
+				t.Errorf("RunDetached(%q, %v) 不应被白名单拒绝，但收到: %v", tt.executable, tt.args, err)
+			}
+		})
+	}
+}
+
+// TestRunContext_DynamicFallback 测试绝对路径动态回退到 RunScanContext
+func TestRunContext_DynamicFallback(t *testing.T) {
+	ctx := t.Context()
+
+	tests := []struct {
+		name        string
+		cmd         string
+		shouldBlock bool // true 表示应被白名单拒绝
+	}{
+		{
+			name:        "非标准路径nginx-t通过动态回退",
+			cmd:         "/usr/local/nginx/sbin/nginx -t",
+			shouldBlock: false,
+		},
+		{
+			name:        "非标准路径nginx-T通过动态回退",
+			cmd:         "/opt/nginx/sbin/nginx -T",
+			shouldBlock: false,
+		},
+		{
+			name:        "非标准路径httpd-t通过动态回退",
+			cmd:         "/opt/apache/bin/httpd -t",
+			shouldBlock: false,
+		},
+		{
+			name:        "非白名单可执行文件被拒绝",
+			cmd:         "/usr/bin/bash -c echo",
+			shouldBlock: true,
+		},
+		{
+			name:        "无参数的未知命令被拒绝",
+			cmd:         "unknown-tool",
+			shouldBlock: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := RunContext(ctx, tt.cmd)
+			if tt.shouldBlock {
+				if err == nil {
+					t.Errorf("RunContext(%q) 应该返回错误", tt.cmd)
+				}
+				// 对于白名单拒绝，检查错误信息
+				if err != nil && !contains(err.Error(), "whitelist") && !contains(err.Error(), "not in scan whitelist") {
+					t.Errorf("RunContext(%q) 应因白名单拒绝，实际错误: %v", tt.cmd, err)
+				}
+			} else {
+				// 不应因白名单拒绝（命令执行失败是允许的）
+				if err != nil && (contains(err.Error(), "not in whitelist") || contains(err.Error(), "not in scan whitelist")) {
+					t.Errorf("RunContext(%q) 不应被白名单拒绝，但收到: %v", tt.cmd, err)
+				}
+			}
+		})
+	}
+}
+
 // TestDefaultTimeout 测试默认超时常量
 func TestDefaultTimeout(t *testing.T) {
 	if DefaultTimeout <= 0 {

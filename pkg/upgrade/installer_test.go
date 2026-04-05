@@ -664,3 +664,90 @@ func TestAddReleasePublicKey(t *testing.T) {
 		t.Error("key not added to keyring")
 	}
 }
+
+func TestInstallTo_Overwrite(t *testing.T) {
+	// 测试覆盖已有文件（触发 os.Rename 在同一文件系统上的正常覆盖）
+	tmpDir := t.TempDir()
+	binPath := filepath.Join(tmpDir, "sslctl-test")
+
+	// 先写入旧文件
+	if err := os.WriteFile(binPath, []byte("old binary"), 0755); err != nil {
+		t.Fatalf("write old file: %v", err)
+	}
+
+	content := []byte("new binary v2")
+	gzData := makeGzipData(t, content)
+
+	result, err := installTo(gzData, binPath)
+	if err != nil {
+		t.Fatalf("installTo: %v", err)
+	}
+	if result != binPath {
+		t.Errorf("result = %q, want %q", result, binPath)
+	}
+
+	got, err := os.ReadFile(binPath)
+	if err != nil {
+		t.Fatalf("read file: %v", err)
+	}
+	if !bytes.Equal(got, content) {
+		t.Errorf("content = %q, want %q", got, content)
+	}
+}
+
+func TestCopyFile_DstDirNotExist(t *testing.T) {
+	tmpDir := t.TempDir()
+	srcPath := filepath.Join(tmpDir, "src")
+	dstPath := filepath.Join(tmpDir, "nonexistent", "dst")
+
+	if err := os.WriteFile(srcPath, []byte("test"), 0644); err != nil {
+		t.Fatalf("write src: %v", err)
+	}
+
+	err := copyFile(srcPath, dstPath)
+	if err == nil {
+		t.Error("expected error for nonexistent destination directory")
+	}
+}
+
+func TestInstallTo_MkdirFails(t *testing.T) {
+	// 测试目标目录无法创建的错误路径
+	// 使用 /dev/null 子路径确保 MkdirAll 失败
+	binPath := "/dev/null/subdir/sslctl"
+	gzData := makeGzipData(t, []byte("binary"))
+
+	_, err := installTo(gzData, binPath)
+	if err == nil {
+		t.Fatal("expected error for mkdir failure")
+	}
+	if !strings.Contains(err.Error(), "创建目录失败") {
+		t.Errorf("error = %q, want containing '创建目录失败'", err.Error())
+	}
+}
+
+func TestDownloadBinaryWithClient_ConnectionError(t *testing.T) {
+	// 测试连接失败返回 ErrReleaseSource
+	_, err := downloadBinaryWithClient("https://127.0.0.1:1/file.gz", &http.Client{})
+	if err == nil {
+		t.Fatal("expected error for connection failure")
+	}
+	var releaseErr *ErrReleaseSource
+	if !errors.As(err, &releaseErr) {
+		t.Errorf("expected *ErrReleaseSource, got %T: %v", err, err)
+	}
+}
+
+func TestDownloadBinaryWithClient_HTTPNotFound(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	_, err := downloadBinaryWithClient(server.URL+"/missing", server.Client())
+	if err == nil {
+		t.Fatal("expected error for 404")
+	}
+	if !strings.Contains(err.Error(), "HTTP 404") {
+		t.Errorf("error = %q, want containing 'HTTP 404'", err.Error())
+	}
+}

@@ -219,6 +219,7 @@ func runSingle(p *setupParams, orderID int) {
 
 	var bindings []config.SiteBinding
 	var needSSLInstall []*matcher.ScannedSiteInfo
+	hasDockerNonVolume := false
 
 	// 处理完全匹配
 	for _, smr := range fullMatch {
@@ -232,6 +233,9 @@ func runSingle(p *setupParams, orderID int) {
 				}
 			}
 			needSSLInstall = append(needSSLInstall, site)
+		}
+		if site.ContainerID != "" && !site.VolumeMode {
+			hasDockerNonVolume = true
 		}
 		bindings = append(bindings, createBinding(site, p.cfgManager))
 	}
@@ -257,6 +261,9 @@ func runSingle(p *setupParams, orderID int) {
 				}
 			}
 			needSSLInstall = append(needSSLInstall, site)
+		}
+		if site.ContainerID != "" && !site.VolumeMode {
+			hasDockerNonVolume = true
 		}
 		bindings = append(bindings, createBinding(site, p.cfgManager))
 	}
@@ -483,6 +490,11 @@ func runSingle(p *setupParams, orderID int) {
 			fmt.Println("  journalctl -u sslctl -f    # 查看日志")
 		}
 	}
+
+	if hasDockerNonVolume && successCount > 0 {
+		fmt.Println("\n[!] 检测到 Docker 容器站点的证书路径未挂载为卷")
+		fmt.Println("    重建容器后需要重新部署证书")
+	}
 }
 
 // scanSites 扫描站点（使用 webserver 抽象层）
@@ -520,6 +532,8 @@ func scanSites(serverType string, log *logger.Logger) []*matcher.ScannedSiteInfo
 			KeyPath:     site.PrivateKeyPath,
 			ChainPath:   site.ChainFile,
 			ServerType:  string(site.ServerType),
+			ContainerID: site.ContainerID,
+			VolumeMode:  site.VolumeMode,
 		})
 	}
 

@@ -222,6 +222,9 @@ func runScan(args []string, debug bool) {
 			fmt.Printf("    证书: %s\n", site.CertificatePath)
 			fmt.Printf("    私钥: %s\n", site.PrivateKeyPath)
 		}
+		if site.ContainerID != "" && !site.VolumeMode {
+			fmt.Println("    [!] 证书路径未挂载为卷，重建容器后需要重新部署")
+		}
 		fmt.Println()
 	}
 }

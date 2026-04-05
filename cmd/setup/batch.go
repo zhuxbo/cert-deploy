@@ -323,6 +323,17 @@ func runBatch(p *setupParams, query string) {
 			fmt.Println("  journalctl -u sslctl -f    # 查看日志")
 		}
 	}
+
+	// 检查 Docker 非卷挂载站点
+	if totalSiteSuccess > 0 {
+		for _, site := range sites {
+			if site.ContainerID != "" && !site.VolumeMode {
+				fmt.Println("\n[!] 检测到 Docker 容器站点的证书路径未挂载为卷")
+				fmt.Println("    重建容器后需要重新部署证书")
+				break
+			}
+		}
+	}
 }
 
 // resolveSiteConflicts 为每个证书匹配站点，解决多证书匹配同一站点的冲突

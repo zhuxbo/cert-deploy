@@ -1,6 +1,11 @@
 name: E2E Tests
 
 on:
+  push:
+    branches: [dev]
+    paths:
+      - 'docker/test/**'
+      - '.github/workflows/e2e.yml'
   workflow_dispatch:
     inputs:
       distro:
@@ -30,8 +35,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        distro: ${{ github.event.inputs.distro == 'all' && fromJSON('["ubuntu","debian","alpine","rocky"]') || fromJSON(format('["{0}"]', github.event.inputs.distro)) }}
-        server: ${{ github.event.inputs.server == 'all' && fromJSON('["nginx","apache"]') || fromJSON(format('["{0}"]', github.event.inputs.server)) }}
+        distro: ${{ (github.event.inputs.distro || 'all') == 'all' && fromJSON('["ubuntu","debian","alpine","rocky"]') || fromJSON(format('["{0}"]', github.event.inputs.distro)) }}
+        server: ${{ (github.event.inputs.server || 'all') == 'all' && fromJSON('["nginx","apache"]') || fromJSON(format('["{0}"]', github.event.inputs.server)) }}
 
     steps:
       - name: Checkout

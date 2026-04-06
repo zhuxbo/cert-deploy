@@ -4,6 +4,9 @@ load 'helpers/common'
 
 setup_file() {
   ensure_webserver_running
+  mock_reset || true
+  mock_set_scenario active || true
+  rm -f "$SSLCTL_CONFIG_DIR/config.json"
   run_initial_setup
 }
 

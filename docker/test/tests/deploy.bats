@@ -4,7 +4,11 @@ load 'helpers/common'
 
 setup_file() {
   ensure_webserver_running
-  # 先执行 setup 创建配置，后续 deploy 测试依赖
+  # 重置 Mock API 到 active 场景，确保配置可用
+  mock_reset || true
+  mock_set_scenario active || true
+  # 清理旧配置，重新 setup
+  rm -f "$SSLCTL_CONFIG_DIR/config.json"
   run_initial_setup
 }
 

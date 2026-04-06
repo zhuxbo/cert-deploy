@@ -4,7 +4,9 @@ load 'helpers/common'
 
 setup_file() {
   ensure_webserver_running
-  # 先 setup + deploy 确保有证书
+  mock_reset || true
+  mock_set_scenario active || true
+  rm -f "$SSLCTL_CONFIG_DIR/config.json"
   run_initial_setup
   sslctl deploy --all --yes 2>&1 || true
 }

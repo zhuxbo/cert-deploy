@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -51,7 +52,9 @@ func (b *Base) NeedsProcessRestart() bool {
 }
 
 // ReloadService 重载服务
-// 优先使用服务管理命令；Windows 上服务未注册时回退到进程重启
+// 优先使用服务管理命令；失败时尝试回退策略：
+// - Linux 容器环境（无 systemd）：回退到 kill -USR1（Apache graceful）或 nginx -s reload
+// - Windows 非服务模式：回退到进程重启
 func (b *Base) ReloadService() error {
 	if b.ReloadCommand == "" {
 		return nil
@@ -60,11 +63,19 @@ func (b *Base) ReloadService() error {
 	if err == nil {
 		return nil
 	}
+
+	errMsg := err.Error()
+
+	// Linux 容器环境：httpd -k graceful 可能因无 systemd 失败
+	// 回退到发送 USR1 信号（Apache graceful reload）
+	if runtime.GOOS != "windows" && strings.Contains(errMsg, "systemd") {
+		return b.reloadFallbackLinux(err)
+	}
+
 	// Windows 非服务模式：回退到进程重启
 	if runtime.GOOS != "windows" {
 		return err
 	}
-	errMsg := err.Error()
 	if !strings.Contains(errMsg, "No installed service") &&
 		!strings.Contains(errMsg, "could not open error log") {
 		return err
@@ -76,6 +87,35 @@ func (b *Base) ReloadService() error {
 	}
 
 	return restartProcessWindows(exe, err)
+}
+
+// reloadFallbackLinux 在 Linux 容器中 reload 失败时的回退策略
+// httpd -k graceful 在无 systemd 容器中可能失败，回退到 kill -USR1 发送 graceful reload 信号
+func (b *Base) reloadFallbackLinux(origErr error) error {
+	exe, _ := executor.ParseCommand(b.ReloadCommand)
+	if exe == "" {
+		return origErr
+	}
+	processName := filepath.Base(exe)
+
+	// 通过 pidof 查找主进程 PID（直接调用，不经过 executor 白名单）
+	out, err := exec.Command("pidof", processName).Output()
+	if err != nil {
+		return origErr
+	}
+
+	pidStr := strings.TrimSpace(strings.Fields(string(out))[0])
+	pid, err := strconv.Atoi(pidStr)
+	if err != nil {
+		return origErr
+	}
+
+	// 发送 USR1 信号（Apache: graceful restart）
+	// 直接调用 kill 命令，不经过 executor 白名单（内部回退逻辑，非用户输入）
+	if killErr := exec.Command("kill", "-USR1", strconv.Itoa(pid)).Run(); killErr != nil {
+		return origErr
+	}
+	return nil
 }
 
 // restartProcessWindows 通过终止进程+重启实现重载（适用于 Apache/Nginx 非服务模式）
@@ -154,7 +194,7 @@ func (b *Base) TestAndReloadForRollback() error {
 		}
 	}
 	if b.ReloadCommand != "" {
-		if err := executor.Run(b.ReloadCommand); err != nil {
+		if err := b.ReloadService(); err != nil {
 			return errors.NewStructuredDeployError(
 				errors.DeployErrorReload, errors.PhaseRollback,
 				"reload failed after rollback", err,

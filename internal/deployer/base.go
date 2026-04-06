@@ -90,7 +90,7 @@ func (b *Base) ReloadService() error {
 }
 
 // reloadFallbackLinux 在 Linux 容器中 reload 失败时的回退策略
-// httpd -k graceful 在无 systemd 容器中可能失败，回退到 kill -USR1 发送 graceful reload 信号
+// httpd -k graceful 在无 systemd 容器中可能失败，回退到发送 SIGUSR1 信号
 func (b *Base) reloadFallbackLinux(origErr error) error {
 	exe, _ := executor.ParseCommand(b.ReloadCommand)
 	if exe == "" {
@@ -98,24 +98,47 @@ func (b *Base) reloadFallbackLinux(origErr error) error {
 	}
 	processName := filepath.Base(exe)
 
-	// 通过 pidof 查找主进程 PID（直接调用，不经过 executor 白名单）
-	out, err := exec.Command("pidof", processName).Output()
+	// 通过 /proc 扫描查找进程 PID（不依赖 pidof 等外部命令）
+	pid := findPIDByName(processName)
+	if pid <= 0 {
+		return origErr
+	}
+
+	proc, err := os.FindProcess(pid)
 	if err != nil {
 		return origErr
 	}
 
-	pidStr := strings.TrimSpace(strings.Fields(string(out))[0])
-	pid, err := strconv.Atoi(pidStr)
-	if err != nil {
-		return origErr
-	}
-
-	// 发送 USR1 信号（Apache: graceful restart）
-	// 直接调用 kill 命令，不经过 executor 白名单（内部回退逻辑，非用户输入）
-	if killErr := exec.Command("kill", "-USR1", strconv.Itoa(pid)).Run(); killErr != nil {
+	// 发送 SIGUSR1（Apache: graceful restart）
+	if err := signalUSR1(proc); err != nil {
 		return origErr
 	}
 	return nil
+}
+
+// findPIDByName 通过扫描 /proc 查找指定进程名的 PID
+func findPIDByName(name string) int {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return 0
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil {
+			continue
+		}
+		comm, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
+		if err != nil {
+			continue
+		}
+		if strings.TrimSpace(string(comm)) == name {
+			return pid
+		}
+	}
+	return 0
 }
 
 // restartProcessWindows 通过终止进程+重启实现重载（适用于 Apache/Nginx 非服务模式）

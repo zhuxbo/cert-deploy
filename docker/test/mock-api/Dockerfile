@@ -1,7 +1,8 @@
 FROM golang:1.23-alpine AS builder
 WORKDIR /app
+RUN go mod init mock-api
 COPY main.go .
-RUN go build -o mock-api .
+RUN CGO_ENABLED=0 go build -o mock-api .
 
 FROM alpine:3.21
 RUN apk add --no-cache ca-certificates

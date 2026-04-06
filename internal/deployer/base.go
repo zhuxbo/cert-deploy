@@ -63,10 +63,7 @@ func (b *Base) ReloadService() error {
 	// Linux 容器环境预检：如果 systemd 不可用且命令涉及 httpd/apache，
 	// 先尝试通过 SIGUSR1 信号 reload（避免 httpd -k graceful 因无 dbus 导致进程异常退出）
 	if runtime.GOOS != "windows" && !isSystemdAvailable() && b.isApacheReload() {
-		fmt.Fprintf(os.Stderr, "[DEBUG] reload fallback: systemd=%v apache=%v cmd=%s\n", isSystemdAvailable(), b.isApacheReload(), b.ReloadCommand)
-		if err := b.reloadFallbackLinux(); err != nil {
-			fmt.Fprintf(os.Stderr, "[DEBUG] reload fallback failed: %v\n", err)
-		} else {
+		if err := b.reloadFallbackLinux(); err == nil {
 			return nil
 		}
 	}
@@ -112,7 +109,8 @@ func (b *Base) reloadFallbackLinux() error {
 	if exe == "" {
 		return fmt.Errorf("cannot parse reload command: %s", b.ReloadCommand)
 	}
-	processName := filepath.Base(exe)
+	// apachectl/apache2ctl 是 shell wrapper，实际进程名是 httpd/apache2
+	processName := apacheProcessName(filepath.Base(exe))
 
 	// 通过 /proc 扫描查找 master 进程 PID（不依赖 pidof 等外部命令）
 	pid := findMasterPIDByName(processName)
@@ -130,6 +128,20 @@ func (b *Base) reloadFallbackLinux() error {
 		return fmt.Errorf("send SIGUSR1 to %d: %w", pid, err)
 	}
 	return nil
+}
+
+// apacheProcessName 将 apachectl/apache2ctl 等 wrapper 脚本名映射到实际进程名
+func apacheProcessName(name string) string {
+	switch name {
+	case "apachectl", "apache2ctl":
+		// 尝试 httpd 和 apache2 两种可能的进程名
+		if findMasterPIDByName("httpd") > 0 {
+			return "httpd"
+		}
+		return "apache2"
+	default:
+		return name
+	}
 }
 
 // findMasterPIDByName 通过扫描 /proc 查找指定进程名的 master 进程 PID

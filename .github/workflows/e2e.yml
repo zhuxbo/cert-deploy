@@ -1,0 +1,171 @@
+name: E2E Tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      distro:
+        description: '发行版 (ubuntu/debian/alpine/rocky/all)'
+        required: false
+        default: 'all'
+      server:
+        description: '服务器类型 (nginx/apache/all)'
+        required: false
+        default: 'all'
+      test:
+        description: '测试文件 (setup/deploy/scan/.../all)'
+        required: false
+        default: 'all'
+      dind:
+        description: '运行 Docker-in-Docker 测试'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  e2e:
+    name: E2E (${{ matrix.server }}-${{ matrix.distro }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: ${{ github.event.inputs.distro == 'all' && fromJSON('["ubuntu","debian","alpine","rocky"]') || fromJSON(format('["{0}"]', github.event.inputs.distro)) }}
+        server: ${{ github.event.inputs.server == 'all' && fromJSON('["nginx","apache"]') || fromJSON(format('["{0}"]', github.event.inputs.server)) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.24'
+          cache: true
+
+      - name: Build sslctl binary
+        run: |
+          mkdir -p docker/test/build
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o docker/test/build/sslctl ./cmd/
+
+      - name: Build Docker images
+        working-directory: docker/test
+        run: |
+          docker compose build mock-api ${{ matrix.server }}-${{ matrix.distro }}
+
+      - name: Start services
+        working-directory: docker/test
+        run: |
+          docker compose up -d mock-api ${{ matrix.server }}-${{ matrix.distro }}
+          # 等待 mock-api 健康
+          for i in $(seq 1 30); do
+            if docker compose exec mock-api wget -q --spider http://localhost:8080/health 2>/dev/null; then
+              echo "mock-api ready"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Start web server
+        working-directory: docker/test
+        run: |
+          SERVICE="${{ matrix.server }}-${{ matrix.distro }}"
+          if [ "${{ matrix.server }}" = "nginx" ]; then
+            docker compose exec "$SERVICE" nginx
+          else
+            docker compose exec "$SERVICE" bash -c 'command -v apache2ctl && apache2ctl start || httpd'
+          fi
+          sleep 2
+
+      - name: Run Bats tests
+        working-directory: docker/test
+        run: |
+          SERVICE="${{ matrix.server }}-${{ matrix.distro }}"
+          TEST_INPUT="${{ github.event.inputs.test }}"
+
+          if [ "$TEST_INPUT" = "all" ] || [ -z "$TEST_INPUT" ]; then
+            # 跑所有测试（排除 docker-scan 和 uninstall，uninstall 最后跑）
+            docker compose exec "$SERVICE" bats \
+              /tests/setup.bats \
+              /tests/scan.bats \
+              /tests/deploy.bats \
+              /tests/deploy-local.bats \
+              /tests/status.bats \
+              /tests/rollback.bats \
+              /tests/daemon.bats \
+              /tests/upgrade.bats \
+              /tests/uninstall.bats
+          else
+            docker compose exec "$SERVICE" bats "/tests/${TEST_INPUT}.bats"
+          fi
+
+      - name: Collect logs on failure
+        if: failure()
+        working-directory: docker/test
+        run: |
+          SERVICE="${{ matrix.server }}-${{ matrix.distro }}"
+          echo "=== Container logs ==="
+          docker compose logs "$SERVICE" 2>&1 | tail -100
+          echo "=== Mock API logs ==="
+          docker compose logs mock-api 2>&1 | tail -50
+          echo "=== sslctl logs ==="
+          docker compose exec "$SERVICE" cat /opt/sslctl/logs/*.log 2>/dev/null | tail -50 || true
+
+      - name: Cleanup
+        if: always()
+        working-directory: docker/test
+        run: docker compose down -v
+
+  dind:
+    name: E2E (Docker-in-Docker)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: ${{ github.event.inputs.dind == 'true' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.24'
+          cache: true
+
+      - name: Build sslctl binary
+        run: |
+          mkdir -p docker/test/build
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o docker/test/build/sslctl ./cmd/
+
+      - name: Build Docker images
+        working-directory: docker/test
+        run: docker compose build mock-api dind
+
+      - name: Start services
+        working-directory: docker/test
+        run: |
+          docker compose up -d mock-api dind
+          # 等待 dind 内 docker daemon 就绪
+          for i in $(seq 1 30); do
+            if docker compose exec dind docker info >/dev/null 2>&1; then
+              echo "dind ready"
+              break
+            fi
+            sleep 2
+          done
+
+      - name: Run Docker scan tests
+        working-directory: docker/test
+        run: docker compose exec dind bats /tests/docker-scan.bats
+
+      - name: Collect logs on failure
+        if: failure()
+        working-directory: docker/test
+        run: |
+          docker compose logs dind 2>&1 | tail -100
+          docker compose logs mock-api 2>&1 | tail -50
+
+      - name: Cleanup
+        if: always()
+        working-directory: docker/test
+        run: docker compose down -v

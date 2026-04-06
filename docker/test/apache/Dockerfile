@@ -86,6 +86,12 @@ RUN git clone --depth 1 https://github.com/bats-core/bats-core.git /tmp/bats-cor
     /tmp/bats-core/install.sh /usr/local && \
     rm -rf /tmp/bats-core
 RUN mkdir -p /etc/httpd/ssl /etc/httpd/conf.d
+# 生成默认 SSL 证书（mod_ssl 的 ssl.conf 引用 /etc/pki/tls/certs/localhost.crt）
+RUN openssl req -x509 -nodes -days 3650 \
+    -newkey rsa:2048 \
+    -keyout /etc/pki/tls/private/localhost.key \
+    -out /etc/pki/tls/certs/localhost.crt \
+    -subj "/CN=localhost"
 RUN openssl req -x509 -nodes -days 3650 \
     -newkey rsa:2048 \
     -keyout /etc/httpd/ssl/default.key \

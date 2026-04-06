@@ -2,7 +2,7 @@
 # 用法: docker build -t test-dind docker/test/dind/
 FROM docker:dind
 
-RUN apk add --no-cache bash curl jq bats
+RUN apk add --no-cache bash curl jq bats socat
 
 RUN mkdir -p \
     /opt/sslctl/sites \

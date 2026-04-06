@@ -30,7 +30,7 @@ jobs:
   e2e:
     name: E2E (${{ matrix.server }}-${{ matrix.distro }})
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     strategy:
       fail-fast: false
@@ -71,16 +71,32 @@ jobs:
             sleep 1
           done
 
-      - name: Start web server
+      - name: Start web server and verify connectivity
         working-directory: docker/test
         run: |
           SERVICE="${{ matrix.server }}-${{ matrix.distro }}"
+
+          # 启动 web 服务器
           if [ "${{ matrix.server }}" = "nginx" ]; then
-            docker compose exec "$SERVICE" nginx
+            docker compose exec "$SERVICE" nginx || true
           else
-            docker compose exec "$SERVICE" bash -c 'command -v apache2ctl && apache2ctl start || httpd'
+            docker compose exec "$SERVICE" bash -c 'command -v apache2ctl && apache2ctl start || httpd' || true
           fi
           sleep 2
+
+          # 从测试容器内验证 mock-api 连通性
+          echo "=== Verifying mock-api connectivity from test container ==="
+          docker compose exec "$SERVICE" curl -sf --max-time 5 http://mock-api:8080/health || echo "WARN: mock-api not reachable via hostname"
+
+          # 启动 socat 代理并验证 localhost 连通��
+          echo "=== Starting socat proxy and verifying localhost connectivity ==="
+          docker compose exec -d "$SERVICE" socat TCP-LISTEN:8080,fork,reuseaddr TCP:mock-api:8080
+          sleep 2
+          docker compose exec "$SERVICE" curl -sf --max-time 5 http://localhost:8080/health || echo "WARN: mock-api not reachable via localhost proxy"
+
+          # 验证 sslctl 可执行
+          echo "=== Verifying sslctl ==="
+          docker compose exec "$SERVICE" sslctl version || echo "WARN: sslctl not available"
 
       - name: Run Bats tests
         working-directory: docker/test

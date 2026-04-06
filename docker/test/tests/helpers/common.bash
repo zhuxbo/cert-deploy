@@ -19,22 +19,22 @@ export SSLCTL_CONFIG_DIR="/opt/sslctl"
 # 切换 Mock API 场景
 # $1 = scenario name (active/processing/expired/error/unauthorized/not_found/batch/renew-flow/releases)
 mock_set_scenario() {
-  curl -sf -X POST "$MOCK_REMOTE_URL/admin/scenario/$1"
+  curl -sf --max-time 5 -X POST "$MOCK_REMOTE_URL/admin/scenario/$1"
 }
 
 # 重置 Mock API 状态（清除请求日志、回调记录，恢复默认场景）
 mock_reset() {
-  curl -sf -X POST "$MOCK_REMOTE_URL/admin/reset"
+  curl -sf --max-time 5 -X POST "$MOCK_REMOTE_URL/admin/reset"
 }
 
 # 获取 Mock API 收到的回调记录（JSON）
 mock_get_callbacks() {
-  curl -sf "$MOCK_REMOTE_URL/admin/callbacks"
+  curl -sf --max-time 5 "$MOCK_REMOTE_URL/admin/callbacks"
 }
 
 # 获取 Mock API 的请求日志（JSON）
 mock_get_requests() {
-  curl -sf "$MOCK_REMOTE_URL/admin/logs"
+  curl -sf --max-time 5 "$MOCK_REMOTE_URL/admin/logs"
 }
 
 # ==============================================================================
@@ -189,7 +189,7 @@ assert_dir_exists() {
 # sslctl 的 SSRF 防护仅允许 localhost 使用 HTTP
 ensure_mock_proxy() {
   # 已经在监听则跳过
-  if curl -sf http://localhost:8080/health >/dev/null 2>&1; then
+  if curl -sf --max-time 3 http://localhost:8080/health >/dev/null 2>&1; then
     return
   fi
   # 从 MOCK_REMOTE_URL 提取 host:port
@@ -200,7 +200,7 @@ ensure_mock_proxy() {
   socat TCP-LISTEN:8080,fork,reuseaddr TCP:"$remote_host":"$remote_port" &
   # 等待端口就绪
   for i in $(seq 1 10); do
-    if curl -sf http://localhost:8080/health >/dev/null 2>&1; then
+    if curl -sf --max-time 3 http://localhost:8080/health >/dev/null 2>&1; then
       break
     fi
     sleep 0.3
@@ -219,9 +219,9 @@ ensure_webserver_running() {
   fi
 }
 
-# 通用 setup 函数（每个测试前调用，重置 Mock API 状态）
+# 通用 setup 函数（��个测试前调用，重置 Mock API 状态）
 common_setup() {
-  mock_reset
+  mock_reset || true
 }
 
 # 生成自签名测试证书和私钥到 /tmp

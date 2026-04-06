@@ -4,6 +4,9 @@ load 'helpers/common'
 
 setup_file() {
   ensure_webserver_running
+  mock_reset || true
+  mock_set_scenario active || true
+  rm -f "$SSLCTL_CONFIG_DIR/config.json"
   # 1. 初始 setup
   run_initial_setup
   # 2. 第一次 deploy（创建初始状态）

@@ -19,12 +19,12 @@ export SSLCTL_CONFIG_DIR="/opt/sslctl"
 # 切换 Mock API 场景
 # $1 = scenario name (active/processing/expired/error/unauthorized/not_found/batch/renew-flow/releases)
 mock_set_scenario() {
-  curl -sf --max-time 5 -X POST "$MOCK_REMOTE_URL/admin/scenario/$1"
+  curl -sf --max-time 5 -X POST "$MOCK_REMOTE_URL/admin/scenario/$1" >/dev/null 2>&1
 }
 
 # 重置 Mock API 状态（清除请求日志、回调记录，恢复默认场景）
 mock_reset() {
-  curl -sf --max-time 5 -X POST "$MOCK_REMOTE_URL/admin/reset"
+  curl -sf --max-time 5 -X POST "$MOCK_REMOTE_URL/admin/reset" >/dev/null 2>&1
 }
 
 # 获取 Mock API 收到的回调记录（JSON）

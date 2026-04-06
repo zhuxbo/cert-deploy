@@ -72,9 +72,10 @@ setup() {
 
 @test "deploy: 回调已发送" {
   # 先重置以清空回调记录
-  mock_reset
-  # 执行部署
-  sslctl deploy --cert "$CERT_NAME" 2>&1 || true
+  mock_reset || true
+  # deploy --all 走 API 路径（certops.DeployOne），会发送部署回调
+  sslctl deploy --all 2>&1 || true
+  sleep 1
   # 检查 Mock API 收到的回调
   local callbacks
   callbacks=$(mock_get_callbacks)

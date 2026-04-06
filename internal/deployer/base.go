@@ -63,7 +63,10 @@ func (b *Base) ReloadService() error {
 	// Linux 容器环境预检：如果 systemd 不可用且命令涉及 httpd/apache，
 	// 先尝试通过 SIGUSR1 信号 reload（避免 httpd -k graceful 因无 dbus 导致进程异常退出）
 	if runtime.GOOS != "windows" && !isSystemdAvailable() && b.isApacheReload() {
-		if err := b.reloadFallbackLinux(); err == nil {
+		fmt.Fprintf(os.Stderr, "[DEBUG] reload fallback: systemd=%v apache=%v cmd=%s\n", isSystemdAvailable(), b.isApacheReload(), b.ReloadCommand)
+		if err := b.reloadFallbackLinux(); err != nil {
+			fmt.Fprintf(os.Stderr, "[DEBUG] reload fallback failed: %v\n", err)
+		} else {
 			return nil
 		}
 	}

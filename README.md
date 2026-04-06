@@ -309,32 +309,25 @@ bash build/test-linux.sh
 ### 容器端到端测试
 
 ```bash
-# Mock 测试（离线，不依赖外部 API）
-bash docker/test/scripts/run-mock-tests.sh
+# 运行全部 E2E 测试（构建 + 全矩阵）
+bash docker/test/scripts/run-tests.sh
 
-# E2E 测试（使用真实 API）
-export SSLCTL_API_TOKEN="your-token"
-export SSLCTL_API_URL="https://api.example.com/api/deploy"
-bash docker/test/scripts/run-e2e-tests.sh
+# 指定发行版和服务器
+bash docker/test/scripts/run-tests.sh --distro ubuntu --server nginx
 
-# 测试所有发行版 + 服务器组合
-bash docker/test/scripts/run-e2e-tests.sh --all
+# 指定测试文件（不含 .bats 后缀）
+bash docker/test/scripts/run-tests.sh --test scan
 
-# 指定发行版和服务器类型
-bash docker/test/scripts/run-e2e-tests.sh --distro ubuntu --server nginx
+# Docker-in-Docker 测试
+bash docker/test/scripts/run-tests.sh --dind
+
+# 跳过构建（已构建过镜像）
+bash docker/test/scripts/run-tests.sh --no-build
 ```
 
-测试报告输出到 `docker/test/reports/test-report.md`。
+测试矩阵：Nginx/Apache × Ubuntu/Debian/Alpine/Rocky + DinD，使用 Mock API 离线运行。
 
-**发行版服务管理测试**覆盖 5 种发行版 × 3 种 init 系统：
-
-- systemd: Ubuntu 22.04, Debian 12, AlmaLinux 9
-- OpenRC: Alpine 3.19
-- SysVinit: Devuan 5
-
-**E2E 测试**覆盖 4 种发行版 × 2 种服务器：
-
-- Ubuntu, Debian, Alpine, Rocky × Nginx, Apache
+测试用例：setup、deploy、deploy-local、scan、status、rollback、daemon、upgrade、uninstall、docker-scan（共 10 个 bats 文件，docker-scan 在 DinD 容器中运行，uninstall 自动排最后执行）。
 
 ## License
 

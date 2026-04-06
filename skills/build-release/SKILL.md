@@ -148,6 +148,29 @@ bash build/release.sh --test                     # 测试 SSH 连接
 - 单元测试（`go test -race ./...`）
 - 三平台交叉编译验证（linux/amd64、linux/arm64、windows/amd64）
 
+### 容器 E2E 测试
+
+**不在 CI 自动触发**，合并前手动运行，全部通过再合并。
+
+```bash
+# 全矩阵（8 容器 × 全量测试）
+bash docker/test/scripts/run-tests.sh
+
+# 指定发行版/服务器
+bash docker/test/scripts/run-tests.sh --distro ubuntu --server nginx
+
+# 指定测试文件
+bash docker/test/scripts/run-tests.sh --distro ubuntu --server nginx --test setup
+
+# Docker-in-Docker 测试
+bash docker/test/scripts/run-tests.sh --dind
+
+# 跳过构建（已有二进制时）
+bash docker/test/scripts/run-tests.sh --no-build
+```
+
+测试框架：Bats + Docker Compose，详见 `docker/test/` 目录。发行版矩阵：ubuntu:24.04、debian:12、alpine:3.21、rockylinux:9。
+
 ---
 
 ## 安装脚本

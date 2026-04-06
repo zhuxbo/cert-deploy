@@ -35,12 +35,15 @@ Thumbs.db
 # 工作目录（运行时生成）
 sslctl/
 
-# Test artifacts (dynamically built by test scripts)
-docker/test/**/sslctl
-docker/test/**/mock-api
-docker/test/mock-api/mock-api-linux-*
-docker/test/reports/test-report*.md
+# Test artifacts
 build/test-report.md
+
+# E2E test artifacts
+docker/test/build/
+docker/test/**/sslctl
+docker/test/mock-api/mock-api
+docker/test/mock-api/mock-api-*
+docker/test/reports/*.md
 
 # 版本文件（构建时生成）
 version.json

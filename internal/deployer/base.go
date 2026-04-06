@@ -53,31 +53,33 @@ func (b *Base) NeedsProcessRestart() bool {
 
 // ReloadService 重载服务
 // 优先使用服务管理命令；失败时尝试回退策略：
-// - Linux 容器环境（无 systemd）：回退到 kill -USR1（Apache graceful）或 nginx -s reload
+// - Linux 容器环境（无 systemd）：先发送 SIGUSR1 再执行 reload 命令
 // - Windows 非服务模式：回退到进程重启
 func (b *Base) ReloadService() error {
 	if b.ReloadCommand == "" {
 		return nil
 	}
+
+	// Linux 容器环境预检：如果 systemd 不可用且命令涉及 httpd/apache，
+	// 先尝试通过 SIGUSR1 信号 reload（避免 httpd -k graceful 因无 dbus 导致进程异常退出）
+	if runtime.GOOS != "windows" && !isSystemdAvailable() && b.isApacheReload() {
+		if fallbackErr := b.reloadFallbackLinux(nil); fallbackErr == nil {
+			return nil
+		}
+	}
+
 	err := executor.Run(b.ReloadCommand)
 	if err == nil {
 		return nil
-	}
-
-	errMsg := err.Error()
-
-	// Linux 容器环境：httpd -k graceful 可能因无 systemd 失败
-	// 回退到发送 USR1 信号（Apache graceful reload）
-	if runtime.GOOS != "windows" && strings.Contains(errMsg, "systemd") {
-		return b.reloadFallbackLinux(err)
 	}
 
 	// Windows 非服务模式：回退到进程重启
 	if runtime.GOOS != "windows" {
 		return err
 	}
-	if !strings.Contains(errMsg, "No installed service") &&
-		!strings.Contains(errMsg, "could not open error log") {
+	msg := err.Error()
+	if !strings.Contains(msg, "No installed service") &&
+		!strings.Contains(msg, "could not open error log") {
 		return err
 	}
 
@@ -89,8 +91,19 @@ func (b *Base) ReloadService() error {
 	return restartProcessWindows(exe, err)
 }
 
-// reloadFallbackLinux 在 Linux 容器中 reload 失败时的回退策略
-// httpd -k graceful 在无 systemd 容器中可能失败，回退到发送 SIGUSR1 信号
+// isSystemdAvailable 检测 systemd 是否可用（通过 /run/systemd/system 目录判断）
+func isSystemdAvailable() bool {
+	_, err := os.Stat("/run/systemd/system")
+	return err == nil
+}
+
+// isApacheReload 检查 reload 命令是否与 Apache 相关
+func (b *Base) isApacheReload() bool {
+	cmd := strings.ToLower(b.ReloadCommand)
+	return strings.Contains(cmd, "httpd") || strings.Contains(cmd, "apache")
+}
+
+// reloadFallbackLinux 在 Linux 容器中通过 SIGUSR1 信号实现 Apache graceful reload
 func (b *Base) reloadFallbackLinux(origErr error) error {
 	exe, _ := executor.ParseCommand(b.ReloadCommand)
 	if exe == "" {

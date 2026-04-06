@@ -9,7 +9,7 @@ ARG DISTRO=ubuntu
 FROM ubuntu:24.04 AS base-ubuntu
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    apache2 openssl curl jq ca-certificates bash bats \
+    apache2 openssl curl jq ca-certificates bash bats socat \
     && rm -rf /var/lib/apt/lists/*
 # 启用 SSL 模块和 sites-enabled
 RUN a2enmod ssl && mkdir -p /etc/apache2/sites-available /etc/apache2/sites-enabled /etc/apache2/ssl
@@ -36,7 +36,7 @@ RUN a2ensite test.example.com.conf 2>/dev/null || \
 FROM debian:12 AS base-debian
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    apache2 openssl curl jq ca-certificates bash bats \
+    apache2 openssl curl jq ca-certificates bash bats socat \
     && rm -rf /var/lib/apt/lists/*
 RUN a2enmod ssl && mkdir -p /etc/apache2/sites-available /etc/apache2/sites-enabled /etc/apache2/ssl
 RUN openssl req -x509 -nodes -days 3650 \
@@ -59,7 +59,7 @@ RUN a2ensite test.example.com.conf 2>/dev/null || \
 # ============================================================
 FROM alpine:3.21 AS base-alpine
 RUN apk add --no-cache \
-    apache2 apache2-ssl openssl curl jq ca-certificates bash bats
+    apache2 apache2-ssl openssl curl jq ca-certificates bash bats socat
 RUN mkdir -p /etc/apache2/ssl /etc/apache2/conf.d
 RUN openssl req -x509 -nodes -days 3650 \
     -newkey rsa:2048 \
@@ -79,7 +79,7 @@ RUN printf '<VirtualHost *:443>\n\
 # ============================================================
 FROM rockylinux:9 AS base-rocky
 RUN dnf install -y epel-release && \
-    dnf install -y httpd mod_ssl openssl curl jq ca-certificates bash git && \
+    dnf install -y --allowerasing httpd mod_ssl openssl curl jq ca-certificates bash git socat && \
     dnf clean all
 # 从源码安装 bats
 RUN git clone --depth 1 https://github.com/bats-core/bats-core.git /tmp/bats-core && \

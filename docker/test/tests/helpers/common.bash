@@ -6,7 +6,9 @@
 # 环境变量
 # ==============================================================================
 
-export MOCK_URL="${MOCK_API_URL:-http://mock-api:8080}"
+# sslctl 的 SSRF 防护仅允许 localhost 使用 HTTP，通过 socat 代理 mock-api 到本地
+export MOCK_REMOTE_URL="${MOCK_API_URL:-http://mock-api:8080}"
+export MOCK_URL="http://localhost:8080"
 export TOKEN="${TEST_TOKEN:-test-token}"
 export SSLCTL_CONFIG_DIR="/opt/sslctl"
 
@@ -17,22 +19,22 @@ export SSLCTL_CONFIG_DIR="/opt/sslctl"
 # 切换 Mock API 场景
 # $1 = scenario name (active/processing/expired/error/unauthorized/not_found/batch/renew-flow/releases)
 mock_set_scenario() {
-  curl -sf -X POST "$MOCK_URL/admin/scenario/$1"
+  curl -sf -X POST "$MOCK_REMOTE_URL/admin/scenario/$1"
 }
 
 # 重置 Mock API 状态（清除请求日志、回调记录，恢复默认场景）
 mock_reset() {
-  curl -sf -X POST "$MOCK_URL/admin/reset"
+  curl -sf -X POST "$MOCK_REMOTE_URL/admin/reset"
 }
 
 # 获取 Mock API 收到的回调记录（JSON）
 mock_get_callbacks() {
-  curl -sf "$MOCK_URL/admin/callbacks"
+  curl -sf "$MOCK_REMOTE_URL/admin/callbacks"
 }
 
 # 获取 Mock API 的请求日志（JSON）
 mock_get_requests() {
-  curl -sf "$MOCK_URL/admin/logs"
+  curl -sf "$MOCK_REMOTE_URL/admin/logs"
 }
 
 # ==============================================================================
@@ -183,8 +185,31 @@ assert_dir_exists() {
 # 测试生命周期辅助
 # ==============================================================================
 
+# 确保 socat 代理正在运行（将 mock-api 转发到 localhost:8080）
+# sslctl 的 SSRF 防护仅允许 localhost 使用 HTTP
+ensure_mock_proxy() {
+  # 已经在监听则跳过
+  if curl -sf http://localhost:8080/health >/dev/null 2>&1; then
+    return
+  fi
+  # 从 MOCK_REMOTE_URL 提取 host:port
+  local remote_host remote_port
+  remote_host=$(echo "$MOCK_REMOTE_URL" | sed -E 's|https?://||; s|/.*||; s|:.*||')
+  remote_port=$(echo "$MOCK_REMOTE_URL" | sed -E 's|https?://||; s|/.*||; s|.*:||')
+  remote_port="${remote_port:-8080}"
+  socat TCP-LISTEN:8080,fork,reuseaddr TCP:"$remote_host":"$remote_port" &
+  # 等待端口就绪
+  for i in $(seq 1 10); do
+    if curl -sf http://localhost:8080/health >/dev/null 2>&1; then
+      break
+    fi
+    sleep 0.3
+  done
+}
+
 # 确保 Web 服务器正在运行（在 setup_file 中调用）
 ensure_webserver_running() {
+  ensure_mock_proxy
   local ws
   ws=$(detect_webserver)
   if [ "$ws" = "nginx" ]; then

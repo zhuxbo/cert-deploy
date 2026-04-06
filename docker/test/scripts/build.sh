@@ -17,3 +17,4 @@ cd "$TEST_DIR"
 docker compose build
 echo "=== Build complete ==="
 
+

@@ -41,7 +41,7 @@ setup() {
   run sslctl rollback --site test.example.com --list
   assert_success
   # 输出应包含时间戳格式 YYYYMMDD-HHMMSS
-  assert_output_contains "-"
+  [[ "$output" =~ [0-9]{8}-[0-9]{6} ]]
 }
 
 @test "rollback: 回滚到最新" {

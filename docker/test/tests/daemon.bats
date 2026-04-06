@@ -33,8 +33,12 @@ teardown() {
   sslctl daemon &
   local daemon_pid=$!
 
-  # 等待 daemon 完成启动时的立即检查
-  sleep 8
+  # 轮询等待 daemon 完成启动时的立即检查（最多 20 秒）
+  for i in $(seq 1 20); do
+    requests=$(mock_get_requests 2>/dev/null || echo "")
+    if [[ "$requests" == *"/api/"* ]]; then break; fi
+    sleep 1
+  done
 
   # 验证 daemon 进程仍在运行
   kill -0 "$daemon_pid" 2>/dev/null
@@ -73,8 +77,12 @@ teardown() {
   sslctl daemon &
   local daemon_pid=$!
 
-  # 等待 daemon 完成启动时的立即检查
-  sleep 8
+  # 轮询等待 daemon 完成启动时的立即检查（最多 20 秒）
+  for i in $(seq 1 20); do
+    requests=$(mock_get_requests 2>/dev/null || echo "")
+    if [[ "$requests" == *"/api/"* ]]; then break; fi
+    sleep 1
+  done
 
   # daemon 应该仍在运行（不会因 processing 状态崩溃）
   if ! kill -0 "$daemon_pid" 2>/dev/null; then

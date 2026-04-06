@@ -44,6 +44,7 @@ docker/test/**/sslctl
 docker/test/mock-api/mock-api
 docker/test/mock-api/mock-api-*
 docker/test/reports/*.md
+docker/test/reports/*.tap
 
 # 版本文件（构建时生成）
 version.json
@@ -53,3 +54,4 @@ release-key.pem
 release-key.pub
 public_key.go
 build/keys/
+mock-api

@@ -63,7 +63,7 @@ func (b *Base) ReloadService() error {
 	// Linux 容器环境预检：如果 systemd 不可用且命令涉及 httpd/apache，
 	// 先尝试通过 SIGUSR1 信号 reload（避免 httpd -k graceful 因无 dbus 导致进程异常退出）
 	if runtime.GOOS != "windows" && !isSystemdAvailable() && b.isApacheReload() {
-		if fallbackErr := b.reloadFallbackLinux(nil); fallbackErr == nil {
+		if err := b.reloadFallbackLinux(); err == nil {
 			return nil
 		}
 	}
@@ -104,37 +104,40 @@ func (b *Base) isApacheReload() bool {
 }
 
 // reloadFallbackLinux 在 Linux 容器中通过 SIGUSR1 信号实现 Apache graceful reload
-func (b *Base) reloadFallbackLinux(origErr error) error {
+func (b *Base) reloadFallbackLinux() error {
 	exe, _ := executor.ParseCommand(b.ReloadCommand)
 	if exe == "" {
-		return origErr
+		return fmt.Errorf("cannot parse reload command: %s", b.ReloadCommand)
 	}
 	processName := filepath.Base(exe)
 
-	// 通过 /proc 扫描查找进程 PID（不依赖 pidof 等外部命令）
-	pid := findPIDByName(processName)
+	// 通过 /proc 扫描查找 master 进程 PID（不依赖 pidof 等外部命令）
+	pid := findMasterPIDByName(processName)
 	if pid <= 0 {
-		return origErr
+		return fmt.Errorf("process %s not found", processName)
 	}
 
 	proc, err := os.FindProcess(pid)
 	if err != nil {
-		return origErr
+		return fmt.Errorf("find process %d: %w", pid, err)
 	}
 
 	// 发送 SIGUSR1（Apache: graceful restart）
 	if err := signalUSR1(proc); err != nil {
-		return origErr
+		return fmt.Errorf("send SIGUSR1 to %d: %w", pid, err)
 	}
 	return nil
 }
 
-// findPIDByName 通过扫描 /proc 查找指定进程名的 PID
-func findPIDByName(name string) int {
+// findMasterPIDByName 通过扫描 /proc 查找指定进程名的 master 进程 PID
+// 优先返回 PPID=1 的进程（master），否则返回最小 PID（通常是 master）
+func findMasterPIDByName(name string) int {
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
 		return 0
 	}
+
+	minPID := 0
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
@@ -147,11 +150,30 @@ func findPIDByName(name string) int {
 		if err != nil {
 			continue
 		}
-		if strings.TrimSpace(string(comm)) == name {
-			return pid
+		if strings.TrimSpace(string(comm)) != name {
+			continue
+		}
+
+		// 检查 PPID：master 进程的 PPID 通常是 1（init/容器入口）
+		status, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
+		if err == nil {
+			for _, line := range strings.Split(string(status), "\n") {
+				if strings.HasPrefix(line, "PPid:") {
+					ppidStr := strings.TrimSpace(strings.TrimPrefix(line, "PPid:"))
+					if ppid, _ := strconv.Atoi(ppidStr); ppid <= 1 {
+						return pid // PPID=0 或 1，确定是 master
+					}
+					break
+				}
+			}
+		}
+
+		// 记录最小 PID 作为后备
+		if minPID == 0 || pid < minPID {
+			minPID = pid
 		}
 	}
-	return 0
+	return minPID
 }
 
 // restartProcessWindows 通过终止进程+重启实现重载（适用于 Apache/Nginx 非服务模式）

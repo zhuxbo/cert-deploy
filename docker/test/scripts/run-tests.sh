@@ -205,41 +205,41 @@ if [[ "$RUN_DIND" == "true" ]]; then
     if docker compose up -d dind 2>&1; then
         # DinD 需要等待 Docker daemon 就绪
         echo "等待 Docker daemon 就绪..."
+        dind_ready=false
         for i in $(seq 1 30); do
             if docker compose exec -T dind docker info >/dev/null 2>&1; then
                 echo "Docker daemon 已就绪"
+                dind_ready=true
                 break
-            fi
-            if [[ $i -eq 30 ]]; then
-                echo -e "${RED}Docker daemon 启动超时${NC}"
-                FAILED=$((FAILED + 1))
-                FAILED_LIST="$FAILED_LIST dind"
-                docker compose stop dind >/dev/null 2>&1
-                # 跳到汇总
-                break 2 2>/dev/null || true
             fi
             sleep 1
         done
-
-        report_file="reports/dind.tap"
-        dind_bats="bats --tap /tests/docker-scan.bats"
-        if [[ -n "$TESTS" ]]; then
-            dind_bats="bats --tap /tests/$TESTS.bats"
-        fi
-
-        if docker compose exec -T dind bash -c "$dind_bats" > "$report_file" 2>&1; then
-            echo -e "${GREEN}PASS: dind${NC}"
-            PASSED=$((PASSED + 1))
-        else
-            echo -e "${RED}FAIL: dind${NC}"
+        if [[ "$dind_ready" != "true" ]]; then
+            echo -e "${RED}Docker daemon 启动超时${NC}"
             FAILED=$((FAILED + 1))
             FAILED_LIST="$FAILED_LIST dind"
-            echo "--- TAP 输出 ---"
-            cat "$report_file"
-            echo "--- 结束 ---"
-        fi
+            docker compose stop dind >/dev/null 2>&1
+        else
+            report_file="reports/dind.tap"
+            dind_bats="bats --tap /tests/docker-scan.bats"
+            if [[ -n "$TESTS" ]]; then
+                dind_bats="bats --tap /tests/$TESTS.bats"
+            fi
 
-        docker compose stop dind >/dev/null 2>&1
+            if docker compose exec -T dind bash -c "$dind_bats" > "$report_file" 2>&1; then
+                echo -e "${GREEN}PASS: dind${NC}"
+                PASSED=$((PASSED + 1))
+            else
+                echo -e "${RED}FAIL: dind${NC}"
+                FAILED=$((FAILED + 1))
+                FAILED_LIST="$FAILED_LIST dind"
+                echo "--- TAP 输出 ---"
+                cat "$report_file"
+                echo "--- 结束 ---"
+            fi
+
+            docker compose stop dind >/dev/null 2>&1
+        fi
     else
         echo -e "${RED}FAIL: dind (容器启动失败)${NC}"
         FAILED=$((FAILED + 1))

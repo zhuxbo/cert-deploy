@@ -14,6 +14,12 @@ setup() {
   common_setup
 }
 
+teardown() {
+  # 确保 config.json 备份在异常退出时也能恢复
+  local config_file="$SSLCTL_CONFIG_DIR/config.json"
+  [[ -f "${config_file}.bak" ]] && mv "${config_file}.bak" "$config_file"
+}
+
 # ==============================================================================
 # upgrade 命令测试
 # ==============================================================================

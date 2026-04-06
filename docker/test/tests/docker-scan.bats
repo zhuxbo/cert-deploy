@@ -19,7 +19,7 @@ setup_file() {
     skip "Docker daemon 未就绪"
   fi
 
-  # 准备自定义 nginx 配置（默认 nginx:alpine 的 server_name 是 _，scanner 会跳过）
+  # 准备自定义 nginx 配置（默认 nginx:1.27-alpine 的 server_name 是 _，scanner 会跳过）
   mkdir -p /tmp/nginx-conf
   cat > /tmp/nginx-conf/default.conf <<'CONF'
 server {
@@ -53,11 +53,11 @@ CONF
     -subj "/CN=docker-ssl.example.com" 2>/dev/null
 
   # 启动 nginx 容器（挂载自定义配置和证书）
-  docker pull nginx:alpine 2>/dev/null || true
+  docker pull nginx:1.27-alpine 2>/dev/null || true
   docker run -d --name test-nginx \
     -v /tmp/nginx-conf/default.conf:/etc/nginx/conf.d/default.conf:ro \
     -v /tmp/nginx-ssl:/etc/nginx/ssl:ro \
-    nginx:alpine
+    nginx:1.27-alpine
 
   # 等待 nginx 容器就绪
   local nginx_wait=10

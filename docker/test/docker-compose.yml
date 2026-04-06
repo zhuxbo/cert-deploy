@@ -2,6 +2,17 @@
 # 用法: docker compose up -d mock-api && docker compose up -d nginx-ubuntu
 # 注意: 容器 CMD 为 tail -f /dev/null，需在 exec 中手动启动 web 服务器
 
+x-test-common: &test-common
+  depends_on:
+    mock-api:
+      condition: service_healthy
+  volumes:
+    - ./tests:/tests:ro
+    - ./build/sslctl:/usr/local/bin/sslctl:ro
+  environment:
+    - MOCK_API_URL=http://mock-api:8080
+    - TEST_TOKEN=test-token
+
 services:
   # Mock API 服务
   mock-api:
@@ -16,140 +27,71 @@ services:
   # Nginx 容器
   # ============================================================
   nginx-ubuntu:
+    <<: *test-common
     build:
       context: ./nginx
       args:
         DISTRO: ubuntu
-    depends_on:
-      mock-api:
-        condition: service_healthy
-    volumes:
-      - ./tests:/tests:ro
-      - ./build/sslctl:/usr/local/bin/sslctl:ro
-    environment:
-      - MOCK_API_URL=http://mock-api:8080
-      - TEST_TOKEN=test-token
 
   nginx-debian:
+    <<: *test-common
     build:
       context: ./nginx
       args:
         DISTRO: debian
-    depends_on:
-      mock-api:
-        condition: service_healthy
-    volumes:
-      - ./tests:/tests:ro
-      - ./build/sslctl:/usr/local/bin/sslctl:ro
-    environment:
-      - MOCK_API_URL=http://mock-api:8080
-      - TEST_TOKEN=test-token
 
   nginx-alpine:
+    <<: *test-common
     build:
       context: ./nginx
       args:
         DISTRO: alpine
-    depends_on:
-      mock-api:
-        condition: service_healthy
-    volumes:
-      - ./tests:/tests:ro
-      - ./build/sslctl:/usr/local/bin/sslctl:ro
-    environment:
-      - MOCK_API_URL=http://mock-api:8080
-      - TEST_TOKEN=test-token
 
   nginx-rocky:
+    <<: *test-common
     build:
       context: ./nginx
       args:
         DISTRO: rocky
-    depends_on:
-      mock-api:
-        condition: service_healthy
-    volumes:
-      - ./tests:/tests:ro
-      - ./build/sslctl:/usr/local/bin/sslctl:ro
-    environment:
-      - MOCK_API_URL=http://mock-api:8080
-      - TEST_TOKEN=test-token
 
   # ============================================================
   # Apache 容器
   # ============================================================
   apache-ubuntu:
+    <<: *test-common
     build:
       context: ./apache
       args:
         DISTRO: ubuntu
-    depends_on:
-      mock-api:
-        condition: service_healthy
-    volumes:
-      - ./tests:/tests:ro
-      - ./build/sslctl:/usr/local/bin/sslctl:ro
-    environment:
-      - MOCK_API_URL=http://mock-api:8080
-      - TEST_TOKEN=test-token
 
   apache-debian:
+    <<: *test-common
     build:
       context: ./apache
       args:
         DISTRO: debian
-    depends_on:
-      mock-api:
-        condition: service_healthy
-    volumes:
-      - ./tests:/tests:ro
-      - ./build/sslctl:/usr/local/bin/sslctl:ro
-    environment:
-      - MOCK_API_URL=http://mock-api:8080
-      - TEST_TOKEN=test-token
 
   apache-alpine:
+    <<: *test-common
     build:
       context: ./apache
       args:
         DISTRO: alpine
-    depends_on:
-      mock-api:
-        condition: service_healthy
-    volumes:
-      - ./tests:/tests:ro
-      - ./build/sslctl:/usr/local/bin/sslctl:ro
-    environment:
-      - MOCK_API_URL=http://mock-api:8080
-      - TEST_TOKEN=test-token
 
   apache-rocky:
+    <<: *test-common
     build:
       context: ./apache
       args:
         DISTRO: rocky
-    depends_on:
-      mock-api:
-        condition: service_healthy
-    volumes:
-      - ./tests:/tests:ro
-      - ./build/sslctl:/usr/local/bin/sslctl:ro
-    environment:
-      - MOCK_API_URL=http://mock-api:8080
-      - TEST_TOKEN=test-token
 
   # ============================================================
   # Docker-in-Docker 容器
   # ============================================================
   dind:
+    <<: *test-common
     build: ./dind
     privileged: true
-    depends_on:
-      mock-api:
-        condition: service_healthy
-    volumes:
-      - ./tests:/tests:ro
-      - ./build/sslctl:/usr/local/bin/sslctl:ro
     environment:
       - MOCK_API_URL=http://mock-api:8080
       - TEST_TOKEN=test-token

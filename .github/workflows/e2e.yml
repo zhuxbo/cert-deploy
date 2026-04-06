@@ -38,6 +38,11 @@ jobs:
         distro: ${{ (github.event.inputs.distro || 'all') == 'all' && fromJSON('["ubuntu","debian","alpine","rocky"]') || fromJSON(format('["{0}"]', github.event.inputs.distro)) }}
         server: ${{ (github.event.inputs.server || 'all') == 'all' && fromJSON('["nginx","apache"]') || fromJSON(format('["{0}"]', github.event.inputs.server)) }}
 
+    env:
+      E2E_SERVER: ${{ matrix.server }}
+      E2E_DISTRO: ${{ matrix.distro }}
+      E2E_TEST: ${{ github.event.inputs.test || '' }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -56,12 +61,12 @@ jobs:
       - name: Build Docker images
         working-directory: docker/test
         run: |
-          docker compose build mock-api ${{ matrix.server }}-${{ matrix.distro }}
+          docker compose build mock-api "${E2E_SERVER}-${E2E_DISTRO}"
 
       - name: Start services
         working-directory: docker/test
         run: |
-          docker compose up -d mock-api ${{ matrix.server }}-${{ matrix.distro }}
+          docker compose up -d mock-api "${E2E_SERVER}-${E2E_DISTRO}"
           # 等待 mock-api 健康
           for i in $(seq 1 30); do
             if docker compose exec mock-api wget -q --spider http://localhost:8080/health 2>/dev/null; then
@@ -74,10 +79,10 @@ jobs:
       - name: Start web server and verify connectivity
         working-directory: docker/test
         run: |
-          SERVICE="${{ matrix.server }}-${{ matrix.distro }}"
+          SERVICE="${E2E_SERVER}-${E2E_DISTRO}"
 
           # 启动 web 服务器
-          if [ "${{ matrix.server }}" = "nginx" ]; then
+          if [ "$E2E_SERVER" = "nginx" ]; then
             docker compose exec "$SERVICE" nginx || true
           else
             docker compose exec "$SERVICE" bash -c 'command -v apache2ctl && apache2ctl start || httpd' || true
@@ -88,7 +93,7 @@ jobs:
           echo "=== Verifying mock-api connectivity from test container ==="
           docker compose exec "$SERVICE" curl -sf --max-time 5 http://mock-api:8080/health || echo "WARN: mock-api not reachable via hostname"
 
-          # 启动 socat 代理并验证 localhost 连通��
+          # 启动 socat 代理并验证 localhost 连通性
           echo "=== Starting socat proxy and verifying localhost connectivity ==="
           docker compose exec -d "$SERVICE" socat TCP-LISTEN:8080,fork,reuseaddr TCP:mock-api:8080
           sleep 2
@@ -101,11 +106,10 @@ jobs:
       - name: Run Bats tests
         working-directory: docker/test
         run: |
-          SERVICE="${{ matrix.server }}-${{ matrix.distro }}"
-          TEST_INPUT="${{ github.event.inputs.test }}"
+          SERVICE="${E2E_SERVER}-${E2E_DISTRO}"
 
-          if [ "$TEST_INPUT" = "all" ] || [ -z "$TEST_INPUT" ]; then
-            # 跑所有测试（排除 docker-scan 和 uninstall，uninstall 最后跑）
+          if [ "$E2E_TEST" = "all" ] || [ -z "$E2E_TEST" ]; then
+            # 跑所有测试（排除 docker-scan，uninstall 最后跑）
             docker compose exec "$SERVICE" bats \
               /tests/setup.bats \
               /tests/scan.bats \
@@ -117,14 +121,14 @@ jobs:
               /tests/upgrade.bats \
               /tests/uninstall.bats
           else
-            docker compose exec "$SERVICE" bats "/tests/${TEST_INPUT}.bats"
+            docker compose exec "$SERVICE" bats "/tests/${E2E_TEST}.bats"
           fi
 
       - name: Collect logs on failure
         if: failure()
         working-directory: docker/test
         run: |
-          SERVICE="${{ matrix.server }}-${{ matrix.distro }}"
+          SERVICE="${E2E_SERVER}-${E2E_DISTRO}"
           echo "=== Container logs ==="
           docker compose logs "$SERVICE" 2>&1 | tail -100
           echo "=== Mock API logs ==="

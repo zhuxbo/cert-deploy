@@ -45,6 +45,10 @@ setup() {
   run sslctl setup --file-validation --webroot /var/www/html --url "$MOCK_URL" --token "$TOKEN" --order 1002 --yes
   # processing 场景下 setup 可能以非零退出（等待签发），但应输出 processing 相关信息
   assert_output_contains "processing"
+  # 验证文件验证内容已写入 webroot
+  if [ -f "/var/www/html/.well-known/pki-validation/test.txt" ]; then
+    assert_file_contains "/var/www/html/.well-known/pki-validation/test.txt" "test-validation-content"
+  fi
 }
 
 @test "setup: 不安装服务" {

@@ -22,8 +22,9 @@ setup() {
 @test "status: 显示证书状态" {
   run sslctl status
   assert_success
-  # status 输出应包含证书配置信息
+  # status 输出应包含证书配置信息和域名
   assert_output_contains "证书配置"
+  assert_output_contains "example.com"
 }
 
 @test "version: 显示版本" {

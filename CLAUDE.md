@@ -102,32 +102,41 @@ go test -v ./...                           # 运行单元测试
 go test -coverprofile=coverage.out ./...   # 测试并生成覆盖率
 bash build/test-linux.sh                   # Linux 发行版服务管理测试
 
-# 容器端到端测试
-bash docker/test/scripts/run-mock-tests.sh                # Mock API 离线测试
-bash docker/test/scripts/run-e2e-tests.sh --token <token> # 真实 API 测试
-bash docker/test/scripts/run-e2e-tests.sh --all           # 全发行版测试
+# 容器端到端测试（Bats + Docker Compose）
+bash docker/test/scripts/run-tests.sh                              # 全部测试
+bash docker/test/scripts/run-tests.sh --distro ubuntu --server nginx  # 指定目标
+bash docker/test/scripts/run-tests.sh --dind                       # Docker-in-Docker 测试
+bash docker/test/scripts/run-tests.sh --no-build --test scan       # 跳过构建，指定测试
 ```
 
 ## 容器测试目录
 
 ```text
 docker/test/
-├── scripts/           # 测试脚本（构建+运行均自动化）
-│   ├── common.sh      # 公共函数（含 build_binary/build_mock_api）
-│   ├── run-e2e-tests.sh    # E2E 测试主脚本
-│   ├── run-mock-tests.sh   # Mock 测试主脚本
-│   ├── test-setup.sh       # setup 命令测试
-│   ├── test-deploy.sh      # deploy 命令测试
-│   ├── test-deploy-local.sh # deploy local 测试
-│   ├── test-scan.sh        # scan 命令测试
-│   └── test-status.sh      # status/rollback/version 测试
-├── e2e/               # E2E 测试环境（多发行版通过 --build-arg DISTRO 选择）
-│   ├── docker-compose.e2e.yml
-│   ├── nginx-e2e/     # Nginx E2E 容器（ubuntu/debian/alpine/rocky）
-│   └── apache-e2e/    # Apache E2E 容器（ubuntu/debian/alpine/rocky）
-├── mock-api/          # Mock API 服务
-│   └── main.go        # 支持场景切换、请求记录
-└── reports/           # 测试报告输出
+├── docker-compose.yml # 10 服务（mock-api + nginx×4 + apache×4 + dind）
+├── scripts/
+│   ├── build.sh       # 编译二进制 + 构建镜像
+│   └── run-tests.sh   # 测试入口（--distro/--server/--test/--dind/--no-build）
+├── tests/             # Bats 测试用例
+│   ├── helpers/
+│   │   └── common.bash  # 公共函数（Mock API/Web 服务器/断言/生命周期）
+│   ├── setup.bats       # setup 命令测试
+│   ├── deploy.bats      # deploy 命令测试
+│   ├── deploy-local.bats # deploy local 测试
+│   ├── scan.bats        # scan 命令测试
+│   ├── status.bats      # status/version 命令测试
+│   ├── rollback.bats    # rollback 命令测试
+│   ├── daemon.bats      # daemon 启动/续签测试
+│   ├── upgrade.bats     # upgrade 命令测试
+│   ├── uninstall.bats   # uninstall 测试（必须最后执行）
+│   └── docker-scan.bats # DinD 环境 Docker 容器扫描测试
+├── nginx/             # Nginx 测试容器（ubuntu/debian/alpine/rocky）
+├── apache/            # Apache 测试容器（ubuntu/debian/alpine/rocky）
+├── dind/              # Docker-in-Docker 测试容器
+├── mock-api/          # Mock API 服务（多阶段 Docker 构建）
+│   ├── main.go        # 9 场景、CA→服务器证书分层、releases 端点
+│   └── Dockerfile
+└── reports/           # TAP 测试报告输出
 ```
 
 ## 续签模式

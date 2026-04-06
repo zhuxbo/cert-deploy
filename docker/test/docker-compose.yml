@@ -1,0 +1,156 @@
+# E2E 测试 Compose 配置
+# 用法: docker compose up -d mock-api && docker compose up -d nginx-ubuntu
+# 注意: 容器 CMD 为 tail -f /dev/null，需在 exec 中手动启动 web 服务器
+
+services:
+  # Mock API 服务
+  mock-api:
+    build: ./mock-api
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  # ============================================================
+  # Nginx 容器
+  # ============================================================
+  nginx-ubuntu:
+    build:
+      context: ./nginx
+      args:
+        DISTRO: ubuntu
+    depends_on:
+      mock-api:
+        condition: service_healthy
+    volumes:
+      - ./tests:/tests:ro
+      - ./build/sslctl:/usr/local/bin/sslctl:ro
+    environment:
+      - MOCK_API_URL=http://mock-api:8080
+      - TEST_TOKEN=test-token
+
+  nginx-debian:
+    build:
+      context: ./nginx
+      args:
+        DISTRO: debian
+    depends_on:
+      mock-api:
+        condition: service_healthy
+    volumes:
+      - ./tests:/tests:ro
+      - ./build/sslctl:/usr/local/bin/sslctl:ro
+    environment:
+      - MOCK_API_URL=http://mock-api:8080
+      - TEST_TOKEN=test-token
+
+  nginx-alpine:
+    build:
+      context: ./nginx
+      args:
+        DISTRO: alpine
+    depends_on:
+      mock-api:
+        condition: service_healthy
+    volumes:
+      - ./tests:/tests:ro
+      - ./build/sslctl:/usr/local/bin/sslctl:ro
+    environment:
+      - MOCK_API_URL=http://mock-api:8080
+      - TEST_TOKEN=test-token
+
+  nginx-rocky:
+    build:
+      context: ./nginx
+      args:
+        DISTRO: rocky
+    depends_on:
+      mock-api:
+        condition: service_healthy
+    volumes:
+      - ./tests:/tests:ro
+      - ./build/sslctl:/usr/local/bin/sslctl:ro
+    environment:
+      - MOCK_API_URL=http://mock-api:8080
+      - TEST_TOKEN=test-token
+
+  # ============================================================
+  # Apache 容器
+  # ============================================================
+  apache-ubuntu:
+    build:
+      context: ./apache
+      args:
+        DISTRO: ubuntu
+    depends_on:
+      mock-api:
+        condition: service_healthy
+    volumes:
+      - ./tests:/tests:ro
+      - ./build/sslctl:/usr/local/bin/sslctl:ro
+    environment:
+      - MOCK_API_URL=http://mock-api:8080
+      - TEST_TOKEN=test-token
+
+  apache-debian:
+    build:
+      context: ./apache
+      args:
+        DISTRO: debian
+    depends_on:
+      mock-api:
+        condition: service_healthy
+    volumes:
+      - ./tests:/tests:ro
+      - ./build/sslctl:/usr/local/bin/sslctl:ro
+    environment:
+      - MOCK_API_URL=http://mock-api:8080
+      - TEST_TOKEN=test-token
+
+  apache-alpine:
+    build:
+      context: ./apache
+      args:
+        DISTRO: alpine
+    depends_on:
+      mock-api:
+        condition: service_healthy
+    volumes:
+      - ./tests:/tests:ro
+      - ./build/sslctl:/usr/local/bin/sslctl:ro
+    environment:
+      - MOCK_API_URL=http://mock-api:8080
+      - TEST_TOKEN=test-token
+
+  apache-rocky:
+    build:
+      context: ./apache
+      args:
+        DISTRO: rocky
+    depends_on:
+      mock-api:
+        condition: service_healthy
+    volumes:
+      - ./tests:/tests:ro
+      - ./build/sslctl:/usr/local/bin/sslctl:ro
+    environment:
+      - MOCK_API_URL=http://mock-api:8080
+      - TEST_TOKEN=test-token
+
+  # ============================================================
+  # Docker-in-Docker 容器
+  # ============================================================
+  dind:
+    build: ./dind
+    privileged: true
+    depends_on:
+      mock-api:
+        condition: service_healthy
+    volumes:
+      - ./tests:/tests:ro
+      - ./build/sslctl:/usr/local/bin/sslctl:ro
+    environment:
+      - MOCK_API_URL=http://mock-api:8080
+      - TEST_TOKEN=test-token
+      - DOCKER_TLS_CERTDIR=

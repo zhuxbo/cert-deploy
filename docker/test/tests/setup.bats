@@ -48,6 +48,8 @@ setup() {
 }
 
 @test "setup: 不安装服务" {
+  # 清理之前测试可能安装的服务文件
+  rm -f /etc/systemd/system/sslctl.service /etc/init.d/sslctl 2>/dev/null || true
   run sslctl setup --url "$MOCK_URL" --token "$TOKEN" --order 1001 --no-service --yes
   assert_success
   # 验证没有安装 systemd/openrc 服务文件

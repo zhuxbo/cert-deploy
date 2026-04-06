@@ -489,8 +489,17 @@ func handleGetOrders(w http.ResponseWriter, r *http.Request) {
 	if orderIDStr != "" {
 		orderID, err := strconv.Atoi(orderIDStr)
 		if err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			_ = json.NewEncoder(w).Encode(APIResponse{Code: 0, Message: "Invalid order"})
+			// 非纯整数: 批量查询（逗号分隔的 ID/域名混合）
+			matchedOrders := filterOrdersByQuery(orderIDStr, scenario)
+			_ = json.NewEncoder(w).Encode(APIResponse{
+				Code:    1,
+				Message: "success",
+				Data: PaginatedData{
+					Total: len(matchedOrders), CurrentPage: 1, PageSize: 100,
+					RenewBeforeDays: 14,
+					Data:            matchedOrders,
+				},
+			})
 			return
 		}
 
@@ -989,6 +998,57 @@ func buildOrderResponse(order *OrderData, scenario string) interface{} {
 		}
 	}
 	return order
+}
+
+// filterOrdersByQuery 按逗号分隔的查询条件过滤订单
+// 支持混合 ID 和域名关键字，例如 "1001,test.example.com"
+// 匹配逻辑：订单 ID 匹配 或 订单域名包含关键字
+func filterOrdersByQuery(query, scenario string) []interface{} {
+	parts := strings.Split(query, ",")
+	var result []interface{}
+	seen := make(map[int]bool)
+
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+
+		// 尝试按 ID 匹配
+		if id, err := strconv.Atoi(part); err == nil {
+			if order, exists := orders[id]; exists && !seen[order.OrderID] {
+				seen[order.OrderID] = true
+				result = append(result, orderToResponse(order, scenario))
+			}
+			continue
+		}
+
+		// 按域名关键字匹配
+		for _, order := range orders {
+			if seen[order.OrderID] {
+				continue
+			}
+			if strings.Contains(order.Domains, part) || strings.Contains(order.CommonName, part) {
+				seen[order.OrderID] = true
+				result = append(result, orderToResponse(order, scenario))
+			}
+		}
+	}
+
+	return result
+}
+
+// orderToResponse 根据场景将订单转换为 API 响应数据
+func orderToResponse(order *OrderData, scenario string) interface{} {
+	if scenario == "processing" || order.Status == "processing" {
+		return buildOrderResponse(order, scenario)
+	}
+	if order.Status == "active" {
+		certData := getCertDataWithOrder(order.CommonName, order.OrderID)
+		certData.Domains = order.Domains
+		return certData
+	}
+	return *order
 }
 
 func truncate(s string, maxLen int) string {

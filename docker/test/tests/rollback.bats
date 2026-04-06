@@ -9,15 +9,28 @@ setup_file() {
   rm -f "$SSLCTL_CONFIG_DIR/config.json"
   # 1. 初始 setup
   run_initial_setup
+  # 验证 setup 成功并提取证书名
+  if [ ! -f "$SSLCTL_CONFIG_DIR/config.json" ]; then
+    echo "setup_file FAILED: config.json not created" >&2
+    return 1
+  fi
+  local cert_name
+  cert_name=$(jq -r '.certificates[0].cert_name' "$SSLCTL_CONFIG_DIR/config.json")
+  if [ -z "$cert_name" ] || [ "$cert_name" = "null" ]; then
+    echo "setup_file FAILED: no cert_name in config.json" >&2
+    return 1
+  fi
+  echo "$cert_name" > /tmp/rollback-test-cert-name
   # 2. 第一次 deploy（创建初始状态）
-  sslctl deploy --cert "test.example.com-1001" --yes 2>&1 || true
+  sslctl deploy --cert "$cert_name" --yes 2>&1 || true
   sleep 1
   # 3. 第二次 deploy（创建备份）
-  sslctl deploy --cert "test.example.com-1001" --yes 2>&1 || true
+  sslctl deploy --cert "$cert_name" --yes 2>&1 || true
 }
 
 setup() {
   common_setup
+  CERT_NAME=$(cat /tmp/rollback-test-cert-name 2>/dev/null || echo "")
 }
 
 # ==============================================================================

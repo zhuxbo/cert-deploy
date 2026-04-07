@@ -197,7 +197,9 @@ ensure_mock_proxy() {
   remote_host=$(echo "$MOCK_REMOTE_URL" | sed -E 's|https?://||; s|/.*||; s|:.*||')
   remote_port=$(echo "$MOCK_REMOTE_URL" | sed -E 's|https?://||; s|/.*||; s|.*:||')
   remote_port="${remote_port:-8080}"
-  socat TCP-LISTEN:8080,fork,reuseaddr TCP:"$remote_host":"$remote_port" &
+  # 重定向 stdin/stdout/stderr 到 /dev/null，避免 socat 继承 exec session 的 fd
+  # 导致 docker compose exec -T 在 bats 结束后挂起
+  socat TCP-LISTEN:8080,fork,reuseaddr TCP:"$remote_host":"$remote_port" </dev/null >/dev/null 2>&1 &
   # 等待端口就绪
   for i in $(seq 1 10); do
     if curl -sf --max-time 3 http://localhost:8080/health >/dev/null 2>&1; then

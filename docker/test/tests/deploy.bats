@@ -52,14 +52,16 @@ setup() {
 
 @test "deploy: Web 服务器配置有效" {
   # 先部署证书确保配置已更新
-  sslctl deploy --cert "$CERT_NAME" 2>&1 || true
+  run sslctl deploy --cert "$CERT_NAME"
+  assert_success
   run test_webserver_config
   assert_success
 }
 
 @test "deploy: 备份已创建" {
   # 部署后应在 backup 目录下创建备份
-  sslctl deploy --cert "$CERT_NAME" 2>&1 || true
+  run sslctl deploy --cert "$CERT_NAME"
+  assert_success
   assert_dir_exists "$SSLCTL_CONFIG_DIR/backup"
   # 检查 backup 目录下有内容（至少有一个站点的备份子目录）
   local count

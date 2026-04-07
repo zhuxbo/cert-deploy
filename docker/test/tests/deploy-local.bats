@@ -4,6 +4,13 @@ load 'helpers/common'
 
 setup_file() {
   ensure_webserver_running
+  # deploy local 需要站点绑定信息（来自 config.json 或 scan-result.json）
+  # 确保配置存在，支持 --test deploy-local 独立运行
+  mock_reset || true
+  mock_set_scenario active || true
+  if [ ! -f "$SSLCTL_CONFIG_DIR/config.json" ]; then
+    run_initial_setup
+  fi
   # 生成测试用自签名证书和私钥
   generate_test_cert
 }

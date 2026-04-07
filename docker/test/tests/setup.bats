@@ -40,15 +40,15 @@ setup() {
   rm -f /tmp/test-setup.key
 }
 
-@test "setup: 文件验证模式" {
+@test "setup: 文件验证模式（processing 状态应失败）" {
   mock_set_scenario processing
   run sslctl setup --file-validation --webroot /var/www/html --url "$MOCK_URL" --token "$TOKEN" --order 1002 --yes
-  # processing 场景下 setup 可能以非零退出（等待签发），但应输出 processing 相关信息
+  # processing 场景下证书未就绪，setup 应失败退出
+  assert_failure
   assert_output_contains "processing"
-  # 验证文件验证内容已写入 webroot
-  if [ -f "/var/www/html/.well-known/pki-validation/test.txt" ]; then
-    assert_file_contains "/var/www/html/.well-known/pki-validation/test.txt" "test-validation-content"
-  fi
+  # 注意: 文件验证挑战文件的放置发生在 daemon 续签流程中（certops/renew.go），
+  # setup 在证书未就绪时直接退出，不会写入验证文件
+  assert_file_not_exists "/var/www/html/.well-known/pki-validation/test.txt"
 }
 
 @test "setup: 不安装服务" {

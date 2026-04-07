@@ -56,7 +56,7 @@ jobs:
       - name: Build sslctl binary
         run: |
           mkdir -p docker/test/build
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o docker/test/build/sslctl ./cmd/
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags e2e -o docker/test/build/sslctl ./cmd/
 
       - name: Build Docker images
         working-directory: docker/test
@@ -73,13 +73,21 @@ jobs:
               echo "mock-api ready"
               break
             fi
+            if [ "$i" -eq 30 ]; then
+              echo "ERROR: mock-api health check timeout"
+              exit 1
+            fi
             sleep 1
           done
 
-      - name: Start web server and verify connectivity
+      - name: Install binary and start web server
         working-directory: docker/test
         run: |
           SERVICE="${E2E_SERVER}-${E2E_DISTRO}"
+
+          # 复制二进制到可写路径（volume 为只读暂存，upgrade 测试需要可写）
+          docker compose exec "$SERVICE" cp /opt/sslctl-binary /usr/local/bin/sslctl
+          docker compose exec "$SERVICE" chmod +x /usr/local/bin/sslctl
 
           # 启动 web 服务器
           if [ "$E2E_SERVER" = "nginx" ]; then
@@ -89,28 +97,28 @@ jobs:
           fi
           sleep 2
 
-          # 从测试容器内验证 mock-api 连通性
+          # 验证 mock-api 连通性（硬失败）
           echo "=== Verifying mock-api connectivity from test container ==="
-          docker compose exec "$SERVICE" curl -sf --max-time 5 http://mock-api:8080/health || echo "WARN: mock-api not reachable via hostname"
+          docker compose exec "$SERVICE" curl -sf --max-time 5 http://mock-api:8080/health
 
-          # 启动 socat 代理并验证 localhost 连通性
+          # 启动 socat 代理并验证 localhost 连通性（硬失败）
           echo "=== Starting socat proxy and verifying localhost connectivity ==="
           docker compose exec -d "$SERVICE" socat TCP-LISTEN:8080,fork,reuseaddr TCP:mock-api:8080
           sleep 2
-          docker compose exec "$SERVICE" curl -sf --max-time 5 http://localhost:8080/health || echo "WARN: mock-api not reachable via localhost proxy"
+          docker compose exec "$SERVICE" curl -sf --max-time 5 http://localhost:8080/health
 
-          # 验证 sslctl 可执行
+          # 验证 sslctl 可执行（硬失败）
           echo "=== Verifying sslctl ==="
-          docker compose exec "$SERVICE" sslctl version || echo "WARN: sslctl not available"
+          docker compose exec "$SERVICE" sslctl version
 
       - name: Run Bats tests
         working-directory: docker/test
         run: |
           SERVICE="${E2E_SERVER}-${E2E_DISTRO}"
+          mkdir -p reports
 
           if [ "$E2E_TEST" = "all" ] || [ -z "$E2E_TEST" ]; then
-            # 跑所有测试（排除 docker-scan，uninstall 最后跑）
-            docker compose exec "$SERVICE" bats \
+            docker compose exec "$SERVICE" bats --tap \
               /tests/setup.bats \
               /tests/scan.bats \
               /tests/deploy.bats \
@@ -119,9 +127,11 @@ jobs:
               /tests/rollback.bats \
               /tests/daemon.bats \
               /tests/upgrade.bats \
-              /tests/uninstall.bats
+              /tests/uninstall.bats \
+              | tee "reports/${E2E_SERVER}-${E2E_DISTRO}.tap"
           else
-            docker compose exec "$SERVICE" bats "/tests/${E2E_TEST}.bats"
+            docker compose exec "$SERVICE" bats --tap "/tests/${E2E_TEST}.bats" \
+              | tee "reports/${E2E_SERVER}-${E2E_DISTRO}.tap"
           fi
 
       - name: Collect logs on failure
@@ -129,12 +139,18 @@ jobs:
         working-directory: docker/test
         run: |
           SERVICE="${E2E_SERVER}-${E2E_DISTRO}"
-          echo "=== Container logs ==="
-          docker compose logs "$SERVICE" 2>&1 | tail -100
-          echo "=== Mock API logs ==="
-          docker compose logs mock-api 2>&1 | tail -50
-          echo "=== sslctl logs ==="
-          docker compose exec "$SERVICE" cat /opt/sslctl/logs/*.log 2>/dev/null | tail -50 || true
+          mkdir -p reports
+          docker compose logs "$SERVICE" > "reports/${SERVICE}-container.log" 2>&1 || true
+          docker compose logs mock-api > "reports/${SERVICE}-mock-api.log" 2>&1 || true
+          docker compose exec "$SERVICE" bash -c 'cat /opt/sslctl/logs/*.log 2>/dev/null' > "reports/${SERVICE}-sslctl.log" 2>/dev/null || true
+
+      - name: Upload test artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-${{ matrix.server }}-${{ matrix.distro }}
+          path: docker/test/reports/
+          retention-days: 7
 
       - name: Cleanup
         if: always()
@@ -160,7 +176,7 @@ jobs:
       - name: Build sslctl binary
         run: |
           mkdir -p docker/test/build
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o docker/test/build/sslctl ./cmd/
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags e2e -o docker/test/build/sslctl ./cmd/
 
       - name: Build Docker images
         working-directory: docker/test
@@ -176,19 +192,41 @@ jobs:
               echo "dind ready"
               break
             fi
+            if [ "$i" -eq 30 ]; then
+              echo "ERROR: dind docker daemon timeout"
+              exit 1
+            fi
             sleep 2
           done
 
+      - name: Install binary
+        working-directory: docker/test
+        run: |
+          docker compose exec dind cp /opt/sslctl-binary /usr/local/bin/sslctl
+          docker compose exec dind chmod +x /usr/local/bin/sslctl
+
       - name: Run Docker scan tests
         working-directory: docker/test
-        run: docker compose exec dind bats /tests/docker-scan.bats
+        run: |
+          mkdir -p reports
+          docker compose exec dind bats --tap /tests/docker-scan.bats \
+            | tee reports/dind.tap
 
       - name: Collect logs on failure
         if: failure()
         working-directory: docker/test
         run: |
-          docker compose logs dind 2>&1 | tail -100
-          docker compose logs mock-api 2>&1 | tail -50
+          mkdir -p reports
+          docker compose logs dind > reports/dind-container.log 2>&1 || true
+          docker compose logs mock-api > reports/dind-mock-api.log 2>&1 || true
+
+      - name: Upload test artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-dind
+          path: docker/test/reports/
+          retention-days: 7
 
       - name: Cleanup
         if: always()

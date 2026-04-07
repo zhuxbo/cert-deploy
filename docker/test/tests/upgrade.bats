@@ -15,65 +15,78 @@ setup() {
 }
 
 teardown() {
-  # 确保 config.json 备份在异常退出时也能恢复
+  # 恢复 config.json 备份
   local config_file="$SSLCTL_CONFIG_DIR/config.json"
   if [[ -f "${config_file}.bak" ]]; then
     mv "${config_file}.bak" "$config_file"
   fi
+  # 恢复原始二进制（upgrade 会替换为 mock 数据）
+  cp /opt/sslctl-binary /usr/local/bin/sslctl 2>/dev/null || true
+  chmod +x /usr/local/bin/sslctl 2>/dev/null || true
 }
 
 # ==============================================================================
 # upgrade 命令测试
 # ==============================================================================
+# e2e 构建使用 -tags e2e，跳过 HTTPS 强制和签名验证，可测试完整升级链路。
+# HTTPS 和签名验证由 pkg/upgrade 单元测试覆盖。
 
 @test "upgrade: release_url 未配置时报错" {
   local config_file="$SSLCTL_CONFIG_DIR/config.json"
   cp "$config_file" "${config_file}.bak"
 
-  # 用 jq 移除 release_url 字段
   jq 'del(.release_url)' "$config_file" > "${config_file}.tmp" && mv "${config_file}.tmp" "$config_file"
 
-  # 非交互环境下，未配置 release_url 应报错
   run sslctl upgrade
   assert_failure
   assert_output_contains "release_url"
 
-  # 恢复配置
   mv "${config_file}.bak" "$config_file"
 }
 
-@test "upgrade: 拒绝非 HTTPS 地址" {
+@test "upgrade: --check 检查更新" {
   local config_file="$SSLCTL_CONFIG_DIR/config.json"
   cp "$config_file" "${config_file}.bak"
 
-  # 用 jq 写入 HTTP 地址
-  jq '.release_url = "http://mock-api:8080/releases"' "$config_file" > "${config_file}.tmp" && mv "${config_file}.tmp" "$config_file"
+  # 指向 mock-api releases 端点
+  jq '.release_url = "http://localhost:8080/releases"' "$config_file" > "${config_file}.tmp" && mv "${config_file}.tmp" "$config_file"
+
+  mock_set_scenario releases
+
+  run sslctl upgrade --check
+  assert_success
+  # mock-api 返回 v99.0.0，应提示有新版本
+  assert_output_contains "99.0.0"
+
+  mv "${config_file}.bak" "$config_file"
+}
+
+@test "upgrade: 成功升级（下载/校验/替换）" {
+  local config_file="$SSLCTL_CONFIG_DIR/config.json"
+  cp "$config_file" "${config_file}.bak"
+
+  jq '.release_url = "http://localhost:8080/releases"' "$config_file" > "${config_file}.tmp" && mv "${config_file}.tmp" "$config_file"
+
+  mock_set_scenario releases
+
+  # 记录升级前的二进制 inode
+  local before_inode
+  before_inode=$(stat -c '%i' /usr/local/bin/sslctl 2>/dev/null || stat -f '%i' /usr/local/bin/sslctl)
 
   run sslctl upgrade
-  assert_failure
-  # 应包含 HTTPS 或安全相关的错误信息
-  if [[ "$output" != *"HTTPS"* ]] && [[ "$output" != *"https"* ]] && [[ "$output" != *"不安全"* ]]; then
-    echo "Expected output to mention HTTPS requirement"
-    echo "Actual output: $output"
-    mv "${config_file}.bak" "$config_file"
+  assert_success
+  assert_output_contains "99.0.0"
+  assert_output_contains "升级完成"
+
+  # 验证二进制已被替换（inode 变化）
+  local after_inode
+  after_inode=$(stat -c '%i' /usr/local/bin/sslctl 2>/dev/null || stat -f '%i' /usr/local/bin/sslctl)
+  if [ "$before_inode" = "$after_inode" ]; then
+    echo "二进制 inode 未变化，升级可能未实际替换文件"
     return 1
   fi
 
+  # teardown 会恢复原始二进制
   mv "${config_file}.bak" "$config_file"
 }
 
-@test "upgrade: --check 参数可用" {
-  local config_file="$SSLCTL_CONFIG_DIR/config.json"
-  cp "$config_file" "${config_file}.bak"
-
-  # 写入一个 HTTPS 地址（不存在的域名，测试参数解析正常）
-  jq '.release_url = "https://nonexistent.example.com/sslctl"' "$config_file" > "${config_file}.tmp" && mv "${config_file}.tmp" "$config_file"
-
-  # --check 应尝试连接远程服务器，因为域名不存在会失败，但不应因参数问题失败
-  run sslctl upgrade --check
-  assert_failure
-  assert_output_not_contains "unknown flag"
-  assert_output_not_contains "用法"
-
-  mv "${config_file}.bak" "$config_file"
-}

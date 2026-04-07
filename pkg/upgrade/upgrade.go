@@ -15,6 +15,15 @@ import (
 // installFunc 安装函数，可在测试中替换
 var installFunc = Install
 
+// validateReleaseURL 验证升级地址并返回 HTTP 客户端
+// 生产构建强制 HTTPS + TLS 1.2+，e2e 测试构建可通过 build tag 覆盖
+var validateReleaseURL = func(releaseURL string) (*http.Client, error) {
+	if !strings.HasPrefix(releaseURL, "https://") {
+		return nil, &ErrReleaseSource{Msg: "升级地址必须使用 HTTPS 协议"}
+	}
+	return secureHTTPClient(), nil
+}
+
 // Options 升级选项
 type Options struct {
 	Channel        string // 更新通道 (main/dev)
@@ -42,11 +51,12 @@ func Execute(opts Options, logFunc func(format string, args ...interface{})) (*R
 	if opts.ReleaseURL == "" {
 		return nil, &ErrReleaseSource{Msg: "未配置升级地址，请运行 sslctl upgrade 在交互终端中输入，或使用安装脚本升级"}
 	}
-	// 安全校验：强制 HTTPS
-	if !strings.HasPrefix(opts.ReleaseURL, "https://") {
-		return nil, &ErrReleaseSource{Msg: "升级地址必须使用 HTTPS 协议"}
+	// 安全校验 + 创建 HTTP 客户端（生产环境强制 HTTPS，e2e 可覆盖）
+	client, err := validateReleaseURL(opts.ReleaseURL)
+	if err != nil {
+		return nil, err
 	}
-	return executeWithClient(opts, logFunc, opts.ReleaseURL+"/releases.json", secureHTTPClient())
+	return executeWithClient(opts, logFunc, opts.ReleaseURL+"/releases.json", client)
 }
 
 // executeWithClient 内部实现，接受 URL 和 client 参数（便于测试）

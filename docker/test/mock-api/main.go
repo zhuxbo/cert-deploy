@@ -5,6 +5,7 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
@@ -214,8 +215,10 @@ func main() {
 	mux.HandleFunc("/api/callback", handleCallback)
 
 	// releases 端点
+	// /releases/releases.json - 版本索引（精确匹配优先于 /releases/ 子树）
+	// /releases/{channel}/v{version}/{filename} - 二进制下载
 	mux.HandleFunc("/releases/releases.json", handleReleasesJSON)
-	mux.HandleFunc("/releases/download/", handleReleasesDownload)
+	mux.HandleFunc("/releases/", handleReleasesDownload)
 
 	// 管理端点
 	mux.HandleFunc("/admin/scenario/", handleSetScenario)
@@ -348,21 +351,31 @@ func initTestOrders() {
 
 // initReleaseData 初始化升级测试数据
 func initReleaseData() {
-	// 生成虚拟二进制文件（4KB）
-	releaseBinaryData = make([]byte, 4096)
-	for i := range releaseBinaryData {
-		releaseBinaryData[i] = byte(i % 256)
+	// 生成虚拟二进制（4KB），然后 gzip 压缩
+	// sslctl upgrade 下载的是 gzip 数据，校验和也基于 gzip 数据计算
+	rawBinary := make([]byte, 4096)
+	for i := range rawBinary {
+		rawBinary[i] = byte(i % 256)
 	}
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	if _, err := gz.Write(rawBinary); err != nil {
+		log.Fatalf("gzip write: %v", err)
+	}
+	if err := gz.Close(); err != nil {
+		log.Fatalf("gzip close: %v", err)
+	}
+	releaseBinaryData = buf.Bytes()
 
-	// 计算 SHA256 checksum
+	// 校验和格式: "sha256:<hex>"（与 pkg/upgrade.VerifyChecksum 一致）
 	hash := sha256.Sum256(releaseBinaryData)
-	releaseBinaryHash = hex.EncodeToString(hash[:])
+	releaseBinaryHash = "sha256:" + hex.EncodeToString(hash[:])
 
-	// 文件名列表（与 sslctl 实际发布文件名匹配）
+	// 文件名格式: sslctl-{os}-{arch}.gz（与 pkg/upgrade.GetDownloadFilename 一致）
 	files := []string{
-		"sslctl_linux_amd64.tar.gz",
-		"sslctl_linux_arm64.tar.gz",
-		"sslctl_windows_amd64.zip",
+		"sslctl-linux-amd64.gz",
+		"sslctl-linux-arm64.gz",
+		"sslctl-windows-amd64.exe.gz",
 	}
 
 	checksums := make(map[string]string)
@@ -393,8 +406,8 @@ func initReleaseData() {
 		},
 	}
 
-	log.Printf("Initialized release data: main=v99.0.0, dev=v99.0.0-dev1, binary=%d bytes, sha256=%s",
-		len(releaseBinaryData), releaseBinaryHash[:16]+"...")
+	log.Printf("Initialized release data: main=v99.0.0, dev=v99.0.0-dev1, gzip=%d bytes, %s",
+		len(releaseBinaryData), releaseBinaryHash[:24]+"...")
 }
 
 // ==============================================================================
@@ -726,7 +739,7 @@ func handleReleasesDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 提取文件名: /releases/download/{filename}
+	// 提取文件名: /releases/{channel}/v{version}/{filename}
 	parts := strings.Split(r.URL.Path, "/")
 	if len(parts) < 4 {
 		w.WriteHeader(http.StatusNotFound)

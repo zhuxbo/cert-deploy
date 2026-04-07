@@ -9,7 +9,7 @@ TEST_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 echo "=== Building sslctl binary ==="
 mkdir -p "$TEST_DIR/build"
 cd "$PROJECT_ROOT"
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o "$TEST_DIR/build/sslctl" ./cmd/
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags e2e -o "$TEST_DIR/build/sslctl" ./cmd/
 echo "Binary: $TEST_DIR/build/sslctl"
 
 echo "=== Building Docker images ==="

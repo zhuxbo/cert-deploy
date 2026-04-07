@@ -8,7 +8,7 @@ x-test-common: &test-common
       condition: service_healthy
   volumes:
     - ./tests:/tests:ro
-    - ./build/sslctl:/usr/local/bin/sslctl:ro
+    - ./build/sslctl:/opt/sslctl-binary:ro
   environment:
     - MOCK_API_URL=http://mock-api:8080
     - TEST_TOKEN=test-token

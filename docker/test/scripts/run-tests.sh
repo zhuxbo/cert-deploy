@@ -173,6 +173,10 @@ for server in $SERVERS; do
             continue
         fi
 
+        # 复制二进制到可写路径（挂载为只读暂存，upgrade 测试需要可写）
+        docker compose exec -T "$service" cp /opt/sslctl-binary /usr/local/bin/sslctl
+        docker compose exec -T "$service" chmod +x /usr/local/bin/sslctl
+
         # 启动 web 服务器 + 运行 bats
         start_cmd=$(get_start_cmd "$server" "$distro")
         bats_cmd=$(get_bats_cmd "$TESTS")
@@ -220,6 +224,10 @@ if [[ "$RUN_DIND" == "true" ]]; then
             FAILED_LIST="$FAILED_LIST dind"
             docker compose stop dind >/dev/null 2>&1
         else
+            # 复制二进制到可写路径
+            docker compose exec -T dind cp /opt/sslctl-binary /usr/local/bin/sslctl
+            docker compose exec -T dind chmod +x /usr/local/bin/sslctl
+
             report_file="reports/dind.tap"
             dind_bats="bats --tap /tests/docker-scan.bats"
             if [[ -n "$TESTS" ]]; then

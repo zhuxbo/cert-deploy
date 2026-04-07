@@ -1,27 +1,12 @@
-# Mock API 服务容器
 FROM golang:1.24-alpine AS builder
-
 WORKDIR /app
+RUN go mod init mock-api
 COPY main.go .
+RUN CGO_ENABLED=0 go build -o mock-api .
 
-RUN go build -o mock-api main.go
-
-# 运行镜像
-FROM alpine:3.19
-
-RUN apk add --no-cache ca-certificates openssl bash
-
-WORKDIR /app
-
-COPY --from=builder /app/mock-api /usr/local/bin/mock-api
-
-# 生成默认测试证书
-RUN mkdir -p /certs && \
-    openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
-        -keyout /certs/default.key \
-        -out /certs/default.crt \
-        -subj "/CN=test.example.com/O=MockAPI/C=CN"
-
+FROM alpine:3.21
+RUN apk add --no-cache ca-certificates
+COPY --from=builder /app/mock-api /usr/local/bin/
 EXPOSE 8080
-
-CMD ["mock-api", "-port", "8080", "-cert", "/certs/default.crt", "-key", "/certs/default.key", "-cn", "test.example.com"]
+HEALTHCHECK --interval=5s --timeout=3s CMD wget -q --spider http://localhost:8080/health || exit 1
+CMD ["mock-api"]

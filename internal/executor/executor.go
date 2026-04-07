@@ -76,6 +76,8 @@ var AllowedCommands = map[string]bool{
 	"C:\\Apache24\\bin\\httpd.exe -k restart": true,
 	"net stop Apache2.4":                      true,
 	"net start Apache2.4":                     true,
+	"taskkill /F /T /IM httpd.exe":  true,
+	"taskkill /F /T /IM nginx.exe": true,
 
 	// ========== 系统扫描命令（只读） ==========
 	"ps -C nginx -o pid=":   true, // 查找 nginx 进程
@@ -116,9 +118,15 @@ var AllowedCommands = map[string]bool{
 
 // AllowedScanExecutables 扫描器允许的可执行文件（用于动态路径）
 var AllowedScanExecutables = map[string]bool{
-	"nginx":          true,
-	"nginx.exe":      true,
-	"/usr/sbin/nginx": true,
+	"nginx":            true,
+	"nginx.exe":        true,
+	"/usr/sbin/nginx":  true,
+	"httpd":            true,
+	"httpd.exe":        true,
+	"apachectl":        true,
+	"apache2ctl":       true,
+	"/usr/sbin/httpd":  true,
+	"/usr/sbin/apachectl": true,
 }
 
 // AllowedScanArgs 允许的参数（用于动态路径命令）
@@ -126,16 +134,21 @@ var AllowedScanArgs = map[string]bool{
 	"-t": true, // 测试配置
 	"-T": true, // 获取合并配置
 	"-V": true, // 获取版本信息
+	"-S": true, // 虚拟主机列表（Apache）
 	"-s": true, // 信号控制（如 -s reload）
 	"-v": true, // 版本号
 	"-p": true, // prefix 路径（Windows 上指定 nginx 工作目录）
+	"-k": true, // Apache 信号控制（如 -k graceful）
 
-	"reload": true, // reload 信号参数
+	"reload":   true, // reload 信号参数
+	"graceful": true, // Apache graceful 重载
+	"restart":  true, // Apache restart
 }
 
 // argsWithValueParam 带值参数（下一个参数是值，跳过白名单检查）
 var argsWithValueParam = map[string]bool{
 	"-p": true, // -p <prefix_path>
+	"-k": true, // -k <signal>（graceful/restart）
 }
 
 // ParseCommand 解析命令字符串为可执行文件和参数
@@ -247,4 +260,20 @@ func RunScanContext(ctx context.Context, executable string, args ...string) ([]b
 
 	cmd := exec.CommandContext(ctx, executable, args...)
 	return cmd.CombinedOutput()
+}
+
+// RunDetached 后台启动进程（不等待退出）
+// 仅用于 Windows 上重启非服务模式的 Web 服务器
+func RunDetached(executable string, args ...string) error {
+	basename := executable
+	if idx := strings.LastIndexAny(basename, "/\\"); idx >= 0 {
+		basename = basename[idx+1:]
+	}
+	if !AllowedScanExecutables[basename] && !AllowedScanExecutables[executable] {
+		return fmt.Errorf("executable not in whitelist: %s", executable)
+	}
+
+	cmd := exec.Command(executable, args...)
+	cmd.SysProcAttr = detachedProcAttr()
+	return cmd.Start()
 }

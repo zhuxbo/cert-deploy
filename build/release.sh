@@ -90,11 +90,11 @@ load_config() {
 
 # ========================================
 # 解析服务器配置
-# 格式: "名称,主机,端口,目录,URL"
+# 格式: "名称,主机,端口,目录"
 # ========================================
 parse_server() {
     local server_str="$1"
-    IFS=',' read -r SERVER_NAME SERVER_HOST SERVER_PORT SERVER_DIR SERVER_URL <<< "$server_str"
+    IFS=',' read -r SERVER_NAME SERVER_HOST SERVER_PORT SERVER_DIR <<< "$server_str"
     SERVER_PORT=${SERVER_PORT:-22}
 }
 
@@ -297,26 +297,21 @@ if channel not in data:
 checksums = json.loads(os.environ['CHECKSUMS_JSON'])
 signatures = json.loads(os.environ['SIGNATURES_JSON'])
 
-# 在版本列表中找到对应条目并更新 checksums/signature
+# 在版本列表中找到对应条目并更新 checksums/signatures
 versions = data[channel].get('versions', [])
 found = False
 for v in versions:
     if v['version'] == bare_version:
         v['checksums'] = checksums
         if signatures:
-            # 取第一个签名（所有平台产物使用同一签名）
-            first_sig = next(iter(signatures.values()), '')
-            if first_sig:
-                v['signature'] = first_sig
+            v['signatures'] = signatures
         found = True
         break
 
 if not found:
     entry = {'version': bare_version, 'checksums': checksums}
     if signatures:
-        first_sig = next(iter(signatures.values()), '')
-        if first_sig:
-            entry['signature'] = first_sig
+        entry['signatures'] = signatures
     versions.insert(0, entry)
 
 with open(releases_file, 'w') as f:
@@ -379,11 +374,11 @@ version_entry = {
 # 检查版本是否已存在
 existing = [i for i, v in enumerate(versions) if v['version'] == bare_version]
 if existing:
-    # 保留已有 checksums/signature
+    # 保留已有 checksums/signatures
     old = versions[existing[0]]
     version_entry['checksums'] = old.get('checksums', {})
-    if 'signature' in old:
-        version_entry['signature'] = old['signature']
+    if 'signatures' in old:
+        version_entry['signatures'] = old['signatures']
     versions[existing[0]] = version_entry
 else:
     versions.insert(0, version_entry)
@@ -705,13 +700,7 @@ main() {
     if [ $result -eq 0 ]; then
         log_success "发布完成！"
         echo ""
-        log_info "验证命令:"
-        for server in "${SERVERS[@]}"; do
-            parse_server "$server"
-            if [ -z "$target_server" ] || [ "$SERVER_NAME" = "$target_server" ]; then
-                echo "  curl $SERVER_URL/releases.json | jq ."
-            fi
-        done
+        log_info "验证: curl https://release.cnssl.com/sslctl/releases.json | jq ."
     else
         log_error "部分服务器发布失败"
     fi

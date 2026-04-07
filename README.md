@@ -61,6 +61,9 @@ sslctl setup --url https://api.example.com --token your-token --order 12345
 选项：
 
 - `--local-key`: 使用本机提交
+- `--key <path>`: 私钥文件路径（隐含 `--local-key`）
+- `--file-validation`: 启用文件验证（隐含 `--local-key`）
+- `--webroot <path>`: 文件验证的 Web 根目录（隐含 `--file-validation`）
 - `--yes`: 跳过确认提示
 - `--no-service`: 不安装守护服务
 
@@ -164,7 +167,7 @@ sslctl --debug deploy --site example.com
 - **路径验证**：Docker 容器路径参数严格验证，防止命令注入；挂载路径精确匹配防止误匹配
 - **备份 TOCTOU 保护**：使用文件哈希校验检测并发修改，确保备份一致性；恢复时内部备份跳过清理，防止目标备份被删除；备份源文件符号链接检查，拒绝备份符号链接目标；`siteName`/`timestamp` 路径穿越防护
 - **扫描防护**：Nginx/Apache/Docker 扫描器文件数量限制（1000）+ 深度限制（100）+ 文件大小限制（10MB），防止恶意配置耗尽资源
-- **升级安全**：gzip 解压大小限制，防止 gzip 炸弹攻击；Ed25519 数字签名验证（密钥环支持多公钥 + key ID，空密钥环拒绝验证，已配置公钥时拒绝未签名版本防止降级攻击），防止供应链攻击；安装时符号链接防护；临时文件保持 0600 仅在最终路径设置 0755；通道白名单防止路径遍历；密钥不匹配时提示用 install.sh 重装
+- **升级安全**：gzip 解压大小限制，防止 gzip 炸弹攻击；Ed25519 数字签名验证（按文件名索引签名，密钥环支持多公钥 + key ID，空密钥环拒绝验证，已配置公钥时拒绝未签名版本防止降级攻击），防止供应链攻击；先停服务再替换二进制，失败时恢复服务；Windows 上 rename 策略替换运行中 exe；安装时符号链接防护；临时文件保持 0600 仅在最终路径设置 0755；通道白名单防止路径遍历；密钥不匹配时提示用 install.sh 重装
 - **临时目录安全**：临时目录权限设置为 0700
 - **日志目录安全**：日志目录权限设置为 0700
 - **配置文件锁**：文件锁在操作前获取，确保原子性和一致性
@@ -306,32 +309,25 @@ bash build/test-linux.sh
 ### 容器端到端测试
 
 ```bash
-# Mock 测试（离线，不依赖外部 API）
-bash docker/test/scripts/run-mock-tests.sh
+# 运行全部 E2E 测试（构建 + 全矩阵）
+bash docker/test/scripts/run-tests.sh
 
-# E2E 测试（使用真实 API）
-export SSLCTL_API_TOKEN="your-token"
-export SSLCTL_API_URL="https://api.example.com/api/deploy"
-bash docker/test/scripts/run-e2e-tests.sh
+# 指定发行版和服务器
+bash docker/test/scripts/run-tests.sh --distro ubuntu --server nginx
 
-# 测试所有发行版 + 服务器组合
-bash docker/test/scripts/run-e2e-tests.sh --all
+# 指定测试文件（不含 .bats 后缀）
+bash docker/test/scripts/run-tests.sh --test scan
 
-# 指定发行版和服务器类型
-bash docker/test/scripts/run-e2e-tests.sh --distro ubuntu --server nginx
+# Docker-in-Docker 测试
+bash docker/test/scripts/run-tests.sh --dind
+
+# 跳过构建（已构建过镜像）
+bash docker/test/scripts/run-tests.sh --no-build
 ```
 
-测试报告输出到 `docker/test/reports/test-report.md`。
+测试矩阵：Nginx/Apache × Ubuntu/Debian/Alpine/Rocky + DinD，使用 Mock API 离线运行。
 
-**发行版服务管理测试**覆盖 5 种发行版 × 3 种 init 系统：
-
-- systemd: Ubuntu 22.04, Debian 12, AlmaLinux 9
-- OpenRC: Alpine 3.19
-- SysVinit: Devuan 5
-
-**E2E 测试**覆盖 4 种发行版 × 2 种服务器：
-
-- Ubuntu, Debian, Alpine, Rocky × Nginx, Apache
+测试用例：setup、deploy、deploy-local、scan、status、rollback、daemon、upgrade、uninstall、docker-scan（共 10 个 bats 文件，docker-scan 在 DinD 容器中运行，uninstall 自动排最后执行）。
 
 ## License
 

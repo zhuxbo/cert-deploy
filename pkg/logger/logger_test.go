@@ -2,9 +2,13 @@
 package logger
 
 import (
+	"bytes"
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // TestLevel_String 测试日志级别字符串转换
@@ -336,4 +340,306 @@ func TestSanitize_NoSensitiveData(t *testing.T) {
 	if result != input {
 		t.Errorf("sanitize() 不应修改无敏感数据的消息: %s", result)
 	}
+}
+
+// TestCleanOldLogs 测试清理旧日志文件
+func TestCleanOldLogs(t *testing.T) {
+	t.Run("文件数小于MaxLogBackups时不删除", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		l := &Logger{logDir: tmpDir, name: "app"}
+
+		// 创建少于 MaxLogBackups 个文件
+		for i := 0; i < MaxLogBackups-1; i++ {
+			name := fmt.Sprintf("app-2025-01-%02d.log", i+1)
+			if err := os.WriteFile(filepath.Join(tmpDir, name), []byte("log"), 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		if err := l.cleanOldLogs(); err != nil {
+			t.Fatalf("cleanOldLogs() error = %v", err)
+		}
+
+		// 所有文件都应保留
+		files, _ := filepath.Glob(filepath.Join(tmpDir, "app-*.log"))
+		if len(files) != MaxLogBackups-1 {
+			t.Errorf("期望保留 %d 个文件，实际 %d", MaxLogBackups-1, len(files))
+		}
+	})
+
+	t.Run("超出保留数量时删除最旧文件", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		l := &Logger{logDir: tmpDir, name: "app"}
+
+		totalFiles := MaxLogBackups + 5
+		// 创建文件，并通过 os.Chtimes 设置不同的修改时间
+		baseTime := time.Now()
+		for i := 0; i < totalFiles; i++ {
+			name := fmt.Sprintf("app-2025-01-%02d.log", i+1)
+			fpath := filepath.Join(tmpDir, name)
+			if err := os.WriteFile(fpath, []byte("log"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			// 文件 i=0 最旧，i=totalFiles-1 最新
+			modTime := baseTime.Add(time.Duration(i) * time.Hour)
+			if err := os.Chtimes(fpath, modTime, modTime); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		if err := l.cleanOldLogs(); err != nil {
+			t.Fatalf("cleanOldLogs() error = %v", err)
+		}
+
+		// 应只保留 MaxLogBackups 个最新文件
+		files, _ := filepath.Glob(filepath.Join(tmpDir, "app-*.log"))
+		if len(files) != MaxLogBackups {
+			t.Errorf("期望保留 %d 个文件，实际 %d", MaxLogBackups, len(files))
+		}
+
+		// 验证最旧的 5 个文件已被删除
+		for i := 0; i < 5; i++ {
+			name := fmt.Sprintf("app-2025-01-%02d.log", i+1)
+			fpath := filepath.Join(tmpDir, name)
+			if _, err := os.Stat(fpath); !os.IsNotExist(err) {
+				t.Errorf("旧文件 %s 应已被删除", name)
+			}
+		}
+	})
+
+	t.Run("Stat失败的文件被跳过", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		l := &Logger{logDir: tmpDir, name: "app"}
+
+		// 创建 MaxLogBackups+2 个文件
+		totalFiles := MaxLogBackups + 2
+		baseTime := time.Now()
+		for i := 0; i < totalFiles; i++ {
+			name := fmt.Sprintf("app-2025-02-%02d.log", i+1)
+			fpath := filepath.Join(tmpDir, name)
+			if err := os.WriteFile(fpath, []byte("log"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			modTime := baseTime.Add(time.Duration(i) * time.Hour)
+			if err := os.Chtimes(fpath, modTime, modTime); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		// 在 Glob 匹配前删除中间一个文件，模拟 Stat 失败场景
+		// （Glob 能匹配到文件名，但 Stat 时文件已不存在）
+		midFile := filepath.Join(tmpDir, fmt.Sprintf("app-2025-02-%02d.log", MaxLogBackups/2+1))
+		os.Remove(midFile)
+
+		// cleanOldLogs 应正常执行，不报错
+		if err := l.cleanOldLogs(); err != nil {
+			t.Fatalf("cleanOldLogs() 不应因 Stat 失败而报错: %v", err)
+		}
+	})
+
+	t.Run("恰好等于MaxLogBackups时不删除", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		l := &Logger{logDir: tmpDir, name: "app"}
+
+		// 创建恰好 MaxLogBackups 个文件（但 Glob 匹配数=MaxLogBackups，条件 < 不满足，会进入排序逻辑）
+		// 注意源码：len(files) < MaxLogBackups 时返回，所以 == 时会进入排序但不删除
+		for i := 0; i < MaxLogBackups; i++ {
+			name := fmt.Sprintf("app-2025-03-%02d.log", i+1)
+			fpath := filepath.Join(tmpDir, name)
+			if err := os.WriteFile(fpath, []byte("log"), 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		if err := l.cleanOldLogs(); err != nil {
+			t.Fatalf("cleanOldLogs() error = %v", err)
+		}
+
+		files, _ := filepath.Glob(filepath.Join(tmpDir, "app-*.log"))
+		if len(files) != MaxLogBackups {
+			t.Errorf("期望保留 %d 个文件，实际 %d", MaxLogBackups, len(files))
+		}
+	})
+}
+
+// TestLogger_JSONMode 测试 JSON 输出模式
+func TestLogger_JSONMode(t *testing.T) {
+	t.Run("JSON模式基本输出", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		l, err := New(tmpDir, "jsontest")
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+		defer l.Close()
+
+		l.SetJSONMode(true)
+		l.Info("hello json world")
+
+		// 读取日志文件内容
+		files, _ := filepath.Glob(filepath.Join(tmpDir, "jsontest-*.log"))
+		if len(files) == 0 {
+			t.Fatal("未找到日志文件")
+		}
+		content, err := os.ReadFile(files[0])
+		if err != nil {
+			t.Fatalf("读取日志文件失败: %v", err)
+		}
+
+		// 解析 JSON
+		var entry map[string]string
+		if err := json.Unmarshal(bytes.TrimSpace(content), &entry); err != nil {
+			t.Fatalf("日志不是有效的 JSON: %v, 内容: %s", err, content)
+		}
+
+		// 验证必要字段
+		if entry["level"] != "INFO" {
+			t.Errorf("level = %q, 期望 %q", entry["level"], "INFO")
+		}
+		if entry["msg"] != "hello json world" {
+			t.Errorf("msg = %q, 期望 %q", entry["msg"], "hello json world")
+		}
+		if entry["time"] == "" {
+			t.Error("time 字段不应为空")
+		}
+		// 带 name 的 logger 应包含 module 字段
+		if entry["module"] != "jsontest" {
+			t.Errorf("module = %q, 期望 %q", entry["module"], "jsontest")
+		}
+	})
+
+	t.Run("无name的logger不含module字段", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		l, err := New(tmpDir, "")
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+		defer l.Close()
+
+		l.SetJSONMode(true)
+		l.Info("no module test")
+
+		files, _ := filepath.Glob(filepath.Join(tmpDir, "-*.log"))
+		if len(files) == 0 {
+			t.Fatal("未找到日志文件")
+		}
+		content, err := os.ReadFile(files[0])
+		if err != nil {
+			t.Fatalf("读取日志文件失败: %v", err)
+		}
+
+		var entry map[string]string
+		if err := json.Unmarshal(bytes.TrimSpace(content), &entry); err != nil {
+			t.Fatalf("日志不是有效的 JSON: %v, 内容: %s", err, content)
+		}
+
+		if _, exists := entry["module"]; exists {
+			t.Errorf("name 为空时不应包含 module 字段，但得到 %q", entry["module"])
+		}
+	})
+
+	t.Run("JSON模式敏感信息过滤", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		l, err := New(tmpDir, "sanitize")
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+		defer l.Close()
+
+		l.SetJSONMode(true)
+		l.Info("Authorization: Bearer secret-token-123")
+
+		files, _ := filepath.Glob(filepath.Join(tmpDir, "sanitize-*.log"))
+		if len(files) == 0 {
+			t.Fatal("未找到日志文件")
+		}
+		content, err := os.ReadFile(files[0])
+		if err != nil {
+			t.Fatalf("读取日志文件失败: %v", err)
+		}
+
+		var entry map[string]string
+		if err := json.Unmarshal(bytes.TrimSpace(content), &entry); err != nil {
+			t.Fatalf("日志不是有效的 JSON: %v", err)
+		}
+
+		if entry["msg"] != "Authorization: Bearer ***REDACTED***" {
+			t.Errorf("JSON 模式下敏感信息未过滤: %s", entry["msg"])
+		}
+	})
+}
+
+// TestNew_WithEnvVars 测试环境变量影响 New() 行为
+func TestNew_WithEnvVars(t *testing.T) {
+	t.Run("LOG_LEVEL环境变量", func(t *testing.T) {
+		tmpDir := t.TempDir()
+
+		// 保存和恢复环境变量
+		oldLevel := os.Getenv("LOG_LEVEL")
+		defer os.Setenv("LOG_LEVEL", oldLevel)
+
+		os.Setenv("LOG_LEVEL", "debug")
+		l, err := New(tmpDir, "envtest")
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+		defer l.Close()
+
+		if Level(l.minLevel.Load()) != LevelDebug {
+			t.Errorf("LOG_LEVEL=debug 时，minLevel = %v, 期望 %v", Level(l.minLevel.Load()), LevelDebug)
+		}
+	})
+
+	t.Run("LOG_LEVEL=error", func(t *testing.T) {
+		tmpDir := t.TempDir()
+
+		oldLevel := os.Getenv("LOG_LEVEL")
+		defer os.Setenv("LOG_LEVEL", oldLevel)
+
+		os.Setenv("LOG_LEVEL", "error")
+		l, err := New(tmpDir, "envtest")
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+		defer l.Close()
+
+		if Level(l.minLevel.Load()) != LevelError {
+			t.Errorf("LOG_LEVEL=error 时，minLevel = %v, 期望 %v", Level(l.minLevel.Load()), LevelError)
+		}
+	})
+
+	t.Run("SSLCTL_LOG_FORMAT=json", func(t *testing.T) {
+		tmpDir := t.TempDir()
+
+		oldFormat := os.Getenv("SSLCTL_LOG_FORMAT")
+		defer os.Setenv("SSLCTL_LOG_FORMAT", oldFormat)
+
+		os.Setenv("SSLCTL_LOG_FORMAT", "json")
+		l, err := New(tmpDir, "envtest")
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+		defer l.Close()
+
+		if !l.jsonMode.Load() {
+			t.Error("SSLCTL_LOG_FORMAT=json 时，jsonMode 应为 true")
+		}
+	})
+
+	t.Run("SSLCTL_LOG_FORMAT未设置", func(t *testing.T) {
+		tmpDir := t.TempDir()
+
+		oldFormat := os.Getenv("SSLCTL_LOG_FORMAT")
+		defer os.Setenv("SSLCTL_LOG_FORMAT", oldFormat)
+
+		os.Unsetenv("SSLCTL_LOG_FORMAT")
+		l, err := New(tmpDir, "envtest")
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+		defer l.Close()
+
+		if l.jsonMode.Load() {
+			t.Error("SSLCTL_LOG_FORMAT 未设置时，jsonMode 应为 false")
+		}
+	})
 }

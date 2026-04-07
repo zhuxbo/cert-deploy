@@ -55,17 +55,17 @@ func DownloadBinary(url string) ([]byte, error) {
 func downloadBinaryWithClient(url string, client *http.Client) ([]byte, error) {
 	// 安全校验：强制 HTTPS
 	if !strings.HasPrefix(url, "https://") {
-		return nil, fmt.Errorf("下载失败: 仅允许 HTTPS 协议")
+		return nil, &ErrReleaseSource{Msg: "下载失败: 仅允许 HTTPS 协议"}
 	}
 
 	resp, err := client.Get(url)
 	if err != nil {
-		return nil, fmt.Errorf("下载失败: %w", err)
+		return nil, &ErrReleaseSource{Msg: fmt.Sprintf("下载失败: %v", err)}
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("下载失败: HTTP %d", resp.StatusCode)
+		return nil, &ErrReleaseSource{Msg: fmt.Sprintf("下载失败: HTTP %d", resp.StatusCode)}
 	}
 
 	// 限制读取大小，防止内存耗尽
@@ -78,11 +78,18 @@ func downloadBinaryWithClient(url string, client *http.Client) ([]byte, error) {
 
 	// 检查是否超出大小限制
 	if int64(len(data)) > maxDownloadSize {
-		return nil, fmt.Errorf("下载失败: 文件大小超过限制 (%d bytes)", maxDownloadSize)
+		return nil, &ErrReleaseSource{Msg: fmt.Sprintf("下载失败: 文件大小超过限制 (%d bytes)", maxDownloadSize)}
 	}
 
 	return data, nil
 }
+
+// ErrReleaseSource 发布源相关错误（地址/网络/版本），提示用户可更换地址重试
+type ErrReleaseSource struct {
+	Msg string
+}
+
+func (e *ErrReleaseSource) Error() string { return e.Msg }
 
 // ErrKeyNotFound 签名使用的密钥不在本地密钥环中
 // 通常表示发生了密钥轮换，客户端需要重新安装以获取新公钥
@@ -246,23 +253,49 @@ func installTo(gzData []byte, binPath string) (string, error) {
 		return "", fmt.Errorf("创建目录失败: %w", err)
 	}
 
+	// Windows 上正在运行的 exe 无法被覆盖，但可以被重命名
+	// 策略：先把旧文件重命名为 .old，再放入新文件，最后清理 .old
+	oldPath := binPath + ".old"
+	_ = os.Remove(oldPath) // 清理上次残留的 .old
+	if runtime.GOOS == "windows" {
+		if _, err := os.Stat(binPath); err == nil {
+			// 重试最多 10 秒：服务进程退出后文件句柄可能有短暂延迟释放
+			var renameErr error
+			for i := 0; i < 10; i++ {
+				_ = os.Remove(oldPath) // 每次重试前清理（.old 可能被旧进程锁定）
+				renameErr = os.Rename(binPath, oldPath)
+				if renameErr == nil {
+					break
+				}
+				time.Sleep(time.Second)
+			}
+			if renameErr != nil {
+				_ = os.Remove(tmpPath)
+				return "", fmt.Errorf("无法重命名旧文件（请确认服务已停止）: %w", renameErr)
+			}
+		}
+	}
+
 	// 移动文件到目标位置（临时文件保持 0600，在最终路径设置权限）
-	// 设计说明：Rename 和 Chmod 非原子，微秒级窗口内二进制为 0600 不可执行。
-	// 这是有意的安全取舍：避免在 /tmp 中出现 0755 的可执行文件。
-	// 若进程在窗口期崩溃，下次升级会覆盖。
 	if err := os.Rename(tmpPath, binPath); err != nil {
-		// 跨文件系统移动，使用复制（copyFile 内部设置 0755 权限）
+		// 跨文件系统移动，使用复制
 		if copyErr := copyFile(tmpPath, binPath); copyErr != nil {
+			// 恢复旧文件
+			if runtime.GOOS == "windows" {
+				_ = os.Rename(oldPath, binPath)
+			}
 			_ = os.Remove(tmpPath)
 			return "", copyErr
 		}
 		_ = os.Remove(tmpPath)
 	} else {
-		// Rename 成功后在最终路径设置执行权限
 		if err := os.Chmod(binPath, 0755); err != nil {
 			return "", fmt.Errorf("设置权限失败: %w", err)
 		}
 	}
+
+	// 清理旧文件（Windows 上进程退出前可能无法删除，忽略错误）
+	_ = os.Remove(oldPath)
 
 	return binPath, nil
 }

@@ -1,0 +1,98 @@
+# E2E 测试 Compose 配置
+# 用法: docker compose up -d mock-api && docker compose up -d nginx-ubuntu
+# 注意: 容器 CMD 为 tail -f /dev/null，需在 exec 中手动启动 web 服务器
+
+x-test-common: &test-common
+  depends_on:
+    mock-api:
+      condition: service_healthy
+  volumes:
+    - ./tests:/tests:ro
+    - ./build/sslctl:/opt/sslctl-binary:ro
+  environment:
+    - MOCK_API_URL=http://mock-api:8080
+    - TEST_TOKEN=test-token
+
+services:
+  # Mock API 服务
+  mock-api:
+    build: ./mock-api
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  # ============================================================
+  # Nginx 容器
+  # ============================================================
+  nginx-ubuntu:
+    <<: *test-common
+    build:
+      context: ./nginx
+      args:
+        DISTRO: ubuntu
+
+  nginx-debian:
+    <<: *test-common
+    build:
+      context: ./nginx
+      args:
+        DISTRO: debian
+
+  nginx-alpine:
+    <<: *test-common
+    build:
+      context: ./nginx
+      args:
+        DISTRO: alpine
+
+  nginx-rocky:
+    <<: *test-common
+    build:
+      context: ./nginx
+      args:
+        DISTRO: rocky
+
+  # ============================================================
+  # Apache 容器
+  # ============================================================
+  apache-ubuntu:
+    <<: *test-common
+    build:
+      context: ./apache
+      args:
+        DISTRO: ubuntu
+
+  apache-debian:
+    <<: *test-common
+    build:
+      context: ./apache
+      args:
+        DISTRO: debian
+
+  apache-alpine:
+    <<: *test-common
+    build:
+      context: ./apache
+      args:
+        DISTRO: alpine
+
+  apache-rocky:
+    <<: *test-common
+    build:
+      context: ./apache
+      args:
+        DISTRO: rocky
+
+  # ============================================================
+  # Docker-in-Docker 容器
+  # ============================================================
+  dind:
+    <<: *test-common
+    build: ./dind
+    privileged: true
+    environment:
+      - MOCK_API_URL=http://mock-api:8080
+      - TEST_TOKEN=test-token
+      - DOCKER_TLS_CERTDIR=

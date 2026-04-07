@@ -5,16 +5,15 @@
 # ========================================
 # 服务器配置
 # ========================================
-# 格式: "名称,主机,端口,目录,URL"
+# 格式: "名称,主机,端口,目录"
 # - 名称: 服务器标识，用于 --server 参数
 # - 主机: SSH 主机地址
 # - 端口: SSH 端口（默认 22）
 # - 目录: 远程发布目录
-# - URL: 公网访问 URL（用于替换脚本中的 RELEASE_URL）
 
 SERVERS=(
-    "cn,release-cn.example.com,22,/var/www/release/sslctl,https://release-cn.example.com/sslctl"
-    "us,release-us.example.com,22,/var/www/release/sslctl,https://release-us.example.com/sslctl"
+    "node1,release1.example.com,22,/var/www/release/sslctl"
+    "node2,release2.example.com,22,/var/www/release/sslctl"
 )
 
 # ========================================

@@ -183,7 +183,7 @@ func getCommonApachePaths() []apacheConfig {
 			{`C:\Apache\conf\httpd.conf`, `C:\Apache`},
 			{`C:\Program Files\Apache24\conf\httpd.conf`, `C:\Program Files\Apache24`},
 		}
-		// phpStudy（路径含版本号，需 glob 匹配）
+		// Windows 集成面板（路径含版本号，需 glob）
 		matches, _ := filepath.Glob(`C:\phpstudy_pro\Extensions\Apache*\conf\httpd.conf`)
 		for _, m := range matches {
 			root := filepath.Dir(filepath.Dir(m))
@@ -759,7 +759,7 @@ func findApacheBinary() string {
 			`C:\Program Files (x86)\Apache24\bin\httpd.exe`,
 			`C:\xampp\apache\bin\httpd.exe`,
 		}
-		// phpStudy
+		// Windows 集成面板
 		if matches, _ := filepath.Glob(`C:\phpstudy_pro\Extensions\Apache*\bin\httpd.exe`); len(matches) > 0 {
 			paths = append(paths, matches...)
 		}
@@ -820,8 +820,8 @@ func findApacheFromProcessLinux() string {
 
 		pid := pids[0]
 
-		// 检查是否是容器进程（容器进程交给 Docker 扫描器处理）
-		if isContainerProcess(pid) {
+		// 宿主机上跳过容器进程（交给 Docker 扫描器），容器内不跳过
+		if util.ShouldSkipContainerProcess(pid) {
 			continue
 		}
 
@@ -847,12 +847,6 @@ func findApacheFromProcessLinux() string {
 // 使用公共函数 util.FindBinaryFromPort
 func findBinaryFromPort(processName string) string {
 	return util.FindBinaryFromPort(processName)
-}
-
-// isContainerProcess 检查进程是否运行在容器内
-// 使用公共函数 util.IsContainerProcess
-func isContainerProcess(pid string) bool {
-	return util.IsContainerProcess(pid)
 }
 
 // findApacheFromProcessWindows 从 Windows 进程查找 Apache 路径

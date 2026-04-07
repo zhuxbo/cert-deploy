@@ -384,6 +384,12 @@ sslctl                    Manager API                    CA
 ```bash
 # 一键部署时启用本机提交
 sslctl setup --url <url> --token <token> --order <id> --local-key
+
+# 指定私钥文件 + 文件验证（隐含 --local-key）
+sslctl setup --key /path/key.pem --file-validation --url <url> --token <token> --order <id>
+
+# 指定 webroot（隐含 --file-validation --local-key）
+sslctl setup --key /path/key.pem --webroot /var/www/html --url <url> --token <token> --order <id>
 ```
 
 ### 配置文件

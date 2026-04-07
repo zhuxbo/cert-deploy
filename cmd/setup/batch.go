@@ -2,6 +2,7 @@ package setup
 
 import (
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -149,19 +150,26 @@ func runBatch(p *setupParams, query string) {
 	fmt.Println("\n步骤 6/8: 部署证书...")
 	var certSuccess, certFail int
 	var totalSiteSuccess, totalSiteFail int
+	var needKeyNames []string
 
 	for _, plan := range plans {
 		if len(plan.Bindings) == 0 {
 			continue
 		}
 
-		fmt.Printf("\n  证书 %s:\n", buildCertName(plan.CertDomains[0], plan.CertData.OrderID))
+		certName := buildCertName(plan.CertDomains[0], plan.CertData.OrderID)
+		fmt.Printf("\n  证书 %s:\n", certName)
 
-		// 获取私钥
-		privateKey, err := getAndValidatePrivateKey(plan.Bindings, plan.CertData, certValidator)
+		// 获取私钥（批量模式不交互，缺私钥的最后汇总提示）
+		privateKey, err := getAndValidatePrivateKey(p.keyFile, plan.Bindings, plan.CertData, certValidator, false)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "    私钥验证失败: %v，跳过此证书\n", err)
-			certFail++
+			if errors.Is(err, errNeedPrivateKey) {
+				fmt.Fprintf(os.Stderr, "    缺少私钥，跳过\n")
+				needKeyNames = append(needKeyNames, certName)
+			} else {
+				fmt.Fprintf(os.Stderr, "    私钥验证失败: %v，跳过\n", err)
+				certFail++
+			}
 			continue
 		}
 		plan.PrivateKey = privateKey
@@ -183,8 +191,11 @@ func runBatch(p *setupParams, query string) {
 		}
 	}
 
-	if certSuccess == 0 && certFail > 0 {
+	if certSuccess == 0 && (certFail > 0 || len(needKeyNames) > 0) {
 		fmt.Fprintln(os.Stderr, "\n批量部署失败! 所有证书部署均失败")
+		if len(needKeyNames) > 0 {
+			fmt.Fprintf(os.Stderr, "  需要私钥的证书: %s\n", strings.Join(needKeyNames, ", "))
+		}
 		os.Exit(1)
 	}
 
@@ -225,6 +236,42 @@ func runBatch(p *setupParams, query string) {
 			certConfig.RenewMode = config.RenewModeLocal
 		}
 
+		if p.fileValidation {
+			// 校验：通配符域名不支持文件验证
+			skipCert := false
+			for _, domain := range plan.CertDomains {
+				if errMsg := config.ValidateValidationMethod(domain, config.ValidationMethodFile); errMsg != "" {
+					fmt.Fprintf(os.Stderr, "  ⚠ 证书 %s 域名 %s: %s，跳过\n", certConfig.CertName, domain, errMsg)
+					skipCert = true
+					break
+				}
+			}
+			if skipCert {
+				continue
+			}
+			certConfig.ValidationMethod = config.ValidationMethodFile
+			if p.webroot != "" {
+				for i := range certConfig.Bindings {
+					certConfig.Bindings[i].Paths.Webroot = p.webroot
+				}
+			} else {
+				// 检查至少一个绑定有扫描到的 webroot
+				hasWebroot := false
+				for _, b := range certConfig.Bindings {
+					if b.Paths.Webroot != "" {
+						hasWebroot = true
+						break
+					}
+				}
+				if !hasWebroot {
+					fmt.Fprintf(os.Stderr, "  ⚠ 证书 %s 未扫描到 webroot，跳过\n", certConfig.CertName)
+					continue
+				}
+			}
+		} else if p.localKey {
+			certConfig.ValidationMethod = config.ValidationMethodDelegation
+		}
+
 		if err := p.cfgManager.AddCert(certConfig); err != nil {
 			fmt.Fprintf(os.Stderr, "  保存 %s 失败: %v\n", certConfig.CertName, err)
 			continue
@@ -250,9 +297,15 @@ func runBatch(p *setupParams, query string) {
 
 	// 汇总
 	fmt.Println("\n========================================")
-	if certFail > 0 || totalSiteFail > 0 {
+	if certFail > 0 || totalSiteFail > 0 || len(needKeyNames) > 0 {
 		fmt.Printf("批量部署部分完成! 证书: 成功 %d 个，失败 %d 个; 站点: 成功 %d 个，失败 %d 个\n",
 			certSuccess, certFail, totalSiteSuccess, totalSiteFail)
+		if len(needKeyNames) > 0 {
+			fmt.Printf("\n需要私钥（请使用 sslctl setup --order <id> 逐个部署）:\n")
+			for _, name := range needKeyNames {
+				fmt.Printf("  - %s\n", name)
+			}
+		}
 	} else {
 		fmt.Printf("批量部署完成! 共 %d 个证书，%d 个站点\n", certSuccess, totalSiteSuccess)
 	}
@@ -268,6 +321,17 @@ func runBatch(p *setupParams, query string) {
 		} else {
 			fmt.Println("  systemctl status sslctl    # 查看状态")
 			fmt.Println("  journalctl -u sslctl -f    # 查看日志")
+		}
+	}
+
+	// 检查 Docker 非卷挂载站点
+	if totalSiteSuccess > 0 {
+		for _, site := range sites {
+			if site.ContainerID != "" && !site.VolumeMode {
+				fmt.Println("\n[!] 检测到 Docker 容器站点的证书路径未挂载为卷")
+				fmt.Println("    重建容器后需要重新部署证书")
+				break
+			}
 		}
 	}
 }

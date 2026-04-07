@@ -2,8 +2,10 @@ package upgrade
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -222,20 +224,36 @@ func TestGetSignature(t *testing.T) {
 	index := ReleaseIndex{
 		"main": &ChannelInfo{
 			Versions: []VersionInfo{
-				{Version: "1.0.0", Signature: "ed25519:testSig"},
+				{
+					Version: "1.0.0",
+					Signatures: map[string]string{
+						"sslctl-linux-amd64.gz":       "ed25519:key-1:sigLinux",
+						"sslctl-windows-amd64.exe.gz": "ed25519:key-1:sigWindows",
+					},
+				},
 				{Version: "0.9.0"}, // 无签名
 			},
 		},
 	}
 
-	if got := index.GetSignature("main", "v1.0.0"); got != "ed25519:testSig" {
-		t.Errorf("GetSignature(v1.0.0) = %q, want ed25519:testSig", got)
+	// 按文件名查找
+	if got := index.GetSignature("main", "v1.0.0", "sslctl-linux-amd64.gz"); got != "ed25519:key-1:sigLinux" {
+		t.Errorf("GetSignature(linux) = %q, want sigLinux", got)
 	}
-	if got := index.GetSignature("main", "v0.9.0"); got != "" {
-		t.Errorf("GetSignature(v0.9.0) = %q, want empty", got)
+	if got := index.GetSignature("main", "v1.0.0", "sslctl-windows-amd64.exe.gz"); got != "ed25519:key-1:sigWindows" {
+		t.Errorf("GetSignature(windows) = %q, want sigWindows", got)
 	}
-	if got := index.GetSignature("main", "v9.9.9"); got != "" {
-		t.Errorf("GetSignature(v9.9.9) = %q, want empty", got)
+	// 不存在的文件名
+	if got := index.GetSignature("main", "v1.0.0", "sslctl-darwin-amd64.gz"); got != "" {
+		t.Errorf("GetSignature(darwin) = %q, want empty", got)
+	}
+	// 无签名
+	if got := index.GetSignature("main", "v0.9.0", "sslctl-linux-amd64.gz"); got != "" {
+		t.Errorf("GetSignature(none) = %q, want empty", got)
+	}
+	// 不存在的版本
+	if got := index.GetSignature("main", "v9.9.9", "sslctl-linux-amd64.gz"); got != "" {
+		t.Errorf("GetSignature(missing) = %q, want empty", got)
 	}
 }
 
@@ -252,6 +270,7 @@ func TestCompareVersions(t *testing.T) {
 		{"v1.0.0-beta", "v1.0.0", -1},
 		{"v1.0.0", "v1.0.0-beta", 1},
 		{"v1.0.0-alpha", "v1.0.0-beta", -1},
+		{"v1.0.0-beta", "v1.0.0-alpha", 1},
 		{"v1.0.0-beta", "v1.0.0-beta", 0},
 		{"v0.1.1-beta", "v0.1.0", 1},
 		{"1.0.0", "v1.0.0", 0},
@@ -358,5 +377,75 @@ func TestFetchReleaseInfo_UsesSecureClient(t *testing.T) {
 	}
 	if transport.TLSClientConfig.MinVersion == 0 {
 		t.Error("TLS MinVersion not set")
+	}
+}
+
+func TestFetchReleaseInfoFrom_ConnectionError(t *testing.T) {
+	// 测试连接失败的错误路径
+	_, err := fetchReleaseInfoFrom("http://127.0.0.1:1/releases.json", &http.Client{})
+	if err == nil {
+		t.Fatal("expected error for connection failure")
+	}
+	var releaseErr *ErrReleaseSource
+	if !errors.As(err, &releaseErr) {
+		t.Errorf("expected *ErrReleaseSource, got %T: %v", err, err)
+	}
+	if !strings.Contains(err.Error(), "获取版本信息失败") {
+		t.Errorf("error = %q, want containing '获取版本信息失败'", err.Error())
+	}
+}
+
+func TestFetchReleaseInfo_EntryValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		baseURL string
+		wantErr string
+	}{
+		{
+			name:    "空 URL",
+			baseURL: "",
+			wantErr: "未配置升级地址",
+		},
+		{
+			name:    "仅空格",
+			baseURL: "   ",
+			wantErr: "未配置升级地址",
+		},
+		{
+			name:    "仅斜杠",
+			baseURL: "///",
+			wantErr: "未配置升级地址",
+		},
+		{
+			name:    "HTTP 非 HTTPS",
+			baseURL: "http://example.com/sslctl",
+			wantErr: "必须使用 HTTPS",
+		},
+		{
+			name:    "FTP 协议",
+			baseURL: "ftp://example.com/sslctl",
+			wantErr: "必须使用 HTTPS",
+		},
+		{
+			name:    "无协议前缀",
+			baseURL: "example.com/sslctl",
+			wantErr: "必须使用 HTTPS",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := FetchReleaseInfo(tt.baseURL)
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			var releaseErr *ErrReleaseSource
+			if !errors.As(err, &releaseErr) {
+				t.Errorf("expected *ErrReleaseSource, got %T: %v", err, err)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("error = %q, want containing %q", err.Error(), tt.wantErr)
+			}
+		})
 	}
 }

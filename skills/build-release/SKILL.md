@@ -20,10 +20,10 @@ bash build/build.sh v0.0.7-beta
 
 ### 支持平台
 
-| OS | Arch | 输出文件 |
-|----|------|---------|
-| linux | amd64 | `sslctl-linux-amd64` |
-| linux | arm64 | `sslctl-linux-arm64` |
+| OS      | Arch  | 输出文件                   |
+| ------- | ----- | -------------------------- |
+| linux   | amd64 | `sslctl-linux-amd64`       |
+| linux   | arm64 | `sslctl-linux-arm64`       |
 | windows | amd64 | `sslctl-windows-amd64.exe` |
 
 ### 编译参数
@@ -64,12 +64,12 @@ var (
 
 ### 脚本概览
 
-| 脚本 | 说明 |
-|------|------|
-| `build/build.sh` | 多平台交叉编译 |
-| `build/release.sh` | 构建并发布到远程服务器（cn/us） |
-| `build/sign-release.sh` | Ed25519 签名发布包 |
-| `build/generate-keys.sh` | 生成 Ed25519 密钥对 |
+| 脚本                     | 说明                            |
+| ------------------------ | ------------------------------- |
+| `build/build.sh`         | 多平台交叉编译                  |
+| `build/release.sh`       | 构建并发布到远程服务器（cn/us） |
+| `build/sign-release.sh`  | Ed25519 签名发布包              |
+| `build/generate-keys.sh` | 生成 Ed25519 密钥对             |
 
 ### 标准发布步骤
 
@@ -114,12 +114,7 @@ bash build/release.sh --test                     # 测试 SSH 连接
 
 ## 发布服务器
 
-| 标识 | 域名 | 说明 |
-|------|------|------|
-| cn | release-cn.cnssl.com | 中国区（分区解析） |
-| us | release-us.cnssl.com | 美国区（分区解析） |
-
-公网访问统一入口 `release.cnssl.com`，DNS 自动分区解析。
+公网访问统一入口 `release.cnssl.com`，DNS 自动分区解析。具体服务器节点配置见 `build/release.conf`。
 
 安装脚本中的下载地址为 `release.cnssl.com/sslctl`。
 
@@ -152,6 +147,29 @@ bash build/release.sh --test                     # 测试 SSH 连接
 - golangci-lint 代码检查
 - 单元测试（`go test -race ./...`）
 - 三平台交叉编译验证（linux/amd64、linux/arm64、windows/amd64）
+
+### 容器 E2E 测试
+
+**不在 CI 自动触发**，合并前手动运行，全部通过再合并。
+
+```bash
+# 全矩阵（8 容器 × 全量测试）
+bash docker/test/scripts/run-tests.sh
+
+# 指定发行版/服务器
+bash docker/test/scripts/run-tests.sh --distro ubuntu --server nginx
+
+# 指定测试文件
+bash docker/test/scripts/run-tests.sh --distro ubuntu --server nginx --test setup
+
+# Docker-in-Docker 测试
+bash docker/test/scripts/run-tests.sh --dind
+
+# 跳过构建（已有二进制时）
+bash docker/test/scripts/run-tests.sh --no-build
+```
+
+测试框架：Bats + Docker Compose，详见 `docker/test/` 目录。发行版矩阵：ubuntu:24.04、debian:12、alpine:3.21、rockylinux:9。
 
 ---
 

@@ -415,6 +415,129 @@ func TestJoinUnderDir(t *testing.T) {
 	}
 }
 
+// TestSafeReadFile 测试安全读取文件
+func TestSafeReadFile(t *testing.T) {
+	dir := t.TempDir()
+
+	// 准备普通文件
+	normalFile := filepath.Join(dir, "normal.txt")
+	if err := os.WriteFile(normalFile, []byte("hello"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 准备大文件（100 字节）
+	largeFile := filepath.Join(dir, "large.txt")
+	if err := os.WriteFile(largeFile, make([]byte, 100), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 准备符号链接
+	symlinkFile := filepath.Join(dir, "symlink.txt")
+	symlinkErr := os.Symlink(normalFile, symlinkFile)
+
+	tests := []struct {
+		name       string
+		path       string
+		maxSize    int64
+		wantErr    bool
+		errContain string
+		wantData   string
+	}{
+		{
+			name:     "正常读取普通文件",
+			path:     normalFile,
+			maxSize:  1024,
+			wantData: "hello",
+		},
+		{
+			name:     "maxSize=0 不限制大小",
+			path:     normalFile,
+			maxSize:  0,
+			wantData: "hello",
+		},
+		{
+			name:       "文件不存在",
+			path:       filepath.Join(dir, "nonexistent.txt"),
+			maxSize:    1024,
+			wantErr:    true,
+			errContain: "lstat",
+		},
+		{
+			name:       "文件超过 maxSize",
+			path:       largeFile,
+			maxSize:    50,
+			wantErr:    true,
+			errContain: "file too large",
+		},
+		{
+			name:       "目录而非文件",
+			path:       dir,
+			maxSize:    1024,
+			wantErr:    true,
+			errContain: "not a regular file",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data, err := SafeReadFile(tt.path, tt.maxSize)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("SafeReadFile() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if tt.wantErr {
+				if tt.errContain != "" && !strings.Contains(err.Error(), tt.errContain) {
+					t.Errorf("error = %q, want containing %q", err.Error(), tt.errContain)
+				}
+				return
+			}
+			if string(data) != tt.wantData {
+				t.Errorf("data = %q, want %q", data, tt.wantData)
+			}
+		})
+	}
+
+	// 符号链接单独测试（跳过不支持的平台）
+	t.Run("符号链接拒绝读取", func(t *testing.T) {
+		if symlinkErr != nil {
+			t.Skip("symlinks not supported")
+		}
+		_, err := SafeReadFile(symlinkFile, 1024)
+		if err == nil {
+			t.Error("SafeReadFile() should reject symlinks")
+		}
+		if err != nil && !strings.Contains(err.Error(), "symbolic links not allowed") {
+			t.Errorf("error = %q, want containing %q", err.Error(), "symbolic links not allowed")
+		}
+	})
+}
+
+// TestSafeReadFile_MaxSizeBoundary 测试 maxSize 边界情况
+func TestSafeReadFile_MaxSizeBoundary(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "boundary.txt")
+	content := []byte("12345") // 5 字节
+
+	if err := os.WriteFile(path, content, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// maxSize 正好等于文件大小，应该成功
+	data, err := SafeReadFile(path, 5)
+	if err != nil {
+		t.Errorf("SafeReadFile() with exact maxSize should succeed, got error: %v", err)
+	}
+	if string(data) != "12345" {
+		t.Errorf("data = %q, want %q", data, "12345")
+	}
+
+	// maxSize 比文件小 1 字节，应该失败
+	_, err = SafeReadFile(path, 4)
+	if err == nil {
+		t.Error("SafeReadFile() should fail when file exceeds maxSize")
+	}
+}
+
 // TestJoinUnderDir_RealPath 使用真实临时目录测试
 func TestJoinUnderDir_RealPath(t *testing.T) {
 	dir := t.TempDir()

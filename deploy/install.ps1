@@ -28,6 +28,9 @@ param(
 
 #Requires -RunAsAdministrator
 $ErrorActionPreference = "Stop"
+# 全局禁用 Invoke-WebRequest / Invoke-RestMethod 的进度条
+# 在脚本级别设置，避免函数作用域导致 PowerShell 5.1 进度条仍然渲染覆盖控制台输出
+$ProgressPreference = 'SilentlyContinue'
 
 # 兼容 Linux 风格 --flag 参数（PowerShell 可能将 --dev 等误解析为 $Version 值）
 if ($Version -eq "--dev") { $Dev = [switch]::new($true); $Version = "" }
@@ -342,8 +345,10 @@ $DownloadUrl = "$ReleaseUrl/$Channel/$TargetVersion/$Filename"
 Write-Info "下载 $Filename..."
 
 $downloaded = $false
+# PowerShell 5.1 的 Invoke-WebRequest 默认解析 DOM，极慢
+# -UseBasicParsing 跳过 DOM 解析；进度条已在脚本级别全局禁用
 try {
-    Invoke-WebRequest -Uri $DownloadUrl -OutFile $TempFile -TimeoutSec 120 -ErrorAction Stop
+    Invoke-WebRequest -Uri $DownloadUrl -OutFile $TempFile -TimeoutSec 120 -UseBasicParsing -ErrorAction Stop
     $downloaded = $true
 } catch {}
 
@@ -351,6 +356,8 @@ if (-not $downloaded) {
     Write-Err "下载失败: $DownloadUrl"
     exit 1
 }
+$fileSizeMB = [math]::Round((Get-Item $TempFile).Length / 1MB, 2)
+Write-Info "下载完成 ($fileSizeMB MB)"
 
 # SHA256 校验
 $expectedChecksum = ""
@@ -378,9 +385,35 @@ if (-not $checksumOk) {
     exit 1
 }
 
+# 升级时先停止服务（释放 exe 文件句柄）
+$svcWasRunning = $false
+$svc = Get-Service -Name "sslctl" -ErrorAction SilentlyContinue
+if ($svc -and $svc.Status -eq "Running") {
+    Write-Info "停止服务..."
+    Stop-Service -Name "sslctl" -Force -ErrorAction SilentlyContinue
+    # 等待服务完全停止
+    for ($i = 0; $i -lt 30; $i++) {
+        $svc = Get-Service -Name "sslctl" -ErrorAction SilentlyContinue
+        if (-not $svc -or $svc.Status -eq "Stopped") { break }
+        Start-Sleep -Seconds 1
+    }
+    $svcWasRunning = $true
+}
+
 # 解压 gzip
 Write-Info "安装中..."
 Add-Type -AssemblyName System.IO.Compression
+
+# Windows 上运行中的 exe 无法覆盖，先重命名旧文件
+$oldPath = "$ExePath.old"
+Remove-Item $oldPath -Force -ErrorAction SilentlyContinue
+if (Test-Path $ExePath) {
+    try {
+        Rename-Item $ExePath $oldPath -Force -ErrorAction Stop
+    } catch {
+        # 重命名失败，尝试直接写入
+    }
+}
 
 $inStream = [System.IO.File]::OpenRead($TempFile)
 $gzipStream = New-Object System.IO.Compression.GzipStream($inStream, [System.IO.Compression.CompressionMode]::Decompress)
@@ -394,8 +427,9 @@ try {
     $inStream.Close()
 }
 
-# 清理临时文件
+# 清理
 Remove-Item $TempFile -Force -ErrorAction SilentlyContinue
+Remove-Item $oldPath -Force -ErrorAction SilentlyContinue
 
 # 写入配置文件
 $ConfigFile = Join-Path $WorkDir "config.json"
@@ -411,6 +445,8 @@ if (Test-Path $ConfigFile) {
     $cfg = @{}
 }
 $cfg.release_url = $ReleaseUrl
+$saveChannel = if ($Channel) { $Channel } else { "main" }
+$cfg | Add-Member -NotePropertyName "upgrade_channel" -NotePropertyValue $saveChannel -Force
 $ConfigTmpFile = "$ConfigFile.tmp"
 # PowerShell 5.1 的 -Encoding UTF8 会写 BOM，Go JSON 解析器不支持 BOM
 # 使用 .NET 直接写入 UTF-8 无 BOM
@@ -428,6 +464,18 @@ if ($Path -notlike "*$InstallDir*") {
 # 同时更新当前会话 PATH（无需重启终端即可使用）
 if ($env:Path -notlike "*$InstallDir*") {
     $env:Path = "$env:Path;$InstallDir"
+}
+
+# 升级时重启服务
+if ($svcWasRunning) {
+    Write-Info "启动服务..."
+    Start-Service -Name "sslctl" -ErrorAction SilentlyContinue
+    $svc = Get-Service -Name "sslctl" -ErrorAction SilentlyContinue
+    if ($svc -and $svc.Status -eq "Running") {
+        Write-Info "服务已启动"
+    } else {
+        Write-Warn "服务启动失败，请手动运行: sslctl service repair"
+    }
 }
 
 Write-Host ""

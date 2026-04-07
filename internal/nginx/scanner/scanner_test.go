@@ -1,8 +1,10 @@
 package scanner
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"testing"
 )
 
@@ -624,6 +626,288 @@ include ` + file1 + `;
 	}
 }
 
+// TestExtractListenPort 测试从 listen 指令中提取端口号
+func TestExtractListenPort(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{"纯端口号", "80", "80"},
+		{"带 ssl 参数", "443 ssl", "443"},
+		{"IPv6 格式", "[::]:80", "80"},
+		{"IP:端口格式", "127.0.0.1:443", "443"},
+		{"通配符:端口格式", "*:80", "80"},
+		{"带多个参数", "443 ssl http2", "443"},
+		{"IPv6 带 ssl", "[::]:443 ssl", "443"},
+		{"空字符串", "", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := extractListenPort(tt.input)
+			if got != tt.want {
+				t.Errorf("extractListenPort(%q) = %q，期望 %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestResolveNginxPath 测试路径解析
+func TestResolveNginxPath(t *testing.T) {
+	tests := []struct {
+		name   string
+		prefix string
+		path   string
+		want   string
+	}{
+		{"绝对路径直接返回", "/etc/nginx", "/etc/nginx/conf.d/default.conf", "/etc/nginx/conf.d/default.conf"},
+		{"相对路径与 prefix 拼接", "/etc/nginx", "conf.d/default.conf", "/etc/nginx/conf.d/default.conf"},
+		{"空路径直接返回", "/etc/nginx", "", ""},
+		{"prefix 为空的相对路径", "", "conf.d/default.conf", "conf.d/default.conf"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := resolveNginxPath(tt.prefix, tt.path)
+			if got != tt.want {
+				t.Errorf("resolveNginxPath(%q, %q) = %q，期望 %q", tt.prefix, tt.path, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestGetNginxConfigFromTestRegex 测试 getNginxConfigFromTest 中使用的正则匹配逻辑
+func TestGetNginxConfigFromTestRegex(t *testing.T) {
+	re := regexp.MustCompile(`configuration file (.+?) `)
+
+	tests := []struct {
+		name   string
+		output string
+		want   string
+	}{
+		{
+			"标准 nginx -t 输出",
+			"nginx: the configuration file /etc/nginx/nginx.conf syntax is ok\nnginx: configuration file /etc/nginx/nginx.conf test is successful",
+			"/etc/nginx/nginx.conf",
+		},
+		{
+			"自定义路径",
+			"nginx: the configuration file /usr/local/nginx/conf/nginx.conf syntax is ok",
+			"/usr/local/nginx/conf/nginx.conf",
+		},
+		{
+			"不匹配的输出",
+			"some random output without config info",
+			"",
+		},
+		{
+			"空输出",
+			"",
+			"",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			matches := re.FindSubmatch([]byte(tt.output))
+			got := ""
+			if len(matches) > 1 {
+				got = string(matches[1])
+			}
+			if got != tt.want {
+				t.Errorf("正则匹配结果 = %q，期望 %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestGetNginxConfigFromVersionRegex 测试 getNginxConfigFromVersion 中使用的正则匹配逻辑
+func TestGetNginxConfigFromVersionRegex(t *testing.T) {
+	confPathRe := regexp.MustCompile(`--conf-path=([^\s]+)`)
+	prefixRe := regexp.MustCompile(`--prefix=([^\s]+)`)
+
+	tests := []struct {
+		name       string
+		output     string
+		wantConf   string // --conf-path 匹配结果
+		wantPrefix string // --prefix 匹配结果
+	}{
+		{
+			"包含 conf-path",
+			"nginx version: nginx/1.18.0\nbuilt with OpenSSL 1.1.1\nconfigure arguments: --prefix=/etc/nginx --conf-path=/etc/nginx/nginx.conf --sbin-path=/usr/sbin/nginx",
+			"/etc/nginx/nginx.conf",
+			"/etc/nginx",
+		},
+		{
+			"仅包含 prefix",
+			"nginx version: nginx/1.18.0\nconfigure arguments: --prefix=/usr/local/nginx --sbin-path=/usr/local/nginx/sbin/nginx",
+			"",
+			"/usr/local/nginx",
+		},
+		{
+			"都不包含",
+			"nginx version: nginx/1.18.0",
+			"",
+			"",
+		},
+		{
+			"空输出",
+			"",
+			"",
+			"",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			output := []byte(tt.output)
+
+			// 测试 --conf-path 正则
+			confMatches := confPathRe.FindSubmatch(output)
+			gotConf := ""
+			if len(confMatches) > 1 {
+				gotConf = string(confMatches[1])
+			}
+			if gotConf != tt.wantConf {
+				t.Errorf("--conf-path 匹配结果 = %q，期望 %q", gotConf, tt.wantConf)
+			}
+
+			// 测试 --prefix 正则
+			prefixMatches := prefixRe.FindSubmatch(output)
+			gotPrefix := ""
+			if len(prefixMatches) > 1 {
+				gotPrefix = string(prefixMatches[1])
+			}
+			if gotPrefix != tt.wantPrefix {
+				t.Errorf("--prefix 匹配结果 = %q，期望 %q", gotPrefix, tt.wantPrefix)
+			}
+		})
+	}
+}
+
+// TestRawBlocksToSites 测试 rawBlock 到 Site 的转换和过滤
+func TestRawBlocksToSites(t *testing.T) {
+	tests := []struct {
+		name   string
+		blocks []rawBlock
+		want   int      // 期望的站点数
+		names  []string // 期望的 server_name 列表
+	}{
+		{
+			"正常站点保留",
+			[]rawBlock{
+				{serverName: "example.com", configFile: "/etc/nginx/conf.d/example.conf", hasSSL: true},
+				{serverName: "test.com", configFile: "/etc/nginx/conf.d/test.conf", hasSSL: false},
+			},
+			2,
+			[]string{"example.com", "test.com"},
+		},
+		{
+			"过滤空 server_name",
+			[]rawBlock{
+				{serverName: "", configFile: "/etc/nginx/conf.d/empty.conf"},
+				{serverName: "example.com", configFile: "/etc/nginx/conf.d/example.conf"},
+			},
+			1,
+			[]string{"example.com"},
+		},
+		{
+			"过滤下划线占位符",
+			[]rawBlock{
+				{serverName: "_", configFile: "/etc/nginx/conf.d/default.conf"},
+				{serverName: "example.com", configFile: "/etc/nginx/conf.d/example.conf"},
+			},
+			1,
+			[]string{"example.com"},
+		},
+		{
+			"全部被过滤",
+			[]rawBlock{
+				{serverName: "", configFile: "/etc/nginx/conf.d/empty.conf"},
+				{serverName: "_", configFile: "/etc/nginx/conf.d/default.conf"},
+			},
+			0,
+			nil,
+		},
+		{
+			"空输入",
+			nil,
+			0,
+			nil,
+		},
+		{
+			"字段完整传递",
+			[]rawBlock{
+				{
+					serverName:      "example.com",
+					serverAlias:     []string{"www.example.com"},
+					configFile:      "/etc/nginx/conf.d/example.conf",
+					listenPorts:     []string{"443"},
+					webroot:         "/var/www/html",
+					hasSSL:          true,
+					certificatePath: "/etc/ssl/cert.crt",
+					privateKeyPath:  "/etc/ssl/cert.key",
+				},
+			},
+			1,
+			[]string{"example.com"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := rawBlocksToSites(tt.blocks)
+			if len(got) != tt.want {
+				t.Fatalf("rawBlocksToSites 返回 %d 个站点，期望 %d", len(got), tt.want)
+			}
+			for i, name := range tt.names {
+				if got[i].ServerName != name {
+					t.Errorf("站点 %d ServerName = %q，期望 %q", i, got[i].ServerName, name)
+				}
+			}
+		})
+	}
+
+	// 单独验证字段完整传递
+	blocks := []rawBlock{{
+		serverName:      "example.com",
+		serverAlias:     []string{"www.example.com"},
+		configFile:      "/etc/nginx/conf.d/example.conf",
+		listenPorts:     []string{"443"},
+		webroot:         "/var/www/html",
+		hasSSL:          true,
+		certificatePath: "/etc/ssl/cert.crt",
+		privateKeyPath:  "/etc/ssl/cert.key",
+	}}
+	sites := rawBlocksToSites(blocks)
+	if len(sites) != 1 {
+		t.Fatal("字段传递测试失败：期望 1 个站点")
+	}
+	s := sites[0]
+	if s.ConfigFile != "/etc/nginx/conf.d/example.conf" {
+		t.Errorf("ConfigFile = %q", s.ConfigFile)
+	}
+	if len(s.ServerAlias) != 1 || s.ServerAlias[0] != "www.example.com" {
+		t.Errorf("ServerAlias = %v", s.ServerAlias)
+	}
+	if len(s.ListenPorts) != 1 || s.ListenPorts[0] != "443" {
+		t.Errorf("ListenPorts = %v", s.ListenPorts)
+	}
+	if s.Webroot != "/var/www/html" {
+		t.Errorf("Webroot = %q", s.Webroot)
+	}
+	if !s.HasSSL {
+		t.Error("HasSSL 应为 true")
+	}
+	if s.CertificatePath != "/etc/ssl/cert.crt" {
+		t.Errorf("CertificatePath = %q", s.CertificatePath)
+	}
+	if s.PrivateKeyPath != "/etc/ssl/cert.key" {
+		t.Errorf("PrivateKeyPath = %q", s.PrivateKeyPath)
+	}
+}
+
 // TestFindByDomain_WildcardMatch 测试通配符域名匹配
 func TestFindByDomain_WildcardMatch(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "nginx-test-*")
@@ -1101,5 +1385,804 @@ server {
 	// 验证包含多个服务器名
 	if len(sites[0].ServerAlias) == 0 {
 		t.Log("ServerAlias 可能未正确解析多行 server_name")
+	}
+}
+
+// TestParseServerBlocks_NginxTMode 测试 nginx -T 输出格式解析
+func TestParseServerBlocks_NginxTMode(t *testing.T) {
+	lines := []string{
+		"nginx: the configuration file /etc/nginx/nginx.conf syntax is ok",
+		"# configuration file /etc/nginx/nginx.conf:",
+		"server {",
+		"    listen 443 ssl;",
+		"    server_name site1.example.com;",
+		"    ssl_certificate /etc/ssl/site1.crt;",
+		"    ssl_certificate_key /etc/ssl/site1.key;",
+		"}",
+		"# configuration file /etc/nginx/conf.d/site2.conf:",
+		"server {",
+		"    listen 80;",
+		"    server_name site2.example.com;",
+		"    root /var/www/site2;",
+		"}",
+	}
+
+	blocks := parseServerBlocks(lines, "", parseOptions{
+		skipNginxLines:  true,
+		trackConfigFile: true,
+	})
+
+	if len(blocks) != 2 {
+		t.Fatalf("期望 2 个 server 块，实际 %d", len(blocks))
+	}
+
+	// 验证文件跟踪
+	if blocks[0].configFile != "/etc/nginx/nginx.conf" {
+		t.Errorf("块 0 configFile = %q，期望 /etc/nginx/nginx.conf", blocks[0].configFile)
+	}
+	if blocks[1].configFile != "/etc/nginx/conf.d/site2.conf" {
+		t.Errorf("块 1 configFile = %q，期望 /etc/nginx/conf.d/site2.conf", blocks[1].configFile)
+	}
+
+	// 验证 server_name
+	if blocks[0].serverName != "site1.example.com" {
+		t.Errorf("块 0 serverName = %q", blocks[0].serverName)
+	}
+	if blocks[1].serverName != "site2.example.com" {
+		t.Errorf("块 1 serverName = %q", blocks[1].serverName)
+	}
+
+	// 验证 SSL 检测
+	if !blocks[0].hasSSL {
+		t.Error("块 0 应检测到 SSL")
+	}
+	if blocks[1].hasSSL {
+		t.Error("块 1 不应有 SSL")
+	}
+}
+
+// TestParseServerBlocks_PendingServerNonBrace 测试 server 后跟非 { 内容
+func TestParseServerBlocks_PendingServerNonBrace(t *testing.T) {
+	// server 后跟的不是 {，应该重置 pendingServer
+	lines := []string{
+		"server",
+		"some_other_directive;",
+		"server {",
+		"    listen 80;",
+		"    server_name valid.example.com;",
+		"}",
+	}
+
+	blocks := parseServerBlocks(lines, "/test.conf", parseOptions{})
+
+	if len(blocks) != 1 {
+		t.Fatalf("期望 1 个 server 块，实际 %d", len(blocks))
+	}
+	if blocks[0].serverName != "valid.example.com" {
+		t.Errorf("serverName = %q", blocks[0].serverName)
+	}
+}
+
+// TestParseServerBlocks_UnclosedBlock 测试未关闭的 server 块
+func TestParseServerBlocks_UnclosedBlock(t *testing.T) {
+	lines := []string{
+		"server {",
+		"    listen 80;",
+		"    server_name unclosed.example.com;",
+	}
+
+	blocks := parseServerBlocks(lines, "/test.conf", parseOptions{})
+
+	// 未关闭的块应在末尾被处理
+	if len(blocks) != 1 {
+		t.Fatalf("期望 1 个 server 块（末尾处理），实际 %d", len(blocks))
+	}
+	if blocks[0].serverName != "unclosed.example.com" {
+		t.Errorf("serverName = %q", blocks[0].serverName)
+	}
+}
+
+// TestFindIncludes_CommentedOut 测试注释掉的 include 不会被处理
+func TestFindIncludes_CommentedOut(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "nginx-test-*")
+	if err != nil {
+		t.Fatalf("创建临时目录失败: %v", err)
+	}
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+
+	content := `
+# include /etc/nginx/conf.d/*.conf;
+server {
+    listen 80;
+    server_name example.com;
+}`
+	mainFile := filepath.Join(tmpDir, "nginx.conf")
+	_ = os.WriteFile(mainFile, []byte(content), 0644)
+
+	s := NewWithConfig(mainFile)
+	includes, err := s.findIncludes(mainFile)
+	if err != nil {
+		t.Fatalf("findIncludes 错误: %v", err)
+	}
+
+	if len(includes) != 0 {
+		t.Errorf("注释的 include 不应被解析，实际找到 %d 个", len(includes))
+	}
+}
+
+// TestFindIncludes_QuotedPath 测试带引号的 include 路径
+func TestFindIncludes_QuotedPath(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "nginx-test-*")
+	if err != nil {
+		t.Fatalf("创建临时目录失败: %v", err)
+	}
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+
+	confDir := filepath.Join(tmpDir, "conf.d")
+	_ = os.MkdirAll(confDir, 0755)
+	_ = os.WriteFile(filepath.Join(confDir, "site.conf"), []byte("# empty"), 0644)
+
+	content := `include "` + confDir + `/site.conf";`
+	mainFile := filepath.Join(tmpDir, "nginx.conf")
+	_ = os.WriteFile(mainFile, []byte(content), 0644)
+
+	s := NewWithConfig(mainFile)
+	includes, err := s.findIncludes(mainFile)
+	if err != nil {
+		t.Fatalf("findIncludes 错误: %v", err)
+	}
+
+	if len(includes) != 1 {
+		t.Errorf("期望 1 个 include，实际 %d", len(includes))
+	}
+}
+
+// TestFindIncludes_NoMatch 测试 include 路径不匹配任何文件
+func TestFindIncludes_NoMatch(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "nginx-test-*")
+	if err != nil {
+		t.Fatalf("创建临时目录失败: %v", err)
+	}
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+
+	content := `include /nonexistent/path/*.conf;`
+	mainFile := filepath.Join(tmpDir, "nginx.conf")
+	_ = os.WriteFile(mainFile, []byte(content), 0644)
+
+	s := NewWithConfig(mainFile)
+	s.SetDebug(true, func(format string, args ...interface{}) {})
+	includes, err := s.findIncludes(mainFile)
+	if err != nil {
+		t.Fatalf("findIncludes 错误: %v", err)
+	}
+
+	if len(includes) != 0 {
+		t.Errorf("不存在的路径不应返回 include，实际 %d", len(includes))
+	}
+}
+
+// TestFindIncludes_RelativePath 测试相对路径 include
+func TestFindIncludes_RelativePath(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "nginx-test-*")
+	if err != nil {
+		t.Fatalf("创建临时目录失败: %v", err)
+	}
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+
+	confDir := filepath.Join(tmpDir, "conf.d")
+	_ = os.MkdirAll(confDir, 0755)
+	_ = os.WriteFile(filepath.Join(confDir, "site.conf"), []byte("# content"), 0644)
+
+	content := `include conf.d/site.conf;`
+	mainFile := filepath.Join(tmpDir, "nginx.conf")
+	_ = os.WriteFile(mainFile, []byte(content), 0644)
+
+	s := NewWithConfig(mainFile)
+	includes, err := s.findIncludes(mainFile)
+	if err != nil {
+		t.Fatalf("findIncludes 错误: %v", err)
+	}
+
+	if len(includes) != 1 {
+		t.Errorf("相对路径 include 应找到 1 个文件，实际 %d", len(includes))
+	}
+}
+
+// TestScanAll_WithInclude 测试 ScanAll 含 include 的递归扫描
+func TestScanAll_WithInclude(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "nginx-test-*")
+	if err != nil {
+		t.Fatalf("创建临时目录失败: %v", err)
+	}
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+
+	confDir := filepath.Join(tmpDir, "conf.d")
+	_ = os.MkdirAll(confDir, 0755)
+
+	includeContent := `
+server {
+    listen 443 ssl;
+    server_name included.example.com;
+    ssl_certificate /etc/ssl/included.crt;
+    ssl_certificate_key /etc/ssl/included.key;
+}`
+	_ = os.WriteFile(filepath.Join(confDir, "included.conf"), []byte(includeContent), 0644)
+
+	mainContent := `
+server {
+    listen 80;
+    server_name main.example.com;
+    root /var/www/main;
+}
+include ` + confDir + `/*.conf;`
+	mainFile := filepath.Join(tmpDir, "nginx.conf")
+	_ = os.WriteFile(mainFile, []byte(mainContent), 0644)
+
+	s := NewWithConfig(mainFile)
+	sites, err := s.ScanAll()
+	if err != nil {
+		t.Fatalf("ScanAll 失败: %v", err)
+	}
+
+	if len(sites) != 2 {
+		t.Errorf("期望 2 个站点，实际 %d", len(sites))
+	}
+}
+
+// TestFindByDomain_ByAlias 测试通过别名查找 SSL 站点
+func TestFindByDomain_ByAlias(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "nginx-test-*")
+	if err != nil {
+		t.Fatalf("创建临时目录失败: %v", err)
+	}
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+
+	content := `
+server {
+    listen 443 ssl;
+    server_name primary.example.com www.example.com api.example.com;
+    ssl_certificate /etc/ssl/cert.crt;
+    ssl_certificate_key /etc/ssl/cert.key;
+}`
+	mainFile := filepath.Join(tmpDir, "nginx.conf")
+	_ = os.WriteFile(mainFile, []byte(content), 0644)
+
+	s := NewWithConfig(mainFile)
+	// 通过别名查找
+	site, err := s.FindByDomain("api.example.com")
+	if err != nil {
+		t.Fatalf("FindByDomain 错误: %v", err)
+	}
+	if site == nil {
+		t.Fatal("通过别名应能找到站点")
+	}
+	if site.ServerName != "primary.example.com" {
+		t.Errorf("ServerName = %q，期望 primary.example.com", site.ServerName)
+	}
+}
+
+// TestScanConfigFile_DepthAndFileLimit 测试 SSL 扫描的深度和文件数限制
+func TestScanConfigFile_DepthAndFileLimit(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "nginx-test-*")
+	if err != nil {
+		t.Fatalf("创建临时目录失败: %v", err)
+	}
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+
+	content := `
+server {
+    listen 443 ssl;
+    server_name example.com;
+    ssl_certificate /etc/ssl/cert.crt;
+    ssl_certificate_key /etc/ssl/cert.key;
+}`
+	mainFile := filepath.Join(tmpDir, "nginx.conf")
+	_ = os.WriteFile(mainFile, []byte(content), 0644)
+
+	// 测试深度限制
+	s := NewWithConfig(mainFile)
+	s.scannedFiles = make(map[string]bool)
+	sites, err := s.scanConfigFile(mainFile, maxScanDepth+1)
+	if err != nil {
+		t.Fatalf("不应返回错误: %v", err)
+	}
+	if len(sites) != 0 {
+		t.Errorf("超过深度限制应返回空，实际 %d", len(sites))
+	}
+
+	// 测试文件不存在
+	s2 := NewWithConfig(mainFile)
+	s2.scannedFiles = make(map[string]bool)
+	sites2, err := s2.scanConfigFile("/nonexistent/path.conf", 0)
+	if err != nil {
+		t.Fatalf("不存在的文件不应返回错误: %v", err)
+	}
+	if len(sites2) != 0 {
+		t.Errorf("不存在的文件应返回空，实际 %d", len(sites2))
+	}
+
+	// 测试重复文件跳过
+	s3 := NewWithConfig(mainFile)
+	s3.scannedFiles = make(map[string]bool)
+	sites3, _ := s3.scanConfigFile(mainFile, 0)
+	sites3dup, _ := s3.scanConfigFile(mainFile, 0)
+	if len(sites3) != 1 {
+		t.Errorf("首次扫描应返回 1 个站点，实际 %d", len(sites3))
+	}
+	if len(sites3dup) != 0 {
+		t.Errorf("重复扫描应返回 0 个站点，实际 %d", len(sites3dup))
+	}
+}
+
+// TestParseServerBlocks_ServerNameUnderscore 测试 server_name _ 在 parseServerBlocks 中的处理
+func TestParseServerBlocks_ServerNameUnderscore(t *testing.T) {
+	lines := []string{
+		"server {",
+		"    listen 80;",
+		"    server_name _;",
+		"}",
+	}
+	blocks := parseServerBlocks(lines, "/test.conf", parseOptions{})
+	if len(blocks) != 1 {
+		t.Fatalf("期望 1 个块，实际 %d", len(blocks))
+	}
+	// _ 在 for 循环中被 continue 跳过，但兜底逻辑会设为 names[0]
+	// 过滤 _ 的工作由 rawBlocksToSites 完成
+	if blocks[0].serverName != "_" {
+		t.Errorf("server_name _ 应保留为 _（由 rawBlocksToSites 过滤），实际 %q", blocks[0].serverName)
+	}
+
+	// 验证 rawBlocksToSites 确实会过滤掉 _
+	sites := rawBlocksToSites(blocks)
+	if len(sites) != 0 {
+		t.Errorf("rawBlocksToSites 应过滤掉 _，实际返回 %d 个站点", len(sites))
+	}
+}
+
+// TestParseServerBlocks_EmptyLines 测试空行和纯注释
+func TestParseServerBlocks_EmptyLines(t *testing.T) {
+	lines := []string{
+		"",
+		"# 纯注释",
+		"server {",
+		"    # 注释行",
+		"    listen 443 ssl;",
+		"    server_name example.com;",
+		"    ssl_certificate /etc/ssl/cert.crt;",
+		"    ssl_certificate_key /etc/ssl/cert.key;",
+		"    root /var/www/html;",
+		"}",
+		"",
+	}
+	blocks := parseServerBlocks(lines, "/test.conf", parseOptions{})
+	if len(blocks) != 1 {
+		t.Fatalf("期望 1 个块，实际 %d", len(blocks))
+	}
+	if blocks[0].webroot != "/var/www/html" {
+		t.Errorf("webroot = %q，期望 /var/www/html", blocks[0].webroot)
+	}
+}
+
+// TestScanConfigFile_FileCountLimit 测试文件总数限制
+func TestScanConfigFile_FileCountLimit(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "nginx-test-*")
+	if err != nil {
+		t.Fatalf("创建临时目录失败: %v", err)
+	}
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+
+	content := `
+server {
+    listen 443 ssl;
+    server_name example.com;
+    ssl_certificate /etc/ssl/cert.crt;
+    ssl_certificate_key /etc/ssl/cert.key;
+}`
+	mainFile := filepath.Join(tmpDir, "nginx.conf")
+	_ = os.WriteFile(mainFile, []byte(content), 0644)
+
+	s := NewWithConfig(mainFile)
+	s.scannedFiles = make(map[string]bool)
+	// 填满文件计数到上限
+	for i := 0; i < maxScanFiles; i++ {
+		s.scannedFiles[filepath.Join(tmpDir, fmt.Sprintf("dummy%d.conf", i))] = true
+	}
+	sites, err := s.scanConfigFile(mainFile, 0)
+	if err != nil {
+		t.Fatalf("不应返回错误: %v", err)
+	}
+	if len(sites) != 0 {
+		t.Errorf("超过文件数限制应返回空，实际 %d", len(sites))
+	}
+}
+
+// TestScanHTTPConfigFile_FileCountLimit 测试 HTTP 扫描文件总数限制
+func TestScanHTTPConfigFile_FileCountLimit(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "nginx-test-*")
+	if err != nil {
+		t.Fatalf("创建临时目录失败: %v", err)
+	}
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+
+	content := `
+server {
+    listen 80;
+    server_name example.com;
+    root /var/www/html;
+}`
+	mainFile := filepath.Join(tmpDir, "nginx.conf")
+	_ = os.WriteFile(mainFile, []byte(content), 0644)
+
+	s := NewWithConfig(mainFile)
+	s.scannedFiles = make(map[string]bool)
+	for i := 0; i < maxScanFiles; i++ {
+		s.scannedFiles[filepath.Join(tmpDir, fmt.Sprintf("dummy%d.conf", i))] = true
+	}
+	sites, err := s.scanHTTPConfigFile(mainFile, 0)
+	if err != nil {
+		t.Fatalf("不应返回错误: %v", err)
+	}
+	if len(sites) != 0 {
+		t.Errorf("超过文件数限制应返回空，实际 %d", len(sites))
+	}
+}
+
+// TestScanAllConfigFile_FileCountLimit 测试全站点扫描文件总数限制
+func TestScanAllConfigFile_FileCountLimit(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "nginx-test-*")
+	if err != nil {
+		t.Fatalf("创建临时目录失败: %v", err)
+	}
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+
+	content := `
+server {
+    listen 443 ssl;
+    server_name example.com;
+    ssl_certificate /etc/ssl/cert.crt;
+    ssl_certificate_key /etc/ssl/cert.key;
+}`
+	mainFile := filepath.Join(tmpDir, "nginx.conf")
+	_ = os.WriteFile(mainFile, []byte(content), 0644)
+
+	s := NewWithConfig(mainFile)
+	s.scannedFiles = make(map[string]bool)
+	for i := 0; i < maxScanFiles; i++ {
+		s.scannedFiles[filepath.Join(tmpDir, fmt.Sprintf("dummy%d.conf", i))] = true
+	}
+	sites, err := s.scanAllConfigFile(mainFile, 0)
+	if err != nil {
+		t.Fatalf("不应返回错误: %v", err)
+	}
+	if len(sites) != 0 {
+		t.Errorf("超过文件数限制应返回空，实际 %d", len(sites))
+	}
+}
+
+// TestHasSSLConfig_NonexistentFile 测试不存在的文件
+func TestHasSSLConfig_NonexistentFile(t *testing.T) {
+	s := NewWithConfig("/nonexistent/nginx.conf")
+	got := s.HasSSLConfig("/nonexistent/path.conf")
+	if got {
+		t.Error("不存在的文件应返回 false")
+	}
+}
+
+// TestGetConfigPath 测试获取配置路径
+func TestGetConfigPath(t *testing.T) {
+	s := NewWithConfig("/etc/nginx/nginx.conf")
+	if got := s.GetConfigPath(); got != "/etc/nginx/nginx.conf" {
+		t.Errorf("GetConfigPath() = %q，期望 %q", got, "/etc/nginx/nginx.conf")
+	}
+
+	s2 := New()
+	if got := s2.GetConfigPath(); got != "" {
+		t.Errorf("New() 的 GetConfigPath() = %q，期望空字符串", got)
+	}
+}
+
+// TestFindAllByDomain 测试全站点域名查找（含 SSL 和非 SSL）
+func TestFindAllByDomain(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "nginx-test-*")
+	if err != nil {
+		t.Fatalf("创建临时目录失败: %v", err)
+	}
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+
+	content := `
+server {
+    listen 443 ssl;
+    server_name ssl.example.com;
+    ssl_certificate /etc/ssl/cert.crt;
+    ssl_certificate_key /etc/ssl/cert.key;
+}
+server {
+    listen 80;
+    server_name http.example.com;
+    root /var/www/html;
+}
+server {
+    listen 443 ssl;
+    server_name *.wildcard.com;
+    ssl_certificate /etc/ssl/wildcard.crt;
+    ssl_certificate_key /etc/ssl/wildcard.key;
+}
+server {
+    listen 80;
+    server_name alias.example.com www.alias.example.com;
+    root /var/www/alias;
+}`
+	mainFile := filepath.Join(tmpDir, "nginx.conf")
+	_ = os.WriteFile(mainFile, []byte(content), 0644)
+
+	tests := []struct {
+		name   string
+		domain string
+		expect string
+		found  bool
+	}{
+		{"精确匹配 SSL 站点", "ssl.example.com", "ssl.example.com", true},
+		{"精确匹配 HTTP 站点", "http.example.com", "http.example.com", true},
+		{"通配符匹配", "sub.wildcard.com", "*.wildcard.com", true},
+		{"别名匹配", "www.alias.example.com", "alias.example.com", true},
+		{"不存在的域名", "notexist.example.com", "", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := NewWithConfig(mainFile)
+			site, err := s.FindAllByDomain(tt.domain)
+			if err != nil {
+				t.Fatalf("FindAllByDomain(%s) 错误: %v", tt.domain, err)
+			}
+			if tt.found {
+				if site == nil {
+					t.Fatalf("FindAllByDomain(%s) 未找到站点", tt.domain)
+				}
+				if site.ServerName != tt.expect {
+					t.Errorf("FindAllByDomain(%s).ServerName = %q，期望 %q", tt.domain, site.ServerName, tt.expect)
+				}
+			} else {
+				if site != nil {
+					t.Errorf("FindAllByDomain(%s) 应返回 nil，实际返回 %q", tt.domain, site.ServerName)
+				}
+			}
+		})
+	}
+}
+
+// TestScanAll_WithConfigPath 测试已指定配置路径时的 ScanAll
+func TestScanAll_WithConfigPath(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "nginx-test-*")
+	if err != nil {
+		t.Fatalf("创建临时目录失败: %v", err)
+	}
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+
+	content := `
+server {
+    listen 443 ssl;
+    server_name ssl.example.com;
+    ssl_certificate /etc/ssl/cert.crt;
+    ssl_certificate_key /etc/ssl/cert.key;
+}
+server {
+    listen 80;
+    server_name http.example.com;
+    root /var/www/html;
+}
+server {
+    listen 80;
+    server_name _;
+    root /var/www/default;
+}`
+	mainFile := filepath.Join(tmpDir, "nginx.conf")
+	_ = os.WriteFile(mainFile, []byte(content), 0644)
+
+	s := NewWithConfig(mainFile)
+	sites, err := s.ScanAll()
+	if err != nil {
+		t.Fatalf("ScanAll 失败: %v", err)
+	}
+
+	// _ 被过滤，应该只有 2 个站点
+	if len(sites) != 2 {
+		t.Errorf("期望 2 个站点（过滤 _），实际 %d", len(sites))
+	}
+}
+
+// TestScanHTTPSites_WithInclude 测试 HTTP 站点扫描（含 include 递归）
+func TestScanHTTPSites_WithInclude(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "nginx-test-*")
+	if err != nil {
+		t.Fatalf("创建临时目录失败: %v", err)
+	}
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+
+	confDir := filepath.Join(tmpDir, "conf.d")
+	_ = os.MkdirAll(confDir, 0755)
+
+	includeContent := `
+server {
+    listen 80;
+    server_name included-http.example.com;
+    root /var/www/included;
+}`
+	_ = os.WriteFile(filepath.Join(confDir, "http.conf"), []byte(includeContent), 0644)
+
+	mainContent := `
+server {
+    listen 80;
+    server_name main-http.example.com;
+    root /var/www/main;
+}
+include ` + confDir + `/*.conf;`
+	mainFile := filepath.Join(tmpDir, "nginx.conf")
+	_ = os.WriteFile(mainFile, []byte(mainContent), 0644)
+
+	s := NewWithConfig(mainFile)
+	sites, err := s.ScanHTTPSites()
+	if err != nil {
+		t.Fatalf("ScanHTTPSites 失败: %v", err)
+	}
+
+	if len(sites) != 2 {
+		t.Errorf("期望 2 个 HTTP 站点，实际 %d", len(sites))
+	}
+}
+
+// TestScanHTTPConfigFile_DepthLimit 测试 HTTP 扫描深度限制
+func TestScanHTTPConfigFile_DepthLimit(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "nginx-test-*")
+	if err != nil {
+		t.Fatalf("创建临时目录失败: %v", err)
+	}
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+
+	content := `
+server {
+    listen 80;
+    server_name example.com;
+    root /var/www/html;
+}`
+	mainFile := filepath.Join(tmpDir, "nginx.conf")
+	_ = os.WriteFile(mainFile, []byte(content), 0644)
+
+	s := NewWithConfig(mainFile)
+	// 直接调用 scanHTTPConfigFile 超过深度限制
+	sites, err := s.scanHTTPConfigFile(mainFile, maxScanDepth+1)
+	if err != nil {
+		t.Fatalf("不应返回错误: %v", err)
+	}
+	if len(sites) != 0 {
+		t.Errorf("超过深度限制应返回空，实际 %d 个站点", len(sites))
+	}
+}
+
+// TestScanAllConfigFile_DepthLimit 测试全站点扫描深度限制
+func TestScanAllConfigFile_DepthLimit(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "nginx-test-*")
+	if err != nil {
+		t.Fatalf("创建临时目录失败: %v", err)
+	}
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+
+	content := `
+server {
+    listen 443 ssl;
+    server_name example.com;
+    ssl_certificate /etc/ssl/cert.crt;
+    ssl_certificate_key /etc/ssl/cert.key;
+}`
+	mainFile := filepath.Join(tmpDir, "nginx.conf")
+	_ = os.WriteFile(mainFile, []byte(content), 0644)
+
+	s := NewWithConfig(mainFile)
+	// 直接调用 scanAllConfigFile 超过深度限制
+	sites, err := s.scanAllConfigFile(mainFile, maxScanDepth+1)
+	if err != nil {
+		t.Fatalf("不应返回错误: %v", err)
+	}
+	if len(sites) != 0 {
+		t.Errorf("超过深度限制应返回空，实际 %d 个站点", len(sites))
+	}
+}
+
+// TestScanHTTPConfigFile_NonexistentFile 测试扫描不存在的文件
+func TestScanHTTPConfigFile_NonexistentFile(t *testing.T) {
+	s := NewWithConfig("/nonexistent/nginx.conf")
+	sites, err := s.scanHTTPConfigFile("/nonexistent/path.conf", 0)
+	if err != nil {
+		t.Fatalf("不存在的文件不应返回错误: %v", err)
+	}
+	if len(sites) != 0 {
+		t.Errorf("不存在的文件应返回空，实际 %d 个站点", len(sites))
+	}
+}
+
+// TestScanAllConfigFile_NonexistentFile 测试全站点扫描不存在的文件
+func TestScanAllConfigFile_NonexistentFile(t *testing.T) {
+	s := NewWithConfig("/nonexistent/nginx.conf")
+	sites, err := s.scanAllConfigFile("/nonexistent/path.conf", 0)
+	if err != nil {
+		t.Fatalf("不存在的文件不应返回错误: %v", err)
+	}
+	if len(sites) != 0 {
+		t.Errorf("不存在的文件应返回空，实际 %d 个站点", len(sites))
+	}
+}
+
+// TestScanHTTPConfigFile_DuplicateFile 测试重复文件跳过
+func TestScanHTTPConfigFile_DuplicateFile(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "nginx-test-*")
+	if err != nil {
+		t.Fatalf("创建临时目录失败: %v", err)
+	}
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+
+	content := `
+server {
+    listen 80;
+    server_name example.com;
+    root /var/www/html;
+}`
+	mainFile := filepath.Join(tmpDir, "nginx.conf")
+	_ = os.WriteFile(mainFile, []byte(content), 0644)
+
+	s := NewWithConfig(mainFile)
+	// 第一次扫描
+	sites1, _ := s.scanHTTPConfigFile(mainFile, 0)
+	// 第二次扫描同文件应跳过（已记录）
+	sites2, _ := s.scanHTTPConfigFile(mainFile, 0)
+
+	if len(sites1) != 1 {
+		t.Errorf("首次扫描应返回 1 个站点，实际 %d", len(sites1))
+	}
+	if len(sites2) != 0 {
+		t.Errorf("重复扫描应返回 0 个站点，实际 %d", len(sites2))
+	}
+}
+
+// TestParseHTTPConfigFile_FilterSSLAndEmpty 测试 HTTP 解析过滤 SSL 和空 server_name
+func TestParseHTTPConfigFile_FilterSSLAndEmpty(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "nginx-test-*")
+	if err != nil {
+		t.Fatalf("创建临时目录失败: %v", err)
+	}
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+
+	content := `
+server {
+    listen 443 ssl;
+    server_name ssl-only.example.com;
+    ssl_certificate /etc/ssl/cert.crt;
+    ssl_certificate_key /etc/ssl/cert.key;
+}
+server {
+    listen 80;
+    root /var/www/noname;
+}
+server {
+    listen 80;
+    server_name valid-http.example.com;
+    root /var/www/valid;
+}
+server {
+    listen 8080;
+    server_name another-http.example.com;
+    root /var/www/another;
+}`
+	confFile := filepath.Join(tmpDir, "test.conf")
+	_ = os.WriteFile(confFile, []byte(content), 0644)
+
+	s := NewWithConfig(confFile)
+	sites, err := s.parseHTTPConfigFile(confFile)
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+
+	// SSL 站点和空 server_name 应被过滤，只剩 2 个 HTTP 站点
+	if len(sites) != 2 {
+		t.Errorf("期望 2 个 HTTP 站点，实际 %d", len(sites))
 	}
 }

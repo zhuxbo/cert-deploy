@@ -278,9 +278,11 @@ func (s *Scanner) parseConfig(content, configPath string, info *ContainerInfo) [
 
 		// server 块结束
 		if braceCount <= 0 {
-			if currentSite != nil && currentSite.CertificatePath != "" && currentSite.PrivateKeyPath != "" {
-				// 计算宿主机路径
-				s.resolveHostPaths(currentSite)
+			if currentSite != nil && currentSite.ServerName != "" && currentSite.ServerName != "_" {
+				// 计算宿主机路径（有证书配置时）
+				if currentSite.CertificatePath != "" && currentSite.PrivateKeyPath != "" {
+					s.resolveHostPaths(currentSite)
+				}
 				sites = append(sites, currentSite)
 			}
 			inServerBlock = false
@@ -349,8 +351,10 @@ func (s *Scanner) parseConfig(content, configPath string, info *ContainerInfo) [
 	}
 
 	// 处理最后一个 server 块
-	if currentSite != nil && currentSite.CertificatePath != "" && currentSite.PrivateKeyPath != "" {
-		s.resolveHostPaths(currentSite)
+	if currentSite != nil && currentSite.ServerName != "" && currentSite.ServerName != "_" {
+		if currentSite.CertificatePath != "" && currentSite.PrivateKeyPath != "" {
+			s.resolveHostPaths(currentSite)
+		}
 		sites = append(sites, currentSite)
 	}
 

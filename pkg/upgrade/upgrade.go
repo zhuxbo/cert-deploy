@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"runtime"
 	"strings"
 	"time"
 
@@ -13,6 +14,15 @@ import (
 
 // installFunc 安装函数，可在测试中替换
 var installFunc = Install
+
+// validateReleaseURL 验证升级地址并返回 HTTP 客户端
+// 生产构建强制 HTTPS + TLS 1.2+，e2e 测试构建可通过 build tag 覆盖
+var validateReleaseURL = func(releaseURL string) (*http.Client, error) {
+	if !strings.HasPrefix(releaseURL, "https://") {
+		return nil, &ErrReleaseSource{Msg: "升级地址必须使用 HTTPS 协议"}
+	}
+	return secureHTTPClient(), nil
+}
 
 // Options 升级选项
 type Options struct {
@@ -39,13 +49,14 @@ func Execute(opts Options, logFunc func(format string, args ...interface{})) (*R
 	// 统一处理末尾斜杠，避免拼接出错
 	opts.ReleaseURL = strings.TrimRight(strings.TrimSpace(opts.ReleaseURL), "/")
 	if opts.ReleaseURL == "" {
-		return nil, fmt.Errorf("未配置升级地址，请运行 sslctl upgrade 在交互终端中输入，或使用安装脚本升级")
+		return nil, &ErrReleaseSource{Msg: "未配置升级地址，请运行 sslctl upgrade 在交互终端中输入，或使用安装脚本升级"}
 	}
-	// 安全校验：强制 HTTPS
-	if !strings.HasPrefix(opts.ReleaseURL, "https://") {
-		return nil, fmt.Errorf("升级地址必须使用 HTTPS 协议")
+	// 安全校验 + 创建 HTTP 客户端（生产环境强制 HTTPS，e2e 可覆盖）
+	client, err := validateReleaseURL(opts.ReleaseURL)
+	if err != nil {
+		return nil, err
 	}
-	return executeWithClient(opts, logFunc, opts.ReleaseURL+"/releases.json", secureHTTPClient())
+	return executeWithClient(opts, logFunc, opts.ReleaseURL+"/releases.json", client)
 }
 
 // executeWithClient 内部实现，接受 URL 和 client 参数（便于测试）
@@ -101,13 +112,19 @@ func executeWithClient(opts Options, logFunc func(format string, args ...interfa
 		return result, nil
 	}
 
-	// 6. 下载并安装
-	if err := downloadVerifyInstall(target, channel, index, logFunc, client, baseURL, installHint); err != nil {
+	// 5. 下载安装并重启服务（平台差异化）
+	var restarted bool
+	if runtime.GOOS == "windows" {
+		// Windows: 先停服务释放 exe 文件句柄，再替换，再启动
+		restarted, err = upgradeWithStopFirst(logFunc, target, channel, index, client, baseURL, installHint)
+	} else {
+		// Linux/macOS: 先替换二进制（运行中进程持有旧 inode 不受影响），再重启服务
+		restarted, err = upgradeWithRestartAfter(logFunc, target, channel, index, client, baseURL, installHint)
+	}
+	if err != nil {
 		return nil, err
 	}
-
-	// 7. 如果服务运行中，重启服务
-	result.Restarted = tryRestartService(logFunc)
+	result.Restarted = restarted
 
 	logFunc("\n升级完成: %s → %s", current, target)
 	return result, nil
@@ -125,6 +142,7 @@ func downloadVerifyInstall(target, channel string, index ReleaseIndex, logFunc f
 	logFunc("下载 %s...", filename)
 	var gzData []byte
 	var err error
+	dlStart := time.Now()
 	if client != nil {
 		gzData, err = downloadBinaryWithClient(downloadURL, client)
 	} else {
@@ -133,9 +151,12 @@ func downloadVerifyInstall(target, channel string, index ReleaseIndex, logFunc f
 	if err != nil {
 		return err
 	}
+	dlSec := time.Since(dlStart).Seconds()
+	sizeMB := float64(len(gzData)) / 1024 / 1024
+	logFunc("下载完成 (%.2f MB, %.1f 秒, %.1f MB/s)", sizeMB, dlSec, sizeMB/dlSec)
 
 	// 验证签名（优先于校验和，防止供应链攻击）
-	expectedSignature := index.GetSignature(channel, target)
+	expectedSignature := index.GetSignature(channel, target, filename)
 	logFunc("验证数字签名...")
 	if err := VerifySignature(gzData, expectedSignature); err != nil {
 		var keyNotFound *ErrKeyNotFound
@@ -165,9 +186,36 @@ func downloadVerifyInstall(target, channel string, index ReleaseIndex, logFunc f
 	return nil
 }
 
-// tryRestartService 尝试优雅重启服务（如果运行中）
-// 使用 Stop + 等待 + Start 代替 Restart，确保守护进程完成优雅退出
-func tryRestartService(logFunc func(format string, args ...interface{})) bool {
+// upgradeWithStopFirst Windows 升级策略：停止服务 → 下载安装 → 启动服务
+// Windows 上运行中的 exe 文件被锁定，必须先停止服务释放句柄才能替换
+func upgradeWithStopFirst(logFunc func(format string, args ...interface{}), target, channel string, index ReleaseIndex, client *http.Client, baseURL, installHint string) (bool, error) {
+	svcWasRunning := stopServiceBeforeUpgrade(logFunc)
+
+	if err := downloadVerifyInstall(target, channel, index, logFunc, client, baseURL, installHint); err != nil {
+		if svcWasRunning {
+			startServiceAfterUpgrade(logFunc)
+		}
+		return false, err
+	}
+
+	if svcWasRunning {
+		return startServiceAfterUpgrade(logFunc), nil
+	}
+	return false, nil
+}
+
+// upgradeWithRestartAfter Linux/macOS 升级策略：下载安装 → 重启服务
+// Unix 上覆盖二进制文件不影响运行中的进程（持有旧 inode），下载期间服务不中断
+func upgradeWithRestartAfter(logFunc func(format string, args ...interface{}), target, channel string, index ReleaseIndex, client *http.Client, baseURL, installHint string) (bool, error) {
+	if err := downloadVerifyInstall(target, channel, index, logFunc, client, baseURL, installHint); err != nil {
+		return false, err
+	}
+
+	return restartServiceIfRunning(logFunc), nil
+}
+
+// stopServiceBeforeUpgrade Windows 升级前停止服务，返回是否原本在运行
+func stopServiceBeforeUpgrade(logFunc func(format string, args ...interface{})) bool {
 	svcMgr, err := service.New(nil)
 	if err != nil {
 		return false
@@ -183,23 +231,55 @@ func tryRestartService(logFunc func(format string, args ...interface{})) bool {
 		logFunc("停止服务失败: %v", err)
 		return false
 	}
+	return true
+}
 
-	// 等待服务完全停止（最多 30 秒）
-	deadline := time.Now().Add(30 * time.Second)
-	for time.Now().Before(deadline) {
-		st, _ := svcMgr.Status()
-		if st == nil || !st.Running {
-			break
-		}
-		time.Sleep(time.Second)
+// restartServiceIfRunning Linux 升级后重启服务（如果运行中）
+func restartServiceIfRunning(logFunc func(format string, args ...interface{})) bool {
+	svcMgr, err := service.New(nil)
+	if err != nil {
+		return false
 	}
 
-	logFunc("启动服务...")
-	if err := svcMgr.Start(); err != nil {
-		logFunc("启动服务失败: %v", err)
+	status, _ := svcMgr.Status()
+	if status == nil || !status.Running {
+		return false
+	}
+
+	logFunc("重启服务...")
+	if err := svcMgr.Restart(); err != nil {
+		logFunc("重启服务失败: %v", err)
 		return false
 	}
 
 	logFunc("服务已重启")
+	return true
+}
+
+// startServiceAfterUpgrade Windows 升级后启动服务
+func startServiceAfterUpgrade(logFunc func(format string, args ...interface{})) bool {
+	svcMgr, err := service.New(nil)
+	if err != nil {
+		return false
+	}
+
+	// 检查是否已在运行（恢复机制可能已自动拉起）
+	if st, _ := svcMgr.Status(); st != nil && st.Running {
+		logFunc("服务已在运行")
+		return true
+	}
+
+	logFunc("启动服务...")
+	if err := svcMgr.Start(); err != nil {
+		// 再次检查：可能在 Status 和 Start 之间被恢复机制拉起
+		if st, _ := svcMgr.Status(); st != nil && st.Running {
+			logFunc("服务已启动")
+			return true
+		}
+		logFunc("启动服务失败: %v", err)
+		return false
+	}
+
+	logFunc("服务已启动")
 	return true
 }

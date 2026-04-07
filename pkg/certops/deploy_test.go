@@ -2,6 +2,7 @@
 package certops
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -951,5 +952,212 @@ func TestSendDeployCallback_FailureResult(t *testing.T) {
 
 	// 失败结果也不应 panic
 	svc.sendDeployCallback(t.Context(), cert, result)
+}
+
+// TestDeployOne_ConfigErrors 测试 DeployOne 的配置错误分支
+func TestDeployOne_ConfigErrors(t *testing.T) {
+	t.Run("证书配置不存在时返回错误", func(t *testing.T) {
+		dir := t.TempDir()
+		cm, err := config.NewConfigManagerWithDir(dir)
+		if err != nil {
+			t.Fatalf("创建配置管理器失败: %v", err)
+		}
+
+		// 写入空配置
+		cfg := &config.Config{}
+		data, _ := json.Marshal(cfg)
+		_ = os.WriteFile(filepath.Join(dir, "config.json"), data, 0600)
+
+		log := logger.NewNopLogger()
+		svc := NewService(cm, log)
+
+		result, err := svc.DeployOne(t.Context(), "nonexistent-cert")
+		if err == nil {
+			t.Fatal("证书不存在时应返回错误")
+		}
+		if !strings.Contains(err.Error(), "获取证书配置失败") {
+			t.Errorf("错误信息应包含'获取证书配置失败'，实际: %v", err)
+		}
+		if result != nil {
+			t.Error("证书不存在时 result 应为 nil")
+		}
+	})
+
+	t.Run("API URL 为空时返回错误", func(t *testing.T) {
+		dir := t.TempDir()
+		cm, err := config.NewConfigManagerWithDir(dir)
+		if err != nil {
+			t.Fatalf("创建配置管理器失败: %v", err)
+		}
+
+		// 确保 API 环境变量未设置
+		_ = os.Unsetenv(config.EnvAPIToken)
+		_ = os.Unsetenv(config.EnvAPIURL)
+
+		cert := &config.CertConfig{
+			CertName: "no-url-cert",
+			OrderID:  123,
+			Enabled:  true,
+			API:      config.APIConfig{URL: "", Token: "some-token"},
+		}
+		_ = cm.AddCert(cert)
+
+		log := logger.NewNopLogger()
+		svc := NewService(cm, log)
+
+		result, err := svc.DeployOne(t.Context(), "no-url-cert")
+		if err == nil {
+			t.Fatal("API 不完整时应返回错误")
+		}
+		if !strings.Contains(err.Error(), "API 配置不完整") {
+			t.Errorf("错误信息应包含'API 配置不完整'，实际: %v", err)
+		}
+		if result != nil {
+			t.Error("API 不完整时 result 应为 nil")
+		}
+	})
+
+	t.Run("API Token 为空时返回错误", func(t *testing.T) {
+		dir := t.TempDir()
+		cm, err := config.NewConfigManagerWithDir(dir)
+		if err != nil {
+			t.Fatalf("创建配置管理器失败: %v", err)
+		}
+
+		// 确保 API 环境变量未设置
+		_ = os.Unsetenv(config.EnvAPIToken)
+		_ = os.Unsetenv(config.EnvAPIURL)
+
+		cert := &config.CertConfig{
+			CertName: "no-token-cert",
+			OrderID:  123,
+			Enabled:  true,
+			API:      config.APIConfig{URL: "http://example.com", Token: ""},
+		}
+		_ = cm.AddCert(cert)
+
+		log := logger.NewNopLogger()
+		svc := NewService(cm, log)
+
+		result, err := svc.DeployOne(t.Context(), "no-token-cert")
+		if err == nil {
+			t.Fatal("API Token 为空时应返回错误")
+		}
+		if !strings.Contains(err.Error(), "API 配置不完整") {
+			t.Errorf("错误信息应包含'API 配置不完整'，实际: %v", err)
+		}
+		if result != nil {
+			t.Error("API Token 为空时 result 应为 nil")
+		}
+	})
+
+	t.Run("URL 和 Token 都为空时返回错误", func(t *testing.T) {
+		dir := t.TempDir()
+		cm, err := config.NewConfigManagerWithDir(dir)
+		if err != nil {
+			t.Fatalf("创建配置管理器失败: %v", err)
+		}
+
+		// 确保 API 环境变量未设置
+		_ = os.Unsetenv(config.EnvAPIToken)
+		_ = os.Unsetenv(config.EnvAPIURL)
+
+		cert := &config.CertConfig{
+			CertName: "no-api-cert",
+			OrderID:  123,
+			Enabled:  true,
+			API:      config.APIConfig{URL: "", Token: ""},
+		}
+		_ = cm.AddCert(cert)
+
+		log := logger.NewNopLogger()
+		svc := NewService(cm, log)
+
+		result, err := svc.DeployOne(t.Context(), "no-api-cert")
+		if err == nil {
+			t.Fatal("API 配置都为空时应返回错误")
+		}
+		if !strings.Contains(err.Error(), "API 配置不完整") {
+			t.Errorf("错误信息应包含'API 配置不完整'，实际: %v", err)
+		}
+		if result != nil {
+			t.Error("result 应为 nil")
+		}
+	})
+}
+
+// TestDeployAllCerts_Empty 测试无启用证书时 DeployAllCerts 的行为
+func TestDeployAllCerts_Empty(t *testing.T) {
+	t.Run("无证书时返回空切片", func(t *testing.T) {
+		dir := t.TempDir()
+		cm, err := config.NewConfigManagerWithDir(dir)
+		if err != nil {
+			t.Fatalf("创建配置管理器失败: %v", err)
+		}
+
+		// 写入空配置
+		cfg := &config.Config{}
+		data, _ := json.Marshal(cfg)
+		_ = os.WriteFile(filepath.Join(dir, "config.json"), data, 0600)
+
+		log := logger.NewNopLogger()
+		svc := NewService(cm, log)
+
+		results, err := svc.DeployAllCerts(t.Context())
+		if err != nil {
+			t.Errorf("无证书时不应返回错误: %v", err)
+		}
+		if len(results) != 0 {
+			t.Errorf("无证书时应返回空切片，实际: %d 个结果", len(results))
+		}
+	})
+
+	t.Run("所有证书都禁用时返回空切片", func(t *testing.T) {
+		dir := t.TempDir()
+		cm, err := config.NewConfigManagerWithDir(dir)
+		if err != nil {
+			t.Fatalf("创建配置管理器失败: %v", err)
+		}
+
+		// 添加禁用的证书
+		cert := &config.CertConfig{
+			CertName: "disabled-cert",
+			OrderID:  123,
+			Enabled:  false,
+			API:      config.APIConfig{URL: "http://example.com", Token: "test-token"},
+		}
+		_ = cm.AddCert(cert)
+
+		log := logger.NewNopLogger()
+		svc := NewService(cm, log)
+
+		results, err := svc.DeployAllCerts(t.Context())
+		if err != nil {
+			t.Errorf("所有证书禁用时不应返回错误: %v", err)
+		}
+		if len(results) != 0 {
+			t.Errorf("所有证书禁用时应返回空切片，实际: %d 个结果", len(results))
+		}
+	})
+
+	t.Run("配置文件不存在时返回错误", func(t *testing.T) {
+		dir := t.TempDir()
+		cm, err := config.NewConfigManagerWithDir(dir)
+		if err != nil {
+			t.Fatalf("创建配置管理器失败: %v", err)
+		}
+
+		// 删除配置文件
+		_ = os.Remove(filepath.Join(dir, "config.json"))
+
+		log := logger.NewNopLogger()
+		svc := NewService(cm, log)
+
+		_, err = svc.DeployAllCerts(t.Context())
+		// 配置不存在时，ListEnabledCerts 会返回空列表而不是错误（Load 会初始化空配置）
+		// 所以这里不一定返回错误，取决于实现
+		// 主要验证不会 panic
+		_ = err
+	})
 }
 

@@ -394,3 +394,71 @@ func TestNewInstaller_InvalidType(t *testing.T) {
 		t.Error("无效类型应返回错误")
 	}
 }
+
+// TestListRegisteredTypes 测试列出已注册的服务器类型
+func TestListRegisteredTypes(t *testing.T) {
+	scanners, deployers, installers := ListRegisteredTypes()
+
+	// init 中注册了 Nginx scanner
+	if !containsType(scanners, TypeNginx) {
+		t.Errorf("scanners 应包含 %s, 实际: %v", TypeNginx, scanners)
+	}
+
+	// init 中注册了 Nginx 和 Apache deployer
+	if !containsType(deployers, TypeNginx) {
+		t.Errorf("deployers 应包含 %s, 实际: %v", TypeNginx, deployers)
+	}
+	if !containsType(deployers, TypeApache) {
+		t.Errorf("deployers 应包含 %s, 实际: %v", TypeApache, deployers)
+	}
+
+	// init 中注册了 Nginx 和 Apache installer
+	if !containsType(installers, TypeNginx) {
+		t.Errorf("installers 应包含 %s, 实际: %v", TypeNginx, installers)
+	}
+	if !containsType(installers, TypeApache) {
+		t.Errorf("installers 应包含 %s, 实际: %v", TypeApache, installers)
+	}
+
+	t.Logf("已注册类型 - scanners: %v, deployers: %v, installers: %v", scanners, deployers, installers)
+}
+
+// TestListRegisteredTypes_NonEmpty 验证返回的切片非空
+func TestListRegisteredTypes_NonEmpty(t *testing.T) {
+	scanners, deployers, installers := ListRegisteredTypes()
+
+	if len(scanners) == 0 {
+		t.Error("scanners 不应为空")
+	}
+	if len(deployers) == 0 {
+		t.Error("deployers 不应为空")
+	}
+	if len(installers) == 0 {
+		t.Error("installers 不应为空")
+	}
+}
+
+// TestListRegisteredTypes_NoUnknown 验证不包含 unknown 类型
+func TestListRegisteredTypes_NoUnknown(t *testing.T) {
+	scanners, deployers, installers := ListRegisteredTypes()
+
+	if containsType(scanners, TypeUnknown) {
+		t.Error("scanners 不应包含 unknown 类型")
+	}
+	if containsType(deployers, TypeUnknown) {
+		t.Error("deployers 不应包含 unknown 类型")
+	}
+	if containsType(installers, TypeUnknown) {
+		t.Error("installers 不应包含 unknown 类型")
+	}
+}
+
+// containsType 检查切片中是否包含指定类型
+func containsType(types []ServerType, target ServerType) bool {
+	for _, t := range types {
+		if t == target {
+			return true
+		}
+	}
+	return false
+}

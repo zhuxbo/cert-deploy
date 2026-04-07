@@ -49,6 +49,7 @@ testdata/      # 测试数据和工具
 sslctl setup --url <url> --token <token> --order <order_id>          # 单证书部署
 sslctl setup --url <url> --token <token> --order "123,example.com"   # 批量部署
 sslctl setup --url <url> --token <token>                             # 部署所有证书
+sslctl setup --key /path/key.pem --webroot /var/www/html --url <url> --token <token> --order <id>  # 指定私钥+文件验证
 
 # 站点扫描
 sslctl scan                                      # 扫描站点（自动检测 Web 服务器）
@@ -81,6 +82,7 @@ sslctl uninstall                                 # 卸载
 
 - API 配置在**证书级别**（每个证书独立的 `api` 字段），不再有全局 API
 - `release_url`：升级发布地址（安装时从参数自动生成并写入，未传参则留空；升级模块从此读取，未配置时交互提示输入）
+- `upgrade_channel`：升级通道（`main`/`dev`，安装时写入，默认 `main`）
 - 配置迁移：`pkg/config/migrate.go` 声明式规则引擎，加载时自动检测旧格式并迁移（幂等，支持跨版本升级）
 
 证书存储目录：`/opt/sslctl/certs/{server_name}/`
@@ -100,39 +102,48 @@ go test -v ./...                           # 运行单元测试
 go test -coverprofile=coverage.out ./...   # 测试并生成覆盖率
 bash build/test-linux.sh                   # Linux 发行版服务管理测试
 
-# 容器端到端测试
-bash docker/test/scripts/run-mock-tests.sh                # Mock API 离线测试
-bash docker/test/scripts/run-e2e-tests.sh --token <token> # 真实 API 测试
-bash docker/test/scripts/run-e2e-tests.sh --all           # 全发行版测试
+# 容器端到端测试（Bats + Docker Compose）
+bash docker/test/scripts/run-tests.sh                              # 全部测试
+bash docker/test/scripts/run-tests.sh --distro ubuntu --server nginx  # 指定目标
+bash docker/test/scripts/run-tests.sh --dind                       # Docker-in-Docker 测试
+bash docker/test/scripts/run-tests.sh --no-build --test scan       # 跳过构建，指定测试
 ```
 
 ## 容器测试目录
 
 ```text
 docker/test/
-├── scripts/           # 测试脚本（构建+运行均自动化）
-│   ├── common.sh      # 公共函数（含 build_binary/build_mock_api）
-│   ├── run-e2e-tests.sh    # E2E 测试主脚本
-│   ├── run-mock-tests.sh   # Mock 测试主脚本
-│   ├── test-setup.sh       # setup 命令测试
-│   ├── test-deploy.sh      # deploy 命令测试
-│   ├── test-deploy-local.sh # deploy local 测试
-│   ├── test-scan.sh        # scan 命令测试
-│   └── test-status.sh      # status/rollback/version 测试
-├── e2e/               # E2E 测试环境（多发行版通过 --build-arg DISTRO 选择）
-│   ├── docker-compose.e2e.yml
-│   ├── nginx-e2e/     # Nginx E2E 容器（ubuntu/debian/alpine/rocky）
-│   └── apache-e2e/    # Apache E2E 容器（ubuntu/debian/alpine/rocky）
-├── mock-api/          # Mock API 服务
-│   └── main.go        # 支持场景切换、请求记录
-└── reports/           # 测试报告输出
+├── docker-compose.yml # 10 服务（mock-api + nginx×4 + apache×4 + dind）
+├── scripts/
+│   ├── build.sh       # 编译二进制 + 构建镜像
+│   └── run-tests.sh   # 测试入口（--distro/--server/--test/--dind/--no-build）
+├── tests/             # Bats 测试用例
+│   ├── helpers/
+│   │   └── common.bash  # 公共函数（Mock API/Web 服务器/断言/生命周期）
+│   ├── setup.bats       # setup 命令测试
+│   ├── deploy.bats      # deploy 命令测试
+│   ├── deploy-local.bats # deploy local 测试
+│   ├── scan.bats        # scan 命令测试
+│   ├── status.bats      # status/version 命令测试
+│   ├── rollback.bats    # rollback 命令测试
+│   ├── daemon.bats      # daemon 启动/续签测试
+│   ├── upgrade.bats     # upgrade 命令测试
+│   ├── uninstall.bats   # uninstall 测试（必须最后执行）
+│   └── docker-scan.bats # DinD 环境 Docker 容器扫描测试
+├── nginx/             # Nginx 测试容器（ubuntu/debian/alpine/rocky）
+├── apache/            # Apache 测试容器（ubuntu/debian/alpine/rocky）
+├── dind/              # Docker-in-Docker 测试容器
+├── mock-api/          # Mock API 服务（多阶段 Docker 构建）
+│   ├── main.go        # 9 场景、CA→服务器证书分层、releases 端点
+│   └── Dockerfile
+└── reports/           # TAP 测试报告输出
 ```
 
 ## 续签模式
 
 | 模式    | 说明             | 启用方式                 |
 | ------- | ---------------- | ------------------------ |
-| `local` | 本机提交         | `--local-key` 或配置文件 |
+| `local` | 本机提交         | `--local-key` / `--key` / `--file-validation` 或配置文件 |
 | `pull`  | 自动签发（默认） | 默认行为                 |
 
 - 两种模式统一：`renew_before_days` 默认 14 天，由服务端控制，每次 API 交互后更新本地配置
@@ -151,9 +162,9 @@ docker/test/
 - golangci-lint 配置：errcheck、govet、staticcheck、gosec、unused、ineffassign（排除 G101/G204/G306 误报）
 - 接口参数命名统一（`Deployer.Deploy` 接口参数名与 Nginx/Apache 实现一致使用 `intermediate`）
 - Windows 服务管理错误处理完善（`Control`/`UpdateConfig` 返回值均已检查）
-- 测试覆盖率 48%+，核心包 `pkg/errors` 100%，`pkg/config` 76%，`pkg/backup` 75%
+- 测试覆盖率 48%+，核心包 `pkg/errors` 100%，`pkg/config` 76%，`pkg/backup` 85%，`pkg/upgrade` 78%，`pkg/service` 39%，`apache/scanner` 75%，`nginx/docker` 51%
 - 结构化部署错误（`StructuredDeployError`）支持类型分类、阶段定位和可重试判断
-- 平台相关代码使用 Build Tag 隔离（`inode_unix.go`/`inode_windows.go`、`selinux_linux.go`、`console_windows.go`）
+- 平台相关代码使用 Build Tag 隔离（`inode_unix.go`/`inode_windows.go`、`selinux_linux.go`、`console_windows.go`、`detach_unix.go`/`detach_windows.go`）
 - Windows 控制台 UTF-8 编码自动设置（`cmd/console_windows.go`，SetConsoleOutputCP + ANSI 虚拟终端支持）
 
 ## 安全机制
@@ -172,7 +183,10 @@ docker/test/
 - 日志敏感信息过滤（私钥、Bearer Token、Basic Auth、JSON 敏感字段含复合词匹配、URL 参数）
 - 日志记录器并发安全（`minLevel`/`jsonMode` 使用 `atomic` 类型，`SetLevel`/`SetJSONMode` 线程安全）
 - 升级模块 TLS 安全（HTTPS + TLS 1.2+）
-- 升级优雅重启（Stop + 等待停止 + Start）
+- 升级流程平台差异化（Linux：先替换再重启，零停机；Windows：先停服务释放 exe 句柄再替换再启动，失败时恢复服务；Windows 上 rename 策略替换运行中 exe，重试等待文件句柄释放）
+- Windows 服务停止等待（`Stop()` 轮询至 `Stopped` 状态，确保进程完全退出后才返回）
+- Windows 非服务模式重载（reload 命令失败时回退到进程重启：taskkill → 等待守护进程拉起 → 否则手动启动）
+- 守护进程优雅停止（`RunAsService` 通过 context 通知 daemon，不再依赖 SIGTERM；Windows SCM 停止立即生效）
 - SELinux 兼容（部署后自动恢复文件安全上下文，`restorecon` 失败时返回错误）
 - IDN/Punycode 域名支持（`pkg/matcher`）
 - 证书过期告警（守护进程周期检查，7 天/14 天阈值）
@@ -180,7 +194,7 @@ docker/test/
 - 配置扫描防护（Nginx/Apache/Docker 扫描器均有文件数量限制 1000 + 深度限制 100 + 文件大小限制 10MB）
 - Docker 挂载路径精确匹配（防止 `/etc/nginx` 匹配到 `/etc/nginx-backup`）
 - 升级解压防护（gzip 解压大小限制，防止 gzip 炸弹攻击）
-- 升级模块 Ed25519 签名验证（`pkg/upgrade`，密钥环已内置 key-1 公钥，签名格式 `ed25519:<key_id>:<base64>` 带 key ID；已配置公钥时拒绝安装未签名版本，防止降级攻击）
+- 升级模块 Ed25519 签名验证（`pkg/upgrade`，密钥环已内置 key-1 公钥，签名格式 `ed25519:<key_id>:<base64>` 带 key ID；releases.json 按文件名索引签名 `signatures` map；已配置公钥时拒绝安装未签名版本，防止降级攻击）
 - 升级安装符号链接防护（`copyFile` 写入前检查目标路径，拒绝覆盖符号链接）
 - 升级签名密钥轮换（密钥不匹配时提示用 `install.sh` 重装；`ErrKeyNotFound`/`ErrNoPublicKeys` 统一处理）
 - 升级通道白名单（`upgrade_channel` 配置仅允许 main/dev，releases.json 通道名为顶层 key，每通道保留最近 5 个版本）

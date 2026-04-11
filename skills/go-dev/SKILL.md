@@ -207,6 +207,7 @@ GOOS=windows GOARCH=amd64 go build -o sslctl.exe ./cmd
 - `pkg/config/flock_unix.go` / `flock_windows.go` — 文件锁
 - `pkg/upgrade/exec_unix.go` / `exec_windows.go` — 进程替换
 - `pkg/service/windows.go` / `windows_stub.go` — Windows 服务管理
+- `cmd/console_windows.go` / `console_other.go` — 控制台分版本检测。Win10/Server2016+ 启用 VT 后回读验证才设 UTF-8 CP，老系统完全不动；`supportsANSIColor()` 决定是否输出 ANSI 颜色码，老 Windows 走纯文本
 
 ### 静态编译
 

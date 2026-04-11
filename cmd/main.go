@@ -34,6 +34,23 @@ var (
 	buildTime = "unknown"
 )
 
+const (
+	colorGreen  = "\033[32m"
+	colorYellow = "\033[33m"
+	colorRed    = "\033[31m"
+	colorReset  = "\033[0m"
+)
+
+// colorize 在支持 ANSI 的终端上给文本加颜色，否则返回原文
+// Windows Server 2012 R2 等不支持 VT 的老系统走纯文本分支，
+// 避免控制台把 ESC 序列当作乱码显示
+func colorize(text, color string) string {
+	if !supportsANSIColor() {
+		return text
+	}
+	return color + text + colorReset
+}
+
 func main() {
 	// Windows 服务模式检测
 	if runtime.GOOS == "windows" && service.IsWindowsService() {
@@ -306,7 +323,7 @@ func runStatus() {
 			continue
 		}
 
-		status := "\033[32m有效\033[0m" // 绿色
+		status := colorize("有效", colorGreen)
 		daysStr := ""
 
 		if cert.Metadata.CertExpiresAt.IsZero() {
@@ -315,25 +332,23 @@ func runStatus() {
 			remaining := cert.Metadata.CertExpiresAt.Sub(now)
 
 			if remaining < 0 {
-				// 已过期
 				days := int((-remaining).Hours() / 24)
+				status = colorize("已过期", colorRed)
 				if days == 0 {
-					status = "\033[31m已过期\033[0m" // 红色
 					daysStr = " (今天过期)"
 				} else {
-					status = "\033[31m已过期\033[0m" // 红色
 					daysStr = fmt.Sprintf(" (已过期 %d 天)", days)
 				}
 			} else {
 				days := int(remaining.Hours() / 24)
 				if days == 0 {
-					status = "\033[31m即将过期\033[0m" // 红色
+					status = colorize("即将过期", colorRed)
 					daysStr = " (今天过期)"
 				} else if days < 7 {
-					status = "\033[31m即将过期\033[0m" // 红色
+					status = colorize("即将过期", colorRed)
 					daysStr = fmt.Sprintf(" (剩余 %d 天)", days)
 				} else if days < 13 {
-					status = "\033[33m即将过期\033[0m" // 黄色
+					status = colorize("即将过期", colorYellow)
 					daysStr = fmt.Sprintf(" (剩余 %d 天)", days)
 				} else {
 					daysStr = fmt.Sprintf(" (剩余 %d 天)", days)

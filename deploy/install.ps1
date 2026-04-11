@@ -46,12 +46,16 @@ try {
 # 保存原始控制台编码（StreamWriter 降级时使用，避免 UTF-8 与 GBK 不匹配导致乱码）
 $script:OrigConsoleEncoding = [Console]::OutputEncoding
 
-# 设置控制台编码为 UTF-8，解决中文乱码
-try {
-    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-    [Console]::InputEncoding = [System.Text.Encoding]::UTF8
-    $OutputEncoding = [System.Text.Encoding]::UTF8
-} catch {}
+# 仅当控制台当前已经是 UTF-8 (CP 65001) 时才跟着设为 UTF-8
+# 在 Windows Server 2012 R2 等老系统上，控制台代码页通常是 CP 936 (GBK)，
+# 强制改成 UTF-8 会导致 PowerShell 按 UTF-8 写字节、而控制台按 GBK 解码 → 中文乱码
+# 保持系统默认时 PowerShell 会自动把字符串转成控制台编码再输出，各版本都能正确显示
+if ([Console]::OutputEncoding.CodePage -eq 65001) {
+    try {
+        [Console]::InputEncoding = [System.Text.Encoding]::UTF8
+        $OutputEncoding = [System.Text.Encoding]::UTF8
+    } catch {}
+}
 
 # 兼容控制台缓冲区损坏的 Windows 终端（0x1F 错误）
 # 创建底层输出流作为备用，覆盖 Write-Host：每次调用先尝试原生，失败自动降级

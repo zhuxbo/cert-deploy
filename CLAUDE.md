@@ -165,7 +165,7 @@ docker/test/
 - 测试覆盖率 48%+，核心包 `pkg/errors` 100%，`pkg/config` 76%，`pkg/backup` 85%，`pkg/upgrade` 78%，`pkg/service` 39%，`apache/scanner` 75%，`nginx/docker` 51%
 - 结构化部署错误（`StructuredDeployError`）支持类型分类、阶段定位和可重试判断
 - 平台相关代码使用 Build Tag 隔离（`inode_unix.go`/`inode_windows.go`、`selinux_linux.go`、`console_windows.go`、`detach_unix.go`/`detach_windows.go`）
-- Windows 控制台 UTF-8 编码自动设置（`cmd/console_windows.go`，SetConsoleOutputCP + ANSI 虚拟终端支持）
+- Windows 控制台分版本处理（`cmd/console_windows.go`）：Win10/Server2016+ 通过 `SetConsoleMode` 开 VT 后回读验证，确认成功才设置 UTF-8 CP 并启用 ANSI 颜色；老系统（Server 2012 R2 等）完全不动控制台 CP 和字体，避免触发 Windows 把字体自动切换回 Raster Font 覆盖用户手动设的 TrueType 字体；`SSLCTL_CONSOLE_DEBUG=1` 开启启动期 stderr 诊断
 
 ## 安全机制
 

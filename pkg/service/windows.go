@@ -62,20 +62,20 @@ func (m *WindowsManager) Install() error {
 			break
 		}
 		if i == 0 {
-			fmt.Fprint(os.Stderr, "等待旧服务退出")
+			fmt.Fprint(os.Stdout, "等待旧服务退出")
 		}
-		fmt.Fprint(os.Stderr, ".")
+		fmt.Fprint(os.Stdout, ".")
 		time.Sleep(time.Second)
 	}
 	if createErr != nil {
-		fmt.Fprintln(os.Stderr)
+		fmt.Fprintln(os.Stdout)
 		return fmt.Errorf("创建服务失败: %w", createErr)
 	}
 	if s == nil {
 		return fmt.Errorf("创建服务失败")
 	}
 	// 清除等待输出
-	fmt.Fprint(os.Stderr, "\r                                                \r")
+	fmt.Fprint(os.Stdout, "\r                                                \r")
 	defer s.Close()
 
 	// 设置恢复选项（失败后自动重启）
@@ -175,17 +175,17 @@ func (m *WindowsManager) Stop() error {
 		st, err := s.Query()
 		if err != nil || st.State == svc.Stopped {
 			if i > 0 {
-				fmt.Fprintln(os.Stderr)
+				fmt.Fprintln(os.Stdout)
 			}
 			return nil
 		}
 		if i == 0 {
-			fmt.Fprint(os.Stderr, "等待服务退出")
+			fmt.Fprint(os.Stdout, "等待服务退出")
 		}
-		fmt.Fprint(os.Stderr, ".")
+		fmt.Fprint(os.Stdout, ".")
 		time.Sleep(time.Second)
 	}
-	fmt.Fprintln(os.Stderr)
+	fmt.Fprintln(os.Stdout)
 	return nil
 }
 

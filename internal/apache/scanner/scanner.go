@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strings"
 
+	sslerrors "github.com/zhuxbo/sslctl/pkg/errors"
 	"github.com/zhuxbo/sslctl/pkg/matcher"
 	"github.com/zhuxbo/sslctl/pkg/util"
 )
@@ -711,7 +712,7 @@ func (s *Scanner) ScanAll() ([]*Site, error) {
 	sites, err := s.scanWithApacheCtl()
 	if err == nil && len(sites) > 0 {
 		s.logDebug("使用 apachectl -S 扫描成功，发现 %d 个站点", len(sites))
-		return sites, nil
+		return s.resolveSitePaths(sites)
 	}
 	if err != nil {
 		s.logDebug("apachectl -S 扫描失败: %v，回退到文件扫描", err)
@@ -731,7 +732,64 @@ func (s *Scanner) ScanAll() ([]*Site, error) {
 	s.scannedFiles = make(map[string]bool)
 
 	// 从主配置文件开始递归扫描
-	return s.scanAllConfigFile(s.mainConfigPath)
+	allSites, err := s.scanAllConfigFile(s.mainConfigPath)
+	if err != nil {
+		return nil, err
+	}
+	return s.resolveSitePaths(allSites)
+}
+
+// resolveSitePaths 将站点中相对的证书/私钥/证书链路径解析为绝对路径
+// prefix 未知且存在相对路径时返回 *sslerrors.PrefixUnknownError
+func (s *Scanner) resolveSitePaths(sites []*Site) ([]*Site, error) {
+	// 先收集使用相对路径的站点
+	var affected []sslerrors.AffectedSite
+	for _, site := range sites {
+		if hasRelativeCertPath(site) {
+			affected = append(affected, sslerrors.AffectedSite{
+				ServerName:      site.ServerName,
+				ConfigFile:      site.ConfigFile,
+				CertificatePath: site.CertificatePath,
+				PrivateKeyPath:  site.PrivateKeyPath,
+				ChainPath:       site.ChainPath,
+			})
+		}
+	}
+
+	// 没有相对路径：直接返回
+	if len(affected) == 0 {
+		return sites, nil
+	}
+
+	binaryPath := findApacheBinary()
+	prefix, candidates, ok := s.getApachePrefix(binaryPath)
+
+	// 无法可信地确定 prefix：阻断部署
+	if !ok {
+		return nil, &sslerrors.PrefixUnknownError{
+			ServerKind: sslerrors.ServerKindApache,
+			BinaryPath: binaryPath,
+			Candidates: candidates,
+			Sites:      affected,
+		}
+	}
+
+	// 有 prefix，原地解析相对路径
+	for _, site := range sites {
+		if site.CertificatePath != "" && !filepath.IsAbs(site.CertificatePath) {
+			site.CertificatePath = filepath.Join(prefix, site.CertificatePath)
+		}
+		if site.PrivateKeyPath != "" && !filepath.IsAbs(site.PrivateKeyPath) {
+			site.PrivateKeyPath = filepath.Join(prefix, site.PrivateKeyPath)
+		}
+		if site.ChainPath != "" && !filepath.IsAbs(site.ChainPath) {
+			site.ChainPath = filepath.Join(prefix, site.ChainPath)
+		}
+		if site.Webroot != "" && !filepath.IsAbs(site.Webroot) {
+			site.Webroot = filepath.Join(prefix, site.Webroot)
+		}
+	}
+	return sites, nil
 }
 
 // findApacheBinary 查找 Apache 可执行文件路径

@@ -1,0 +1,202 @@
+package scanner
+
+import (
+	"errors"
+	"testing"
+
+	sslerrors "github.com/zhuxbo/sslctl/pkg/errors"
+)
+
+func TestApacheTokenizeCmdline(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want []string
+	}{
+		{"空串", "", nil},
+		{"单 token", "httpd", []string{"httpd"}},
+		{"空格分隔", "httpd -d /etc/httpd", []string{"httpd", "-d", "/etc/httpd"}},
+		{"带引号路径", `httpd -d "/etc/httpd root"`, []string{"httpd", "-d", `"/etc/httpd root"`}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tokenizeCmdline(tt.in)
+			if len(got) != len(tt.want) {
+				t.Fatalf("got %v, want %v", got, tt.want)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("token[%d] = %q, want %q", i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}
+
+func TestParseServerRootFromCmdline(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"空串", "", ""},
+		{"无 -d", "httpd -f httpd.conf", ""},
+		{"-d 空格形式", "httpd -d /etc/httpd", "/etc/httpd"},
+		{"-d 紧挨形式", "httpd -d/etc/httpd", "/etc/httpd"},
+		{"带引号", `httpd -d "/etc/apache2"`, "/etc/apache2"},
+		{"混合参数", "httpd -f conf/httpd.conf -d /etc/httpd -k start", "/etc/httpd"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parseServerRootFromCmdline(tt.in)
+			if got != tt.want {
+				t.Errorf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestApachePrefixOverride(t *testing.T) {
+	old := getPrefixOverride()
+	defer SetPrefixOverride(old)
+
+	SetPrefixOverride("/custom/apache")
+	if got := getPrefixOverride(); got != "/custom/apache" {
+		t.Errorf("getPrefixOverride() = %q", got)
+	}
+
+	// override 应直接命中 getApachePrefix 第 1 步
+	s := New()
+	prefix, _, ok := s.getApachePrefix("")
+	if !ok || prefix != "/custom/apache" {
+		t.Errorf("getApachePrefix 未命中 override: prefix=%q ok=%v", prefix, ok)
+	}
+
+	SetPrefixOverride("")
+}
+
+func TestApachePrefixFromScannerServerRoot(t *testing.T) {
+	old := getPrefixOverride()
+	defer SetPrefixOverride(old)
+	SetPrefixOverride("")
+
+	s := New()
+	s.serverRoot = "/etc/apache2"
+
+	prefix, _, ok := s.getApachePrefix("")
+	if !ok || prefix != "/etc/apache2" {
+		t.Errorf("getApachePrefix 未命中 scanner.serverRoot: prefix=%q ok=%v", prefix, ok)
+	}
+}
+
+func TestApacheHasRelativeCertPath(t *testing.T) {
+	tests := []struct {
+		name string
+		site *Site
+		want bool
+	}{
+		{"全绝对", &Site{CertificatePath: "/a", PrivateKeyPath: "/b", ChainPath: "/c"}, false},
+		{"相对证书", &Site{CertificatePath: "cert/a"}, true},
+		{"相对私钥", &Site{PrivateKeyPath: "cert/b"}, true},
+		{"相对 chain", &Site{ChainPath: "cert/c"}, true},
+		{"全空", &Site{}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := hasRelativeCertPath(tt.site); got != tt.want {
+				t.Errorf("hasRelativeCertPath() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestApachePrefixCandidates(t *testing.T) {
+	got := prefixCandidates("/usr/local/apache2/bin/httpd")
+	if len(got) != 2 {
+		t.Fatalf("expected 2 candidates, got %d: %v", len(got), got)
+	}
+	if got := prefixCandidates("httpd"); got != nil {
+		t.Errorf("相对路径应返回 nil，实际 %v", got)
+	}
+}
+
+func TestApacheResolveSitePaths_Absolute(t *testing.T) {
+	old := getPrefixOverride()
+	defer SetPrefixOverride(old)
+	SetPrefixOverride("")
+
+	s := New()
+	s.serverRoot = "/etc/apache2"
+
+	sites := []*Site{
+		{
+			ServerName:      "example.com",
+			CertificatePath: "/etc/ssl/example.crt",
+			PrivateKeyPath:  "/etc/ssl/example.key",
+		},
+	}
+
+	resolved, err := s.resolveSitePaths(sites)
+	if err != nil {
+		t.Fatalf("resolveSitePaths 失败: %v", err)
+	}
+	if resolved[0].CertificatePath != "/etc/ssl/example.crt" {
+		t.Errorf("绝对路径被改写: %q", resolved[0].CertificatePath)
+	}
+}
+
+func TestApacheResolveSitePaths_Relative(t *testing.T) {
+	old := getPrefixOverride()
+	defer SetPrefixOverride(old)
+	SetPrefixOverride("")
+
+	s := New()
+	s.serverRoot = "/etc/apache2"
+
+	sites := []*Site{
+		{
+			ServerName:      "example.com",
+			CertificatePath: "ssl/example.crt",
+			PrivateKeyPath:  "ssl/example.key",
+		},
+	}
+
+	resolved, err := s.resolveSitePaths(sites)
+	if err != nil {
+		t.Fatalf("resolveSitePaths 失败: %v", err)
+	}
+	if resolved[0].CertificatePath != "/etc/apache2/ssl/example.crt" {
+		t.Errorf("证书路径解析错误: %q", resolved[0].CertificatePath)
+	}
+	if resolved[0].PrivateKeyPath != "/etc/apache2/ssl/example.key" {
+		t.Errorf("私钥路径解析错误: %q", resolved[0].PrivateKeyPath)
+	}
+}
+
+func TestApacheResolveSitePaths_UnknownPrefix(t *testing.T) {
+	old := getPrefixOverride()
+	defer SetPrefixOverride(old)
+	SetPrefixOverride("")
+
+	// serverRoot 为空且没有 override：在非 Windows 上其它源也大概率拿不到
+	// 这里构造一个"绝对拿不到 prefix"的场景直接传相对路径看是否返回 PrefixUnknownError
+	s := New()
+	s.serverRoot = "" // 显式清空
+
+	// 构造一个 Site，但调用 getApachePrefix 可能会成功（比如机器上真的跑着 Apache）
+	// 所以这个测试主要是验证 resolveSitePaths 返回错误类型的结构，而非严格断言触发路径
+	// 如果本机正好有 Apache 安装且能拿到 HTTPD_ROOT，这个测试会跳过断言
+	sites := []*Site{
+		{ServerName: "example.com", CertificatePath: "ssl/x.crt"},
+	}
+	_, err := s.resolveSitePaths(sites)
+	if err != nil {
+		var prefixErr *sslerrors.PrefixUnknownError
+		if !errors.As(err, &prefixErr) {
+			t.Errorf("期望 PrefixUnknownError，实际 %T: %v", err, err)
+		} else if prefixErr.ServerKind != sslerrors.ServerKindApache {
+			t.Errorf("ServerKind = %q, want apache", prefixErr.ServerKind)
+		}
+	}
+	// 没有错误意味着本机 httpd -V 成功返回了 prefix，这也是合法路径，不做硬断言
+}

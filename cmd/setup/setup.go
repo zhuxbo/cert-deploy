@@ -15,7 +15,10 @@ import (
 	"strings"
 	"time"
 
+	apacheScanner "github.com/zhuxbo/sslctl/internal/apache/scanner"
+	nginxScanner "github.com/zhuxbo/sslctl/internal/nginx/scanner"
 	"github.com/zhuxbo/sslctl/pkg/config"
+	sslerrors "github.com/zhuxbo/sslctl/pkg/errors"
 	"github.com/zhuxbo/sslctl/pkg/fetcher"
 	"github.com/zhuxbo/sslctl/pkg/logger"
 	"github.com/zhuxbo/sslctl/pkg/matcher"
@@ -52,6 +55,8 @@ func Run(args []string, debug bool) {
 	webroot := fs.String("webroot", "", "文件验证的 Web 根目录（隐含 --file-validation）")
 	yes := fs.Bool("yes", false, "跳过确认提示")
 	noService := fs.Bool("no-service", false, "不安装守护服务")
+	nginxPrefix := fs.String("nginx-prefix", "", "显式指定 nginx 相对路径解析基准（仅本次生效，不写入配置）")
+	apachePrefix := fs.String("apache-prefix", "", "显式指定 Apache ServerRoot 解析基准（仅本次生效，不写入配置）")
 
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, "用法:\n")
@@ -86,6 +91,14 @@ func Run(args []string, debug bool) {
 	if *apiURL == "" || *token == "" {
 		fs.Usage()
 		os.Exit(1)
+	}
+
+	// --nginx-prefix / --apache-prefix 仅在本次进程内生效，影响扫描器的相对路径解析
+	if *nginxPrefix != "" {
+		nginxScanner.SetPrefixOverride(*nginxPrefix)
+	}
+	if *apachePrefix != "" {
+		apacheScanner.SetPrefixOverride(*apachePrefix)
 	}
 
 	if err := util.CheckRootPrivilege(); err != nil {
@@ -517,6 +530,13 @@ func scanSites(serverType string, log *logger.Logger) []*matcher.ScannedSiteInfo
 	// 扫描站点
 	allSites, err := scanner.Scan()
 	if err != nil {
+		// Prefix 未知是阻塞性错误：打印修复指引并中止，避免写入错误位置
+		var prefixErr *sslerrors.PrefixUnknownError
+		if errors.As(err, &prefixErr) {
+			log.Error("%s prefix 未知，部署中止", serverType)
+			fmt.Fprint(os.Stderr, prefixErr.RenderHint())
+			os.Exit(1)
+		}
 		log.Error("扫描 %s 失败: %v", serverType, err)
 		return sites
 	}

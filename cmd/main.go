@@ -18,9 +18,12 @@ import (
 	"github.com/zhuxbo/sslctl/cmd/setup"
 	// 空白导入以触发 webserver 工厂注册
 	_ "github.com/zhuxbo/sslctl/internal"
+	apacheScanner "github.com/zhuxbo/sslctl/internal/apache/scanner"
+	nginxScanner "github.com/zhuxbo/sslctl/internal/nginx/scanner"
 	"github.com/zhuxbo/sslctl/pkg/backup"
 	"github.com/zhuxbo/sslctl/pkg/certops"
 	"github.com/zhuxbo/sslctl/pkg/config"
+	sslerrors "github.com/zhuxbo/sslctl/pkg/errors"
 	"github.com/zhuxbo/sslctl/pkg/logger"
 	"github.com/zhuxbo/sslctl/pkg/service"
 	"github.com/zhuxbo/sslctl/pkg/upgrade"
@@ -184,6 +187,8 @@ func runWindowsService() {
 func runScan(args []string, debug bool) {
 	fs := flag.NewFlagSet("scan", flag.ExitOnError)
 	sslOnly := fs.Bool("ssl-only", false, "仅扫描 SSL 站点")
+	nginxPrefix := fs.String("nginx-prefix", "", "显式指定 nginx 相对路径解析基准（仅本次生效，不写入配置）")
+	apachePrefix := fs.String("apache-prefix", "", "显式指定 Apache ServerRoot 解析基准（仅本次生效，不写入配置）")
 
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, "用法: sslctl scan [选项]\n\n选项:\n")
@@ -192,6 +197,13 @@ func runScan(args []string, debug bool) {
 
 	if err := fs.Parse(args); err != nil {
 		os.Exit(1)
+	}
+
+	if *nginxPrefix != "" {
+		nginxScanner.SetPrefixOverride(*nginxPrefix)
+	}
+	if *apachePrefix != "" {
+		apacheScanner.SetPrefixOverride(*apachePrefix)
 	}
 
 	cfgManager, err := config.NewConfigManager()
@@ -218,6 +230,11 @@ func runScan(args []string, debug bool) {
 		SSLOnly: *sslOnly,
 	})
 	if err != nil {
+		var prefixErr *sslerrors.PrefixUnknownError
+		if errors.As(err, &prefixErr) {
+			fmt.Fprint(os.Stderr, prefixErr.RenderHint())
+			os.Exit(1)
+		}
 		fmt.Fprintf(os.Stderr, "扫描失败: %v\n", err)
 		os.Exit(1)
 	}

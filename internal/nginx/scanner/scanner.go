@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -12,9 +13,11 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/zhuxbo/sslctl/internal/executor"
+	sslerrors "github.com/zhuxbo/sslctl/pkg/errors"
 	"github.com/zhuxbo/sslctl/pkg/matcher"
 	"github.com/zhuxbo/sslctl/pkg/util"
 )
@@ -804,6 +807,11 @@ func (s *Scanner) ScanAll() ([]*Site, error) {
 			s.logDebug("使用 nginx -T 扫描成功，发现 %d 个站点", len(sites))
 			return sites, nil
 		}
+		// PrefixUnknownError 是硬错误，不回退到文件扫描（回退会丢失相对路径信息）
+		var prefixErr *sslerrors.PrefixUnknownError
+		if errors.As(err, &prefixErr) {
+			return nil, err
+		}
 		if err != nil {
 			s.logDebug("nginx -T 扫描失败: %v，回退到文件扫描", err)
 		}
@@ -823,7 +831,51 @@ func (s *Scanner) ScanAll() ([]*Site, error) {
 	s.scannedFiles = make(map[string]bool)
 
 	// 从主配置文件开始递归扫描
-	return s.scanAllConfigFile(s.mainConfigPath, 0)
+	allSites, err := s.scanAllConfigFile(s.mainConfigPath, 0)
+	if err != nil {
+		return nil, err
+	}
+	return resolveSitePaths(allSites)
+}
+
+// resolveSitePaths 将站点中相对的证书/私钥路径解析为绝对路径
+// prefix 未知且存在相对路径时返回 *sslerrors.PrefixUnknownError
+func resolveSitePaths(sites []*Site) ([]*Site, error) {
+	var affected []sslerrors.AffectedSite
+	for _, site := range sites {
+		if hasRelativeCertPath(site) {
+			affected = append(affected, sslerrors.AffectedSite{
+				ServerName:      site.ServerName,
+				ConfigFile:      site.ConfigFile,
+				CertificatePath: site.CertificatePath,
+				PrivateKeyPath:  site.PrivateKeyPath,
+			})
+		}
+	}
+	if len(affected) == 0 {
+		return sites, nil
+	}
+
+	nginxPath := findNginxBinary()
+	prefix, candidates, ok := getNginxPrefix(nginxPath)
+
+	if !ok {
+		return nil, &sslerrors.PrefixUnknownError{
+			ServerKind: sslerrors.ServerKindNginx,
+			BinaryPath: nginxPath,
+			Candidates: candidates,
+			Sites:      affected,
+		}
+	}
+
+	if prefix != "" {
+		for _, site := range sites {
+			site.CertificatePath = resolveNginxPath(prefix, site.CertificatePath)
+			site.PrivateKeyPath = resolveNginxPath(prefix, site.PrivateKeyPath)
+			site.Webroot = resolveNginxPath(prefix, site.Webroot)
+		}
+	}
+	return sites, nil
 }
 
 // findNginxBinary 查找 nginx 可执行文件路径
@@ -883,17 +935,176 @@ func buildNginxArgs(nginxPath string, args ...string) []string {
 	return args
 }
 
-// getNginxPrefix 从 nginx 二进制路径推导 prefix 目录
-// 返回空字符串表示不需要特殊处理（Linux 或路径无效）
-func getNginxPrefix(nginxPath string) string {
+// prefixOverride 由 CLI 层通过 SetPrefixOverride 设置，对应 --nginx-prefix
+// 仅在当前进程内生效，不写入配置文件
+var (
+	prefixOverride   string
+	prefixOverrideMu sync.RWMutex
+)
+
+// SetPrefixOverride 设置 nginx prefix 显式覆盖值
+// 由 CLI 层在解析 --nginx-prefix 后调用。传入空字符串等价于清除。
+func SetPrefixOverride(prefix string) {
+	prefixOverrideMu.Lock()
+	defer prefixOverrideMu.Unlock()
+	prefixOverride = prefix
+}
+
+func getPrefixOverride() string {
+	prefixOverrideMu.RLock()
+	defer prefixOverrideMu.RUnlock()
+	return prefixOverride
+}
+
+// prefixCandidates 返回 Windows 下常见的 prefix 候选路径
+// 按使用频率排序：nginx.exe 所在目录（手动启动）、conf 子目录（面板场景）
+func prefixCandidates(nginxPath string) []string {
 	if !filepath.IsAbs(nginxPath) {
-		return ""
+		return nil
 	}
 	dir := filepath.Dir(nginxPath)
-	if _, err := os.Stat(filepath.Join(dir, "conf", "nginx.conf")); err == nil {
-		return dir
+	return []string{
+		dir + string(filepath.Separator),
+		filepath.Join(dir, "conf") + string(filepath.Separator),
+	}
+}
+
+// getNginxPrefix 以多策略探测 nginx 相对路径的解析基准（prefix）
+// 返回：
+//   - prefix: 推测的 prefix 目录（空表示未知）
+//   - candidates: 常见候选路径（仅 Windows 有意义，供失败时提示）
+//   - ok: 是否可信地确定了 prefix
+//
+// 策略优先级：显式 override > nginx -V --prefix= > 运行进程 -p 参数 > error.log 启发式
+func getNginxPrefix(nginxPath string) (prefix string, candidates []string, ok bool) {
+	// 1. 显式 override（--nginx-prefix）
+	if p := getPrefixOverride(); p != "" {
+		return p, nil, true
+	}
+
+	// 2. nginx -V --prefix=（编译时 prefix，跨平台最可靠）
+	if p := getPrefixFromVersion(); p != "" {
+		return p, nil, true
+	}
+
+	// 3. Windows 运行进程命令行的 -p 参数
+	if runtime.GOOS == "windows" {
+		if p := getPrefixFromProcessCmdline(); p != "" {
+			return p, nil, true
+		}
+	}
+
+	// Linux 通常走不到这里（编译时 --prefix 非空），返回空让 resolveNginxPath 原样透传
+	if runtime.GOOS != "windows" {
+		return "", nil, false
+	}
+
+	candidates = prefixCandidates(nginxPath)
+	if len(candidates) == 0 {
+		return "", nil, false
+	}
+
+	// 4. error.log 启发式探测
+	//    nginx 启动即创建 logs/error.log，其路径同样受 prefix 解析影响
+	dir := filepath.Dir(nginxPath)
+	if _, err := os.Stat(filepath.Join(dir, "logs", "error.log")); err == nil {
+		return dir + string(filepath.Separator), candidates, true
+	}
+	if _, err := os.Stat(filepath.Join(dir, "conf", "logs", "error.log")); err == nil {
+		return filepath.Join(dir, "conf") + string(filepath.Separator), candidates, true
+	}
+
+	// 全部策略失败
+	return "", candidates, false
+}
+
+// getPrefixFromVersion 通过 nginx -V 输出解析编译时 --prefix=
+func getPrefixFromVersion() string {
+	nginxPath := findNginxBinary()
+	var output []byte
+	if nginxPath != "" {
+		output, _ = executor.RunScan(nginxPath, "-V")
+	}
+	if len(output) == 0 {
+		output, _ = executor.RunOutput("nginx -V")
+	}
+	if len(output) == 0 {
+		return ""
+	}
+	re := regexp.MustCompile(`--prefix=([^\s]+)`)
+	matches := re.FindSubmatch(output)
+	if len(matches) <= 1 {
+		return ""
+	}
+	p := strings.TrimSpace(string(matches[1]))
+	if p == "" || !filepath.IsAbs(p) {
+		return ""
+	}
+	return p
+}
+
+// getPrefixFromProcessCmdline 从运行中的 nginx 进程命令行解析 -p 参数
+// Windows 专用，使用 PowerShell Get-CimInstance 读取 Win32_Process.CommandLine
+// 失败时（权限不足 / PowerShell 不可用）返回空字符串
+func getPrefixFromProcessCmdline() string {
+	if runtime.GOOS != "windows" {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), processTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "powershell", "-NoProfile", "-NonInteractive", "-Command",
+		"Get-CimInstance Win32_Process -Filter \"Name='nginx.exe'\" | Select-Object -ExpandProperty CommandLine -First 1")
+	output, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return parsePrefixFromCmdline(string(output))
+}
+
+// parsePrefixFromCmdline 从完整命令行解析 -p 参数值
+// 支持 -p value、-p"value"、-p "value" 三种形式
+func parsePrefixFromCmdline(cmdline string) string {
+	cmdline = strings.TrimSpace(cmdline)
+	if cmdline == "" {
+		return ""
+	}
+	// 逐 token 扫描，处理带引号的路径
+	tokens := tokenizeCmdline(cmdline)
+	for i := 0; i < len(tokens); i++ {
+		tok := tokens[i]
+		if tok == "-p" && i+1 < len(tokens) {
+			return strings.Trim(tokens[i+1], `"'`)
+		}
+		if strings.HasPrefix(tok, "-p") && len(tok) > 2 {
+			return strings.Trim(tok[2:], `"'`)
+		}
 	}
 	return ""
+}
+
+// tokenizeCmdline 按空白切分命令行，尊重双引号
+func tokenizeCmdline(s string) []string {
+	var tokens []string
+	var cur strings.Builder
+	inQuote := false
+	for _, r := range s {
+		switch {
+		case r == '"':
+			inQuote = !inQuote
+			cur.WriteRune(r)
+		case (r == ' ' || r == '\t') && !inQuote:
+			if cur.Len() > 0 {
+				tokens = append(tokens, cur.String())
+				cur.Reset()
+			}
+		default:
+			cur.WriteRune(r)
+		}
+	}
+	if cur.Len() > 0 {
+		tokens = append(tokens, cur.String())
+	}
+	return tokens
 }
 
 // resolveNginxPath 将 nginx 配置中的相对路径解析为绝对路径
@@ -1060,16 +1271,19 @@ func (s *Scanner) scanWithNginxT() ([]*Site, error) {
 
 	sites := rawBlocksToSites(blocks)
 
-	// 解析相对路径：Windows 上 nginx 配置常用相对路径，需基于 prefix 目录转为绝对路径
-	if prefix := getNginxPrefix(nginxPath); prefix != "" {
-		for _, site := range sites {
-			site.CertificatePath = resolveNginxPath(prefix, site.CertificatePath)
-			site.PrivateKeyPath = resolveNginxPath(prefix, site.PrivateKeyPath)
-			site.Webroot = resolveNginxPath(prefix, site.Webroot)
-		}
-	}
+	// 解析相对路径：配置中的相对路径需基于 prefix 目录转为绝对路径
+	return resolveSitePaths(sites)
+}
 
-	return sites, nil
+// hasRelativeCertPath 判断站点的证书/私钥路径是否有相对路径
+func hasRelativeCertPath(site *Site) bool {
+	if site.CertificatePath != "" && !filepath.IsAbs(site.CertificatePath) {
+		return true
+	}
+	if site.PrivateKeyPath != "" && !filepath.IsAbs(site.PrivateKeyPath) {
+		return true
+	}
+	return false
 }
 
 // scanAllConfigFile 扫描配置文件中的所有站点（递归处理 include）

@@ -108,14 +108,35 @@ if ($Help) {
     exit 0
 }
 
-# 构建升级地址（参数传入 > 内置回落）
-$FallbackHost = "release.cnssl.com"
-if ($ReleaseHost) {
-    $ReleaseHost = $ReleaseHost.TrimEnd("/")
-    $ReleaseUrl = "https://$ReleaseHost/sslctl"
-} else {
-    $ReleaseUrl = "https://$FallbackHost/sslctl"
+# 发布目录探测
+# 先尝试根目录 https://{host}/sslctl，失败回落到 https://{host}/release/sslctl
+function Resolve-ReleaseUrl {
+    param([string]$Host_)
+    $Host_ = $Host_.TrimEnd("/")
+    if ($Host_ -match "^https?://") { return $Host_ }
+    $candidates = @("https://$Host_/sslctl", "https://$Host_/release/sslctl")
+    foreach ($base in $candidates) {
+        try {
+            $json = Invoke-RestMethod -Uri "$base/releases.json" -TimeoutSec 10 -ErrorAction Stop
+            if ($json.main -or $json.dev) {
+                return $base
+            }
+        } catch {}
+    }
+    return $null
 }
+
+$FallbackHost = "release.cnssl.com"
+$TargetHost = if ($ReleaseHost) { $ReleaseHost } else { $FallbackHost }
+
+Write-Info "探测发布目录..."
+$ReleaseUrl = Resolve-ReleaseUrl $TargetHost
+if (-not $ReleaseUrl) {
+    $h = $TargetHost.TrimEnd("/")
+    Write-Err "发布目录不可达: https://$h/sslctl/releases.json 与 https://$h/release/sslctl/releases.json 均无响应"
+    exit 1
+}
+Write-Info "使用发布地址: $ReleaseUrl"
 
 # --- 辅助函数 ---
 

@@ -83,14 +83,34 @@ done
 # 网络超时（秒），可通过环境变量覆盖
 TIMEOUT=${SSLCTL_TIMEOUT:-30}
 
-# 构建升级地址（参数传入 > 内置回落）
+# 发布目录探测
+# 先尝试根目录 https://{host}/sslctl，失败回落到 https://{host}/release/sslctl
+# 首个 releases.json 可访问的候选作为 RELEASE_URL
 FALLBACK_HOST="release.cnssl.com"
-if [ -n "$RELEASE_HOST" ]; then
-    RELEASE_HOST="${RELEASE_HOST%/}"
-    RELEASE_URL="https://$RELEASE_HOST/sslctl"
-else
-    RELEASE_URL="https://$FALLBACK_HOST/sslctl"
+RELEASE_HOST="${RELEASE_HOST:-$FALLBACK_HOST}"
+RELEASE_HOST="${RELEASE_HOST%/}"
+
+probe_release_url() {
+    local host="$1"
+    local candidate body
+    for suffix in "/sslctl" "/release/sslctl"; do
+        candidate="https://${host}${suffix}"
+        body=$(curl -s --connect-timeout 5 --max-time 10 "${candidate}/releases.json" 2>/dev/null || echo "")
+        if echo "$body" | grep -q '"latest"'; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+echo_info "探测发布目录..."
+RELEASE_URL=$(probe_release_url "$RELEASE_HOST")
+if [ -z "$RELEASE_URL" ]; then
+    echo_error "发布目录不可达: https://${RELEASE_HOST}/sslctl/releases.json 与 https://${RELEASE_HOST}/release/sslctl/releases.json 均无响应"
+    exit 1
 fi
+echo_info "使用发布地址: $RELEASE_URL"
 
 # 检查 root 权限
 if [ "$EUID" -ne 0 ]; then

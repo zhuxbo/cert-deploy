@@ -76,7 +76,8 @@ func setupWindowsConsole() {
 	// Windows 10+ 确认 VT 可用：允许 ANSI 颜色输出，并设置 UTF-8 代码页
 	vtEnabled = true
 	kernel32 := windows.NewLazySystemDLL("kernel32.dll")
-	kernel32.NewProc("SetConsoleOutputCP").Call(65001)
-	kernel32.NewProc("SetConsoleCP").Call(65001)
+	// 失败非致命：CP 切换失败不影响 VT 已开启的 ANSI 输出能力
+	_, _, _ = kernel32.NewProc("SetConsoleOutputCP").Call(65001)
+	_, _, _ = kernel32.NewProc("SetConsoleCP").Call(65001)
 	consoleDebugf("VT processing enabled, console CP set to 65001")
 }

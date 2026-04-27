@@ -230,6 +230,15 @@ CGO_ENABLED=0 go build -ldflags="-s -w" -o sslctl ./cmd
 
 测试文件已排除 gosec 和 errcheck 检查。
 
+**多平台 lint**：本项目含 Windows 专属源（`//go:build windows`），CI 与本地都需双平台 lint：
+
+```bash
+golangci-lint run --timeout=5m ./...                # Linux 视角
+GOOS=windows golangci-lint run --timeout=5m ./...   # Windows 视角（含 svc/mgr、kernel32 调用）
+```
+
+CI 在 lint job 中按顺序跑 Linux + Windows 两次，任一失败即整个 job 失败。本地提交前应同时跑这两条命令。
+
 ---
 
 ## 安全开发规范

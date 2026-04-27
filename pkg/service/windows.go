@@ -36,13 +36,13 @@ func (m *WindowsManager) Install() error {
 	if err != nil {
 		return fmt.Errorf("连接服务管理器失败: %w", err)
 	}
-	defer manager.Disconnect()
+	defer func() { _ = manager.Disconnect() }()
 
 	// 如果服务已存在，先停止并删除（支持 repair 场景）
 	if existing, openErr := manager.OpenService(m.cfg.Name); openErr == nil {
 		_, _ = existing.Control(svc.Stop)
 		_ = existing.Delete()
-		existing.Close()
+		_ = existing.Close()
 	}
 
 	// 创建服务（重试最多 60 秒，等待旧服务进程退出释放句柄）
@@ -62,21 +62,21 @@ func (m *WindowsManager) Install() error {
 			break
 		}
 		if i == 0 {
-			fmt.Fprint(os.Stderr, "等待旧服务退出")
+			_, _ = fmt.Fprint(os.Stdout, "等待旧服务退出")
 		}
-		fmt.Fprint(os.Stderr, ".")
+		_, _ = fmt.Fprint(os.Stdout, ".")
 		time.Sleep(time.Second)
 	}
 	if createErr != nil {
-		fmt.Fprintln(os.Stderr)
+		_, _ = fmt.Fprintln(os.Stdout)
 		return fmt.Errorf("创建服务失败: %w", createErr)
 	}
 	if s == nil {
 		return fmt.Errorf("创建服务失败")
 	}
 	// 清除等待输出
-	fmt.Fprint(os.Stderr, "\r                                                \r")
-	defer s.Close()
+	_, _ = fmt.Fprint(os.Stdout, "\r                                                \r")
+	defer func() { _ = s.Close() }()
 
 	// 设置恢复选项（失败后自动重启）
 	recoveryActions := []mgr.RecoveryAction{
@@ -84,9 +84,8 @@ func (m *WindowsManager) Install() error {
 		{Type: mgr.ServiceRestart, Delay: 30 * time.Second},
 		{Type: mgr.ServiceRestart, Delay: 30 * time.Second},
 	}
-	if err := s.SetRecoveryActions(recoveryActions, 86400); err != nil {
-		// 非致命错误，继续
-	}
+	// 失败非致命：恢复策略未配置不影响服务正常运行
+	_ = s.SetRecoveryActions(recoveryActions, 86400)
 
 	return nil
 }
@@ -97,13 +96,13 @@ func (m *WindowsManager) Uninstall() error {
 	if err != nil {
 		return fmt.Errorf("连接服务管理器失败: %w", err)
 	}
-	defer manager.Disconnect()
+	defer func() { _ = manager.Disconnect() }()
 
 	s, err := manager.OpenService(m.cfg.Name)
 	if err != nil {
 		return nil // 服务不存在
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	// 停止服务并等待退出（忽略错误，服务可能已停止）
 	if _, err := s.Control(svc.Stop); err == nil {
@@ -131,13 +130,13 @@ func (m *WindowsManager) Start() error {
 	if err != nil {
 		return fmt.Errorf("连接服务管理器失败: %w", err)
 	}
-	defer manager.Disconnect()
+	defer func() { _ = manager.Disconnect() }()
 
 	s, err := manager.OpenService(m.cfg.Name)
 	if err != nil {
 		return fmt.Errorf("打开服务失败: %w", err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	if err := s.Start(); err != nil {
 		return fmt.Errorf("启动服务失败: %w", err)
@@ -152,14 +151,14 @@ func (m *WindowsManager) Stop() error {
 	if err != nil {
 		return fmt.Errorf("连接服务管理器失败: %w", err)
 	}
-	defer manager.Disconnect()
+	defer func() { _ = manager.Disconnect() }()
 
 	s, err := manager.OpenService(m.cfg.Name)
 	if err != nil {
 		// 服务不存在视为已停止
 		return nil
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	if _, err := s.Control(svc.Stop); err != nil {
 		// 可能已停止，检查状态
@@ -175,17 +174,17 @@ func (m *WindowsManager) Stop() error {
 		st, err := s.Query()
 		if err != nil || st.State == svc.Stopped {
 			if i > 0 {
-				fmt.Fprintln(os.Stderr)
+				_, _ = fmt.Fprintln(os.Stdout)
 			}
 			return nil
 		}
 		if i == 0 {
-			fmt.Fprint(os.Stderr, "等待服务退出")
+			_, _ = fmt.Fprint(os.Stdout, "等待服务退出")
 		}
-		fmt.Fprint(os.Stderr, ".")
+		_, _ = fmt.Fprint(os.Stdout, ".")
 		time.Sleep(time.Second)
 	}
-	fmt.Fprintln(os.Stderr)
+	_, _ = fmt.Fprintln(os.Stdout)
 	return nil
 }
 
@@ -205,13 +204,13 @@ func (m *WindowsManager) Status() (*Status, error) {
 	if err != nil {
 		return status, nil
 	}
-	defer manager.Disconnect()
+	defer func() { _ = manager.Disconnect() }()
 
 	s, err := manager.OpenService(m.cfg.Name)
 	if err != nil {
 		return status, nil
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	st, err := s.Query()
 	if err != nil {
@@ -234,13 +233,13 @@ func (m *WindowsManager) Enable() error {
 	if err != nil {
 		return fmt.Errorf("连接服务管理器失败: %w", err)
 	}
-	defer manager.Disconnect()
+	defer func() { _ = manager.Disconnect() }()
 
 	s, err := manager.OpenService(m.cfg.Name)
 	if err != nil {
 		return fmt.Errorf("打开服务失败: %w", err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	cfg, err := s.Config()
 	if err != nil {
@@ -261,13 +260,13 @@ func (m *WindowsManager) Disable() error {
 	if err != nil {
 		return nil
 	}
-	defer manager.Disconnect()
+	defer func() { _ = manager.Disconnect() }()
 
 	s, err := manager.OpenService(m.cfg.Name)
 	if err != nil {
 		return nil
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	cfg, err := s.Config()
 	if err != nil {
@@ -295,6 +294,9 @@ func IsWindowsService() bool {
 // handler 接收 context，服务停止时 context 被取消，handler 应在 ctx.Done() 后尽快返回
 func RunAsService(name string, handler func(ctx context.Context)) error {
 	ctx, cancel := context.WithCancel(context.Background())
+	// svc.Run 阻塞至服务退出；defer 兜底确保 handler 自然结束（Execute 的 <-done 分支
+	// 不会主动调 cancel）时也释放 context，cancel 幂等多次调用安全。
+	defer cancel()
 	return svc.Run(name, &serviceHandler{handler: handler, ctx: ctx, cancel: cancel})
 }
 
@@ -360,18 +362,19 @@ func (m *WindowsManager) InstallWithSC() error {
 		return fmt.Errorf("创建服务失败: %w\n%s", err, output)
 	}
 
-	// 设置描述
-	exec.Command("sc", "description", m.cfg.Name, m.cfg.Description).Run()
+	// 设置描述（失败非致命）
+	_ = exec.Command("sc", "description", m.cfg.Name, m.cfg.Description).Run()
 
-	// 设置失败后重启
-	exec.Command("sc", "failure", m.cfg.Name, "reset=86400", "actions=restart/30000/restart/30000/restart/30000").Run()
+	// 设置失败后重启（失败非致命）
+	_ = exec.Command("sc", "failure", m.cfg.Name, "reset=86400", "actions=restart/30000/restart/30000/restart/30000").Run()
 
 	return nil
 }
 
 // UninstallWithSC 使用 sc.exe 卸载服务（备用方案）
 func (m *WindowsManager) UninstallWithSC() error {
-	exec.Command("sc", "stop", m.cfg.Name).Run()
+	// 停止失败可能是因为服务已停止或不存在，继续 delete 即可
+	_ = exec.Command("sc", "stop", m.cfg.Name).Run()
 	time.Sleep(time.Second)
 
 	cmd := exec.Command("sc", "delete", m.cfg.Name)

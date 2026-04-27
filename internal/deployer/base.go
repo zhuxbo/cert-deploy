@@ -14,7 +14,11 @@ import (
 	"github.com/zhuxbo/sslctl/internal/executor"
 	"github.com/zhuxbo/sslctl/pkg/errors"
 	"github.com/zhuxbo/sslctl/pkg/util"
+	"github.com/zhuxbo/sslctl/pkg/webserver"
 )
+
+// restartWindowsServiceFunc 包一层方便测试替换；默认调用 webserver.RestartWindowsService。
+var restartWindowsServiceFunc = webserver.RestartWindowsService
 
 // Config 部署器配置
 type Config struct {
@@ -41,9 +45,14 @@ func (b *Base) TestConfig() error {
 
 // NeedsProcessRestart 检测是否需要通过进程重启方式重载（Windows 非服务模式）
 // 返回 true 时部署过程会短暂中断服务
+// 注意：若 ReloadCommand 是 winsvc: 哨兵（已识别为 Windows 服务），走 SCM 路径
+// 也会有 stop+start 的短暂中断，因此一并视为需要进程级重启。
 func (b *Base) NeedsProcessRestart() bool {
 	if runtime.GOOS != "windows" || b.ReloadCommand == "" {
 		return false
+	}
+	if strings.HasPrefix(b.ReloadCommand, webserver.WinSvcReloadPrefix) {
+		return true
 	}
 	// 尝试执行 reload 命令的 dry run：解析命令但不执行，
 	// 通过命令特征判断是否依赖服务注册（-k graceful / -s reload）
@@ -53,11 +62,18 @@ func (b *Base) NeedsProcessRestart() bool {
 
 // ReloadService 重载服务
 // 优先使用服务管理命令；失败时尝试回退策略：
+// - Windows 已识别为服务（winsvc: 哨兵）：直接走 SCM Stop+Start
 // - Linux 容器环境（无 systemd）：先发送 SIGUSR1 再执行 reload 命令
-// - Windows 非服务模式：回退到进程重启
+// - Windows 非服务模式：reload 命令失败时回退到进程重启
 func (b *Base) ReloadService() error {
 	if b.ReloadCommand == "" {
 		return nil
+	}
+
+	// Windows 服务路径：detector 已识别 nginx/apache 为 Windows 服务
+	if strings.HasPrefix(b.ReloadCommand, webserver.WinSvcReloadPrefix) {
+		svcName := strings.TrimPrefix(b.ReloadCommand, webserver.WinSvcReloadPrefix)
+		return restartWindowsServiceFunc(svcName)
 	}
 
 	// Linux 容器环境预检：如果 systemd 不可用且命令涉及 httpd/apache，
@@ -78,8 +94,12 @@ func (b *Base) ReloadService() error {
 		return err
 	}
 	msg := err.Error()
+	// "Access is denied" 兜底：调用方与 nginx/apache master 进程权限不一致时
+	// （典型：master 由 SYSTEM 启动，sslctl 由 Administrator 调用），
+	// OpenEvent 会被 Windows 拒绝；此时 reload 命令必败，进程重启可恢复。
 	if !strings.Contains(msg, "No installed service") &&
-		!strings.Contains(msg, "could not open error log") {
+		!strings.Contains(msg, "could not open error log") &&
+		!strings.Contains(msg, "Access is denied") {
 		return err
 	}
 

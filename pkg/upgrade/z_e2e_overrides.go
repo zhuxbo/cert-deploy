@@ -18,4 +18,5 @@ func init() {
 	validateReleaseURL = func(_ string) (*http.Client, error) {
 		return &http.Client{Timeout: 5 * time.Minute}, nil
 	}
+	validateDownloadURL = func(_ string) error { return nil }
 }

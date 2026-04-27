@@ -29,15 +29,19 @@ go test -race -count=1 ./...
 
 ## 3. Lint 检查
 
+本项目含 Windows 专属源（`svc/mgr`、`kernel32` 等），lint 必须双平台同时跑：
+
 ```bash
-golangci-lint run ./... --timeout=5m
+golangci-lint run ./... --timeout=5m                 # Linux 视角
+GOOS=windows golangci-lint run ./... --timeout=5m    # Windows 视角
 ```
 
-本项目启用的检查器：errcheck、govet、staticcheck、gosec、unused、ineffassign。
+启用的检查器：errcheck、govet、staticcheck、gosec、unused、ineffassign。
 测试文件已排除 gosec 和 errcheck，`docker/test/mock-api/` 已排除 gosec。
 
-- 如果有 lint 错误，修复代码
+- 任一平台报错都必须修复
 - 不要通过添加 `//nolint` 注释来绕过检查，除非有充分理由并加注释说明
+- 跨平台 lint 在任意机器上都能跑，无需 Windows 物理机
 
 ## 4. Go 项目专项检查
 

@@ -4,6 +4,7 @@ package internal
 
 import (
 	"context"
+	"errors"
 
 	apacheDeployer "github.com/zhuxbo/sslctl/internal/apache/deployer"
 	apacheDocker "github.com/zhuxbo/sslctl/internal/apache/docker"
@@ -14,6 +15,7 @@ import (
 	nginxDocker "github.com/zhuxbo/sslctl/internal/nginx/docker"
 	nginxInstaller "github.com/zhuxbo/sslctl/internal/nginx/installer"
 	nginxScanner "github.com/zhuxbo/sslctl/internal/nginx/scanner"
+	sslerrors "github.com/zhuxbo/sslctl/pkg/errors"
 	"github.com/zhuxbo/sslctl/pkg/webserver"
 )
 
@@ -77,6 +79,13 @@ type nginxScannerAdapter struct {
 func (a *nginxScannerAdapter) Scan() ([]webserver.Site, error) {
 	// 统一扫描入口：本地和 Docker 独立扫描，互不阻塞
 	localSites, localErr := a.ScanLocal()
+
+	// PrefixUnknownError 是阻塞性错误：相对路径写错位置会导致静默失败，
+	// 必须直接传递到 CLI 层渲染修复指引，不能被 Docker 成功结果掩盖
+	var prefixErr *sslerrors.PrefixUnknownError
+	if errors.As(localErr, &prefixErr) {
+		return nil, localErr
+	}
 
 	dockerSites, _ := a.ScanDocker()
 
@@ -220,6 +229,12 @@ type apacheScannerAdapter struct {
 
 func (a *apacheScannerAdapter) Scan() ([]webserver.Site, error) {
 	localSites, localErr := a.ScanLocal()
+
+	// PrefixUnknownError 是阻塞性错误，需穿透到 CLI 层渲染修复指引
+	var prefixErr *sslerrors.PrefixUnknownError
+	if errors.As(localErr, &prefixErr) {
+		return nil, localErr
+	}
 
 	dockerSites, _ := a.ScanDocker()
 

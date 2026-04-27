@@ -159,13 +159,13 @@ docker/test/
 ## 代码质量
 
 - CI 全绿（Test + Lint + Build），支持 linux/amd64、linux/arm64、windows/amd64 交叉编译
-- golangci-lint 配置：errcheck、govet、staticcheck、gosec、unused、ineffassign（排除 G101/G204/G306 误报）
+- golangci-lint 配置：errcheck、govet、staticcheck、gosec、unused、ineffassign（排除 G101/G204/G306 误报）；CI 同时跑 Linux 与 `GOOS=windows` 两轮 lint，覆盖 Windows 专属源（svc/mgr、kernel32 等）
 - 接口参数命名统一（`Deployer.Deploy` 接口参数名与 Nginx/Apache 实现一致使用 `intermediate`）
 - Windows 服务管理错误处理完善（`Control`/`UpdateConfig` 返回值均已检查）
 - 测试覆盖率 48%+，核心包 `pkg/errors` 100%，`pkg/config` 76%，`pkg/backup` 85%，`pkg/upgrade` 78%，`pkg/service` 39%，`apache/scanner` 75%，`nginx/docker` 51%
 - 结构化部署错误（`StructuredDeployError`）支持类型分类、阶段定位和可重试判断
 - 平台相关代码使用 Build Tag 隔离（`inode_unix.go`/`inode_windows.go`、`selinux_linux.go`、`console_windows.go`、`detach_unix.go`/`detach_windows.go`）
-- Windows 控制台 UTF-8 编码自动设置（`cmd/console_windows.go`，SetConsoleOutputCP + ANSI 虚拟终端支持）
+- Windows 控制台分版本处理（`cmd/console_windows.go`）：Win10/Server2016+ 通过 `SetConsoleMode` 开 VT 后回读验证，确认成功才设置 UTF-8 CP 并启用 ANSI 颜色；老系统（Server 2012 R2 等）完全不动控制台 CP 和字体，避免触发 Windows 把字体自动切换回 Raster Font 覆盖用户手动设的 TrueType 字体；`SSLCTL_CONSOLE_DEBUG=1` 开启启动期 stderr 诊断
 
 ## 安全机制
 
@@ -185,7 +185,8 @@ docker/test/
 - 升级模块 TLS 安全（HTTPS + TLS 1.2+）
 - 升级流程平台差异化（Linux：先替换再重启，零停机；Windows：先停服务释放 exe 句柄再替换再启动，失败时恢复服务；Windows 上 rename 策略替换运行中 exe，重试等待文件句柄释放）
 - Windows 服务停止等待（`Stop()` 轮询至 `Stopped` 状态，确保进程完全退出后才返回）
-- Windows 非服务模式重载（reload 命令失败时回退到进程重启：taskkill → 等待守护进程拉起 → 否则手动启动）
+- Windows 非服务模式重载（reload 命令失败时回退到进程重启：taskkill → 等待守护进程拉起 → 否则手动启动；回退白名单含 `Access is denied`，覆盖 sslctl 与 SYSTEM master 进程权限错配场景）
+- Windows 服务模式重载（detector 检测到 nginx/apache 注册为 Windows 服务时，ReloadCmd 设为 `winsvc:<服务名>` 哨兵，`Base.ReloadService` 走 SCM Stop+Start 标准路径，避免 `nginx -s reload` 在跨权限边界 OpenEvent 失败）
 - 守护进程优雅停止（`RunAsService` 通过 context 通知 daemon，不再依赖 SIGTERM；Windows SCM 停止立即生效）
 - SELinux 兼容（部署后自动恢复文件安全上下文，`restorecon` 失败时返回错误）
 - IDN/Punycode 域名支持（`pkg/matcher`）

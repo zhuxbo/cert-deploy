@@ -39,6 +39,7 @@ powershell -ExecutionPolicy Bypass -File install.ps1 -ReleaseHost release.exampl
 > - 第一行 `SecurityProtocol` 用于启用 TLS 1.2（PowerShell 5.1 默认未启用），Server 2019+ 可省略
 > - 使用 `WebClient.DownloadFile` 而非 `irm -OutFile`，避免 PowerShell 5.1 编码转换导致中文乱码
 > - `-ExecutionPolicy Bypass` 绕过脚本签名限制，仅影响当前执行
+> - **Windows Server 2012 R2 等老系统若 PowerShell 中看到空白或中文乱码**：这是 PowerShell 默认 Raster Font（点阵字体）无法渲染 CJK 字符导致的，改字体即可修复——右键 PowerShell 窗口左上角图标 → 默认值 → 字体 → 选 Consolas 或 Lucida Console，关闭后重新打开窗口。cmd.exe 一般不受影响
 
 手动安装: 从 [Releases](https://release.example.com/sslctl/releases.json) 下载解压，重命名为 `sslctl`。
 

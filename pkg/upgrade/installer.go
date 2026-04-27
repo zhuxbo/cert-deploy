@@ -51,11 +51,19 @@ func DownloadBinary(url string) ([]byte, error) {
 	return downloadBinaryWithClient(url, secureHTTPClient())
 }
 
+// validateDownloadURL 下载 URL 安全校验（强制 HTTPS）
+// e2e 测试构建可通过 build tag 覆盖
+var validateDownloadURL = func(url string) error {
+	if !strings.HasPrefix(url, "https://") {
+		return &ErrReleaseSource{Msg: "下载失败: 仅允许 HTTPS 协议"}
+	}
+	return nil
+}
+
 // downloadBinaryWithClient 内部实现，接受 client 参数（便于测试）
 func downloadBinaryWithClient(url string, client *http.Client) ([]byte, error) {
-	// 安全校验：强制 HTTPS
-	if !strings.HasPrefix(url, "https://") {
-		return nil, &ErrReleaseSource{Msg: "下载失败: 仅允许 HTTPS 协议"}
+	if err := validateDownloadURL(url); err != nil {
+		return nil, err
 	}
 
 	resp, err := client.Get(url)

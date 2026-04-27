@@ -3,9 +3,11 @@ package certops
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/zhuxbo/sslctl/pkg/config"
+	sslerrors "github.com/zhuxbo/sslctl/pkg/errors"
 	"github.com/zhuxbo/sslctl/pkg/webserver"
 )
 
@@ -28,6 +30,11 @@ func (s *Service) ScanSites(ctx context.Context, opts ScanOptions) (*ScanResult,
 
 		sites, err := scanner.Scan()
 		if err != nil {
+			// PrefixUnknownError 是阻塞性错误，必须向上传递而非静默跳过
+			var prefixErr *sslerrors.PrefixUnknownError
+			if errors.As(err, &prefixErr) {
+				return nil, err
+			}
 			s.log.Debug("扫描 %s 站点失败: %v", serverType, err)
 			continue
 		}

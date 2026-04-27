@@ -207,6 +207,7 @@ GOOS=windows GOARCH=amd64 go build -o sslctl.exe ./cmd
 - `pkg/config/flock_unix.go` / `flock_windows.go` — 文件锁
 - `pkg/upgrade/exec_unix.go` / `exec_windows.go` — 进程替换
 - `pkg/service/windows.go` / `windows_stub.go` — Windows 服务管理
+- `cmd/console_windows.go` / `console_other.go` — 控制台分版本检测。Win10/Server2016+ 启用 VT 后回读验证才设 UTF-8 CP，老系统完全不动；`supportsANSIColor()` 决定是否输出 ANSI 颜色码，老 Windows 走纯文本
 
 ### 静态编译
 
@@ -228,6 +229,15 @@ CGO_ENABLED=0 go build -ldflags="-s -w" -o sslctl ./cmd
 - **G306**：服务脚本需要 0755（可执行）、systemd/nginx/apache 配置需要 0644（可读）
 
 测试文件已排除 gosec 和 errcheck 检查。
+
+**多平台 lint**：本项目含 Windows 专属源（`//go:build windows`），CI 与本地都需双平台 lint：
+
+```bash
+golangci-lint run --timeout=5m ./...                # Linux 视角
+GOOS=windows golangci-lint run --timeout=5m ./...   # Windows 视角（含 svc/mgr、kernel32 调用）
+```
+
+CI 在 lint job 中按顺序跑 Linux + Windows 两次，任一失败即整个 job 失败。本地提交前应同时跑这两条命令。
 
 ---
 

@@ -260,16 +260,29 @@ type ServerCommands struct {
 	ReloadCmd string // 服务重载命令，如 "nginx -s reload"
 }
 
+// WinSvcReloadPrefix 标识 ReloadCmd 走 Windows 服务重启路径的哨兵前缀
+// 形如 "winsvc:nginx"，由 internal/deployer.Base.ReloadService 识别后调用
+// webserver.RestartWindowsService 完成 Stop+Start。
+const WinSvcReloadPrefix = "winsvc:"
+
 // DetectNginxCommands 检测当前系统可用的 Nginx 命令
 // 查找 nginx 实际路径，避免 nginx 不在 PATH 时命令执行失败
 // Windows 上自动添加 -p prefix（nginx 默认用当前目录作为 prefix）
+// Windows 上若检测到 nginx 已注册为服务，ReloadCmd 改为 winsvc:<服务名> 哨兵，
+// 由部署层走 SCM 控制路径，避免 sslctl 与 SYSTEM 主进程之间的 OpenEvent 权限错配。
 func DetectNginxCommands() ServerCommands {
 	nginxBin := findNginxBin()
 	prefixArgs := getNginxPrefixArgs(nginxBin)
-	return ServerCommands{
+	cmds := ServerCommands{
 		TestCmd:   nginxBin + prefixArgs + " -t",
 		ReloadCmd: nginxBin + prefixArgs + " -s reload",
 	}
+	if runtime.GOOS == "windows" {
+		if svc := FindWebServerService("nginx"); svc != "" {
+			cmds.ReloadCmd = WinSvcReloadPrefix + svc
+		}
+	}
+	return cmds
 }
 
 // getNginxPrefixArgs 获取 nginx -p 参数（含前导空格）
@@ -352,7 +365,28 @@ func findNginxBin() string {
 
 // DetectApacheCommands 检测当前系统可用的 Apache 命令
 // 检测顺序：apache2ctl (Debian/Ubuntu) → apachectl (CentOS/RHEL/通用) → httpd (CentOS/RHEL) → 完整路径查找
+// Windows 上若检测到 Apache 已注册为服务，ReloadCmd 改为 winsvc:<服务名> 哨兵，
+// 由部署层走 SCM 控制路径（与 nginx 同理，避免 SYSTEM 主进程下的权限错配）。
 func DetectApacheCommands() ServerCommands {
+	cmds := detectApacheCommandsRaw()
+	if runtime.GOOS == "windows" {
+		if name := findApacheWindowsService(); name != "" {
+			cmds.ReloadCmd = WinSvcReloadPrefix + name
+		}
+	}
+	return cmds
+}
+
+// findApacheWindowsService 优先匹配二进制路径含 httpd 的服务，其次匹配 apache。
+// 拆分两次匹配避免 nginx/apache 二进制路径互相误命中。
+func findApacheWindowsService() string {
+	if name := FindWebServerService("httpd"); name != "" {
+		return name
+	}
+	return FindWebServerService("apache")
+}
+
+func detectApacheCommandsRaw() ServerCommands {
 	// Debian/Ubuntu: apache2ctl
 	if _, err := exec.LookPath("apache2ctl"); err == nil {
 		return ServerCommands{

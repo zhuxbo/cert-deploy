@@ -115,8 +115,7 @@ bash build/release.sh <版本号>
 3. 跑 `build/sign-release.sh`：Ed25519 签名所有 `.gz` 产物
 4. rsync 上传到每台服务器的 `<release_dir>/main/v<版本号>/`
 5. 远端 Python 内联脚本更新 `releases.json`：`main.latest = <版本号>`，`main.versions[]` 头部插入新版（保留最近 KEEP_VERSIONS 个）
-6. 远端 ssh 执行：维护 `<release_dir>/main/latest/` 软链接目录指向新版
-7. 远端清理超出保留数的旧版本目录
+6. 远端清理超出保留数的旧版本目录
 
 **任意服务器失败 → 整体退出码非零，需要排查后用 `--server <名称>` 重试单台**。
 

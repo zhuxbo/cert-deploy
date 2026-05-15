@@ -260,26 +260,34 @@ type ServerCommands struct {
 	ReloadCmd string // 服务重载命令，如 "nginx -s reload"
 }
 
-// WinSvcReloadPrefix 标识 ReloadCmd 走 Windows 服务重启路径的哨兵前缀
-// 形如 "winsvc:nginx"，由 internal/deployer.Base.ReloadService 识别后调用
-// webserver.RestartWindowsService 完成 Stop+Start。
+// WinSvcReloadPrefix 标识 ReloadCmd 走 Windows 服务重启路径的哨兵前缀。
+// 完整形态：winsvc:<service-name>|<fallback-command>
+// 由 internal/deployer.Base.ReloadService 解析：先尝试 SCM Stop+Start，
+// SCM 失败时回退执行 fallback 命令、再失败走进程重启。
+// 旧形态 winsvc:<service-name>（无 fallback）也兼容。
 const WinSvcReloadPrefix = "winsvc:"
+
+// WinSvcFallbackSep 哨兵串中"服务名"与"fallback 命令"的分隔符。
+// 选用 '|' 是因为 nginx/apache reload 命令本身不会出现该字符。
+const WinSvcFallbackSep = "|"
 
 // DetectNginxCommands 检测当前系统可用的 Nginx 命令
 // 查找 nginx 实际路径，避免 nginx 不在 PATH 时命令执行失败
 // Windows 上自动添加 -p prefix（nginx 默认用当前目录作为 prefix）
-// Windows 上若检测到 nginx 已注册为服务，ReloadCmd 改为 winsvc:<服务名> 哨兵，
-// 由部署层走 SCM 控制路径，避免 sslctl 与 SYSTEM 主进程之间的 OpenEvent 权限错配。
+// Windows 上若检测到 nginx 已注册为服务且与当前运行进程匹配，ReloadCmd 改为
+// winsvc:<服务名>|<reload 命令> 哨兵；部署层先走 SCM 控制路径，失败时回退到
+// reload 命令，避免误命中残留服务或 SCM 异常时无法部署。
 func DetectNginxCommands() ServerCommands {
 	nginxBin := findNginxBin()
 	prefixArgs := getNginxPrefixArgs(nginxBin)
+	reloadCmd := nginxBin + prefixArgs + " -s reload"
 	cmds := ServerCommands{
 		TestCmd:   nginxBin + prefixArgs + " -t",
-		ReloadCmd: nginxBin + prefixArgs + " -s reload",
+		ReloadCmd: reloadCmd,
 	}
 	if runtime.GOOS == "windows" {
-		if svc := FindWebServerService("nginx"); svc != "" {
-			cmds.ReloadCmd = WinSvcReloadPrefix + svc
+		if svc := FindWebServerService("nginx", "nginx.exe"); svc != "" {
+			cmds.ReloadCmd = WinSvcReloadPrefix + svc + WinSvcFallbackSep + reloadCmd
 		}
 	}
 	return cmds
@@ -365,13 +373,13 @@ func findNginxBin() string {
 
 // DetectApacheCommands 检测当前系统可用的 Apache 命令
 // 检测顺序：apache2ctl (Debian/Ubuntu) → apachectl (CentOS/RHEL/通用) → httpd (CentOS/RHEL) → 完整路径查找
-// Windows 上若检测到 Apache 已注册为服务，ReloadCmd 改为 winsvc:<服务名> 哨兵，
-// 由部署层走 SCM 控制路径（与 nginx 同理，避免 SYSTEM 主进程下的权限错配）。
+// Windows 上若检测到 Apache 已注册为服务且与当前运行进程匹配，ReloadCmd 改为
+// winsvc:<服务名>|<reload 命令> 哨兵；部署层先走 SCM，失败回退到 reload 命令。
 func DetectApacheCommands() ServerCommands {
 	cmds := detectApacheCommandsRaw()
 	if runtime.GOOS == "windows" {
 		if name := findApacheWindowsService(); name != "" {
-			cmds.ReloadCmd = WinSvcReloadPrefix + name
+			cmds.ReloadCmd = WinSvcReloadPrefix + name + WinSvcFallbackSep + cmds.ReloadCmd
 		}
 	}
 	return cmds
@@ -380,10 +388,10 @@ func DetectApacheCommands() ServerCommands {
 // findApacheWindowsService 优先匹配二进制路径含 httpd 的服务，其次匹配 apache。
 // 拆分两次匹配避免 nginx/apache 二进制路径互相误命中。
 func findApacheWindowsService() string {
-	if name := FindWebServerService("httpd"); name != "" {
+	if name := FindWebServerService("httpd", "httpd.exe"); name != "" {
 		return name
 	}
-	return FindWebServerService("apache")
+	return FindWebServerService("apache", "httpd.exe")
 }
 
 func detectApacheCommandsRaw() ServerCommands {

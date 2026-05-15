@@ -4,6 +4,8 @@ package webserver
 
 import (
 	"fmt"
+	"os"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -11,13 +13,17 @@ import (
 	"golang.org/x/sys/windows/svc/mgr"
 )
 
-// FindWebServerService 在 Windows 服务管理器中查找一个二进制路径包含 matchSubstr
-// 的服务。匹配大小写不敏感。命中时返回服务名，未命中或出错时返回 ""。
+// FindWebServerService 在 Windows 服务管理器中查找一个可用的 nginx/apache 服务。
 //
-// 该函数用于检测 nginx/apache 是否被注册为 Windows 服务（含 nssm/winsw/自带 wrapper），
-// 命中后调用方可通过 RestartWindowsService 走标准 SCM 控制路径，避免与 SYSTEM 主进程
-// 之间的 OpenEvent 权限错配问题。
-func FindWebServerService(matchSubstr string) string {
+// 匹配规则（按顺序全部满足才算命中）：
+//  1. 服务名或 BinaryPathName（小写）包含 matchSubstr。
+//  2. BinaryPathName 解析出的 exe 文件存在于磁盘（防止旧服务卸载后只留注册项）。
+//  3. 若 processName 非空且当前有同名进程在运行，进程 ExecutablePath 必须与服务
+//     BinaryPath 指向同一可执行文件（防止把"系统里有这名服务"等同于"用户实际跑的就是它"，
+//     例如宝塔面板装过 nginx 服务但用户用 `start nginx` 跑的是另一个 binary 的情况）。
+//
+// 命中时返回服务名，未命中或出错时返回 ""。
+func FindWebServerService(matchSubstr, processName string) string {
 	if matchSubstr == "" {
 		return ""
 	}
@@ -40,22 +46,25 @@ func FindWebServerService(matchSubstr string) string {
 		lowerNames[strings.ToLower(n)] = n
 	}
 	if exact, ok := lowerNames[needle]; ok {
-		if isServiceMatching(m, exact, needle) {
+		if isServiceMatching(m, exact, needle, processName) {
 			return exact
 		}
 	}
 
 	// 其次扫描所有服务的 BinaryPathName
 	for _, name := range names {
-		if isServiceMatching(m, name, needle) {
+		if isServiceMatching(m, name, needle, processName) {
 			return name
 		}
 	}
 	return ""
 }
 
-// isServiceMatching 打开服务并判断其 BinaryPathName 是否包含 needle（小写）
-func isServiceMatching(m *mgr.Mgr, name, needle string) bool {
+// isServiceMatching 打开服务并判断：
+//   - BinaryPathName 是否包含 needle（小写）
+//   - BinaryPath 指向的 exe 文件是否存在
+//   - 若 processName 非空，是否与当前运行的同名进程路径一致
+func isServiceMatching(m *mgr.Mgr, name, needle, processName string) bool {
 	s, err := m.OpenService(name)
 	if err != nil {
 		return false
@@ -65,7 +74,66 @@ func isServiceMatching(m *mgr.Mgr, name, needle string) bool {
 	if err != nil {
 		return false
 	}
-	return strings.Contains(strings.ToLower(cfg.BinaryPathName), needle)
+	if !strings.Contains(strings.ToLower(cfg.BinaryPathName), needle) {
+		return false
+	}
+	exe := extractServiceExePath(cfg.BinaryPathName)
+	if exe == "" {
+		return false
+	}
+	if _, err := os.Stat(exe); err != nil {
+		return false
+	}
+	if processName != "" && !runningProcessMatchesService(processName, exe) {
+		return false
+	}
+	return true
+}
+
+// runningProcessMatchesService 判断当前运行的 processName 进程是否由 svcExe 启动。
+//
+//   - 没有同名运行进程：返回 true（不能据此排除该服务，可能服务还没启动）
+//   - 有同名运行进程：必须任一进程的 ExecutablePath 与 svcExe 规范化后一致才返回 true
+//
+// 用于避免 detector 把"系统里曾经装过的服务"等同于"用户实际跑的进程"。
+func runningProcessMatchesService(processName, svcExe string) bool {
+	paths := listRunningProcessPaths(processName)
+	if len(paths) == 0 {
+		return true
+	}
+	target := normalizeWindowsPath(svcExe)
+	if target == "" {
+		return false
+	}
+	for _, p := range paths {
+		if normalizeWindowsPath(p) == target {
+			return true
+		}
+	}
+	return false
+}
+
+// listRunningProcessPaths 通过 wmic 列出指定进程名的所有 ExecutablePath。
+// 查询失败或无结果返回 nil。
+func listRunningProcessPaths(processName string) []string {
+	if processName == "" {
+		return nil
+	}
+	cmd := exec.Command("wmic", "process", "where",
+		fmt.Sprintf("name='%s'", processName), "get", "ExecutablePath")
+	out, err := cmd.Output()
+	if err != nil {
+		return nil
+	}
+	var paths []string
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.EqualFold(line, "ExecutablePath") {
+			continue
+		}
+		paths = append(paths, line)
+	}
+	return paths
 }
 
 // RestartWindowsService 通过 SCM 重启指定服务：先 Stop 并轮询至 Stopped，再 Start。

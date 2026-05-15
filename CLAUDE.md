@@ -186,7 +186,7 @@ docker/test/
 - 升级流程平台差异化（Linux：先替换再重启，零停机；Windows：先停服务释放 exe 句柄再替换再启动，失败时恢复服务；Windows 上 rename 策略替换运行中 exe，重试等待文件句柄释放）
 - Windows 服务停止等待（`Stop()` 轮询至 `Stopped` 状态，确保进程完全退出后才返回）
 - Windows 非服务模式重载（reload 命令失败时回退到进程重启：taskkill → 等待守护进程拉起 → 否则手动启动；回退白名单含 `Access is denied`，覆盖 sslctl 与 SYSTEM master 进程权限错配场景）
-- Windows 服务模式重载（detector 检测到 nginx/apache 注册为 Windows 服务时，ReloadCmd 设为 `winsvc:<服务名>` 哨兵，`Base.ReloadService` 走 SCM Stop+Start 标准路径，避免 `nginx -s reload` 在跨权限边界 OpenEvent 失败）
+- Windows 服务模式重载（detector 检测到 nginx/apache 注册为 Windows 服务、且其 BinaryPath 文件存在并与当前运行进程路径一致时，ReloadCmd 设为 `winsvc:<服务名>|<reload 命令>` 哨兵；`Base.ReloadService` 先走 SCM Stop+Start，SCM 失败时回退执行哨兵编入的 reload 命令，再失败按白名单走进程重启；避免残留服务/wrapper 损坏导致部署失败）
 - 守护进程优雅停止（`RunAsService` 通过 context 通知 daemon，不再依赖 SIGTERM；Windows SCM 停止立即生效）
 - SELinux 兼容（部署后自动恢复文件安全上下文，`restorecon` 失败时返回错误）
 - IDN/Punycode 域名支持（`pkg/matcher`）

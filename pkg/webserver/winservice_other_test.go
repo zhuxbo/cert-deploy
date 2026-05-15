@@ -8,10 +8,10 @@ import (
 )
 
 func TestFindWebServerService_AlwaysEmptyOnNonWindows(t *testing.T) {
-	if got := FindWebServerService("nginx"); got != "" {
+	if got := FindWebServerService("nginx", "nginx.exe"); got != "" {
 		t.Errorf("非 Windows 上应返回空，得到 %q", got)
 	}
-	if got := FindWebServerService(""); got != "" {
+	if got := FindWebServerService("", ""); got != "" {
 		t.Errorf("空 needle 应返回空，得到 %q", got)
 	}
 }

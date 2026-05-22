@@ -20,6 +20,10 @@ import (
 // restartWindowsServiceFunc 包一层方便测试替换；默认调用 webserver.RestartWindowsService。
 var restartWindowsServiceFunc = webserver.RestartWindowsService
 
+// reloadFallbackCommandFunc winsvc 哨兵 SCM 失败后执行 fallback 命令的钩子，
+// 默认指向 runReloadCommandWindows，测试时可替换以避免触达 executor。
+var reloadFallbackCommandFunc = runReloadCommandWindows
+
 // Config 部署器配置
 type Config struct {
 	CertPath      string // 证书文件路径
@@ -62,7 +66,8 @@ func (b *Base) NeedsProcessRestart() bool {
 
 // ReloadService 重载服务
 // 优先使用服务管理命令；失败时尝试回退策略：
-// - Windows 已识别为服务（winsvc: 哨兵）：直接走 SCM Stop+Start
+// - Windows 已识别为服务（winsvc: 哨兵）：先走 SCM Stop+Start；失败则回退执行
+//   哨兵中编入的 reload 命令，再失败走进程重启
 // - Linux 容器环境（无 systemd）：先发送 SIGUSR1 再执行 reload 命令
 // - Windows 非服务模式：reload 命令失败时回退到进程重启
 func (b *Base) ReloadService() error {
@@ -72,8 +77,7 @@ func (b *Base) ReloadService() error {
 
 	// Windows 服务路径：detector 已识别 nginx/apache 为 Windows 服务
 	if strings.HasPrefix(b.ReloadCommand, webserver.WinSvcReloadPrefix) {
-		svcName := strings.TrimPrefix(b.ReloadCommand, webserver.WinSvcReloadPrefix)
-		return restartWindowsServiceFunc(svcName)
+		return b.reloadWinSvc()
 	}
 
 	// Linux 容器环境预检：如果 systemd 不可用且命令涉及 httpd/apache，
@@ -84,14 +88,55 @@ func (b *Base) ReloadService() error {
 		}
 	}
 
-	err := executor.Run(b.ReloadCommand)
-	if err == nil {
+	if runtime.GOOS == "windows" {
+		return runReloadCommandWindows(b.ReloadCommand, nil)
+	}
+	return executor.Run(b.ReloadCommand)
+}
+
+// parseWinSvcSentinel 解析 winsvc:<service-name>[|<fallback>] 哨兵串。
+// 兼容旧形态 winsvc:<service-name>（无 fallback）。
+func parseWinSvcSentinel(s string) (svcName, fallback string) {
+	rest := strings.TrimPrefix(s, webserver.WinSvcReloadPrefix)
+	if i := strings.Index(rest, webserver.WinSvcFallbackSep); i >= 0 {
+		return rest[:i], rest[i+1:]
+	}
+	return rest, ""
+}
+
+// reloadWinSvc 处理 winsvc: 哨兵：
+//  1. 先尝试 SCM Stop+Start
+//  2. 失败时回退执行 fallback 命令（nginx -s reload / httpd -k graceful）
+//  3. 命令仍失败且属于已知白名单错误，走进程重启
+//
+// 三层失败时返回最后一步的错误，并在错误链中保留前置 SCM 错误以便排查。
+func (b *Base) reloadWinSvc() error {
+	svcName, fallback := parseWinSvcSentinel(b.ReloadCommand)
+	if svcName == "" {
+		if fallback != "" {
+			return runReloadCommandWindows(fallback, nil)
+		}
+		return fmt.Errorf("invalid winsvc sentinel: %s", b.ReloadCommand)
+	}
+	scmErr := restartWindowsServiceFunc(svcName)
+	if scmErr == nil {
 		return nil
 	}
+	if fallback == "" {
+		return scmErr
+	}
+	return reloadFallbackCommandFunc(fallback, scmErr)
+}
 
-	// Windows 非服务模式：回退到进程重启
-	if runtime.GOOS != "windows" {
-		return err
+// runReloadCommandWindows 在 Windows 上执行 reload 命令；失败时按已知白名单错误
+// 回退到进程重启（taskkill+守护进程拉起+手动启动）。
+//
+// prevErr 为可选的前置错误（如 SCM 失败错误），返回错误时一起带回上下文，
+// 但不影响白名单判定（白名单只看 reload 命令本身的错误信息）。
+func runReloadCommandWindows(reloadCmd string, prevErr error) error {
+	err := executor.Run(reloadCmd)
+	if err == nil {
+		return nil
 	}
 	msg := err.Error()
 	// "Access is denied" 兜底：调用方与 nginx/apache master 进程权限不一致时
@@ -100,15 +145,24 @@ func (b *Base) ReloadService() error {
 	if !strings.Contains(msg, "No installed service") &&
 		!strings.Contains(msg, "could not open error log") &&
 		!strings.Contains(msg, "Access is denied") {
-		return err
+		return wrapWithPrev(err, prevErr)
 	}
-
-	exe, _ := executor.ParseCommand(b.ReloadCommand)
+	exe, _ := executor.ParseCommand(reloadCmd)
 	if exe == "" {
+		return wrapWithPrev(err, prevErr)
+	}
+	if rerr := restartProcessWindows(exe, err); rerr != nil {
+		return wrapWithPrev(rerr, prevErr)
+	}
+	return nil
+}
+
+// wrapWithPrev 把前置错误（如 SCM 失败）附加到主错误信息后面，方便排查。
+func wrapWithPrev(err, prev error) error {
+	if prev == nil {
 		return err
 	}
-
-	return restartProcessWindows(exe, err)
+	return fmt.Errorf("%w（前置 SCM 错误：%v）", err, prev)
 }
 
 // isSystemdAvailable 检测 systemd 是否可用（通过 /run/systemd/system 目录判断）

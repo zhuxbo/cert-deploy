@@ -83,6 +83,15 @@ done
 # 网络超时（秒），可通过环境变量覆盖
 TIMEOUT=${SSLCTL_TIMEOUT:-30}
 
+# 检测可用的 Python（CentOS 7 默认无 python3，宝塔自带 python 可能不在 PATH）
+PYTHON3=""
+for _py in python3 /www/server/panel/pyenv/bin/python3 python python2; do
+    if command -v "$_py" >/dev/null 2>&1 && "$_py" -c "import json" >/dev/null 2>&1; then
+        PYTHON3="$_py"
+        break
+    fi
+done
+
 # 发布目录探测
 # 先尝试根目录 https://{host}/sslctl，失败回落到 https://{host}/release/sslctl
 # 首个 releases.json 可访问的候选作为 RELEASE_URL
@@ -217,8 +226,8 @@ get_target_version() {
 
     local version=""
     local ch="${CHANNEL:-main}"
-    if command -v python3 >/dev/null 2>&1; then
-        version=$(echo "$json" | python3 -c "
+    if [ -n "$PYTHON3" ]; then
+        version=$(echo "$json" | "$PYTHON3" -c "
 import sys, json
 try:
     d = json.load(sys.stdin)
@@ -232,8 +241,16 @@ try:
 except: pass
 " 2>/dev/null)
     else
-        # 无 python3 时用 grep 回退（仅支持简单格式）
-        version=$(echo "$json" | grep -o "\"$ch\"" -A 5 | grep -o '"latest" *: *"[^"]*"' | head -1 | cut -d'"' -f4)
+        # 无 Python 时用 grep 粗略提取（按通道顺序找到第一个 latest）
+        # 仅在简单格式下可靠：通道为顶层 key 且 latest 紧跟其后
+        version=$(echo "$json" | awk -v ch="$ch" '
+            $0 ~ "\""ch"\"[[:space:]]*:" { found=1 }
+            found && match($0, /"latest"[[:space:]]*:[[:space:]]*"[^"]+"/) {
+                s = substr($0, RSTART, RLENGTH)
+                sub(/.*"latest"[[:space:]]*:[[:space:]]*"/, "", s)
+                sub(/"$/, "", s)
+                print s; exit
+            }')
     fi
 
     # 自动推断通道
@@ -245,7 +262,11 @@ except: pass
         fi
     fi
 
-    echo "$(normalize_version "$version")"
+    if [ -z "$version" ]; then
+        echo ""
+    else
+        normalize_version "$version"
+    fi
 }
 
 BINARY_DST="/usr/local/bin/sslctl"
@@ -255,6 +276,10 @@ VERSION=$(get_target_version)
 
 if [ -z "$VERSION" ]; then
     echo_error "无法获取版本信息: $RELEASE_URL/releases.json"
+    if [ -z "$PYTHON3" ]; then
+        echo_error "未找到可用的 Python（python3/python/python2 均不可用），且 awk 解析失败"
+        echo_error "建议安装 python3 后重试: yum install -y python3"
+    fi
     exit 1
 fi
 
@@ -277,7 +302,7 @@ fi
 # 检测已安装版本
 CURRENT_VERSION=""
 if [ -x "$BINARY_DST" ]; then
-    CURRENT_VERSION=$("$BINARY_DST" --version 2>/dev/null | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9]+)?' || echo "")
+    CURRENT_VERSION=$("$BINARY_DST" --version 2>/dev/null | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?' || echo "")
     [ -n "$CURRENT_VERSION" ] && CURRENT_VERSION=$(normalize_version "$CURRENT_VERSION")
 fi
 
@@ -300,7 +325,7 @@ DOWNLOAD_URL="$RELEASE_URL/$CHANNEL/$VERSION/$FILENAME"
 
 echo_info "下载 $FILENAME..."
 
-if ! curl -fsSL --connect-timeout $TIMEOUT "$DOWNLOAD_URL" -o "/tmp/$FILENAME" 2>/dev/null; then
+if ! curl -fsSL --connect-timeout $TIMEOUT "$DOWNLOAD_URL" -o "/tmp/$FILENAME"; then
     echo_error "下载失败: $DOWNLOAD_URL"
     exit 1
 fi
@@ -311,9 +336,9 @@ fi
 
 # SHA256 校验（从 {channel}.versions[].checksums.{filename} 提取）
 EXPECTED_HASH=""
-if command -v python3 >/dev/null 2>&1; then
+if [ -n "$PYTHON3" ]; then
     EXPECTED_HASH=$(curl -s --connect-timeout $TIMEOUT "$RELEASE_URL/releases.json" 2>/dev/null | \
-        python3 -c "
+        "$PYTHON3" -c "
 import sys, json
 try:
     d = json.load(sys.stdin)
@@ -344,7 +369,7 @@ if [ -n "$EXPECTED_HASH" ]; then
     fi
     echo_info "SHA256 校验通过"
 else
-    echo_warn "无法获取校验和（需要 python3），跳过 SHA256 校验"
+    echo_warn "无法获取校验和（需要 Python），跳过 SHA256 校验"
 fi
 
 # 解压并安装
@@ -424,24 +449,33 @@ mkdir -p /opt/sslctl/{logs,backup,certs}
 CONFIG_FILE="/opt/sslctl/config.json"
 if [ -f "$CONFIG_FILE" ]; then
     # 配置已存在，合并 release_url（不覆盖其他字段）
-    if command -v python3 >/dev/null 2>&1; then
-        if ! python3 - "$CONFIG_FILE" "$RELEASE_URL" "${CHANNEL:-main}" << 'PYEOF'
+    if [ -n "$PYTHON3" ]; then
+        if ! "$PYTHON3" - "$CONFIG_FILE" "$RELEASE_URL" "${CHANNEL:-main}" << 'PYEOF'
 import json, os, sys, tempfile
 config_path, release_url = sys.argv[1], sys.argv[2]
+channel = sys.argv[3] if len(sys.argv) > 3 else "main"
 try:
-    with open(config_path, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
-except (json.JSONDecodeError, FileNotFoundError):
-    print("配置解析失败，未修改 release_url", file=sys.stderr)
+    with open(config_path, "rb") as f:
+        cfg = json.loads(f.read().decode("utf-8"))
+except Exception:
+    sys.stderr.write("配置解析失败，未修改 release_url\n")
     sys.exit(1)
 cfg["release_url"] = release_url
-channel = sys.argv[3] if len(sys.argv) > 3 else "main"
 cfg["upgrade_channel"] = channel
-dir_path = os.path.dirname(config_path) or "."
-with tempfile.NamedTemporaryFile("w", delete=False, dir=dir_path, encoding="utf-8") as tmp:
-    json.dump(cfg, tmp, indent=2, ensure_ascii=False)
-    tmp_path = tmp.name
-os.replace(tmp_path, config_path)
+data = json.dumps(cfg, indent=2, ensure_ascii=False)
+# py3 str / py2 unicode 都需 encode；py2 ASCII-only 时为 str(=bytes) 已是字节
+if not isinstance(data, bytes):
+    data = data.encode("utf-8")
+d = os.path.dirname(config_path) or "."
+fd, tmp_path = tempfile.mkstemp(dir=d)
+try:
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+    os.rename(tmp_path, config_path)
+except Exception:
+    if os.path.exists(tmp_path):
+        os.remove(tmp_path)
+    raise
 PYEOF
         then
             echo_error "写入 release_url 失败，配置未修改"
@@ -459,7 +493,7 @@ PYEOF
             exit 1
         fi
     else
-        echo_error "未找到 python3 或 jq，无法写入 release_url"
+        echo_error "未找到 Python 或 jq，无法写入 release_url"
         exit 1
     fi
 else

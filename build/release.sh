@@ -507,23 +507,6 @@ upload_to_server() {
     # 更新 releases.json
     update_releases_json_remote "$server_str" "$version" "$channel"
 
-    # 更新 latest 符号链接
-    log_info "更新符号链接..."
-    local latest_dir="$SERVER_DIR/latest"
-    [ "$channel" = "dev" ] && latest_dir="$SERVER_DIR/dev-latest"
-
-    ssh_cmd "$SERVER_HOST" "$SERVER_PORT" "
-        mkdir -p \"$latest_dir\"
-        cd \"$latest_dir\"
-        for pkg in \"$remote_version_dir\"/*.gz; do
-            if [ -f \"\$pkg\" ]; then
-                filename=\$(basename \"\$pkg\")
-                rm -f \"\$filename\"
-                ln -s \"../$channel/$version/\$filename\" \"\$filename\"
-            fi
-        done
-    "
-
     # 修复文件权限（确保 Nginx 可读）
     ssh_cmd "$SERVER_HOST" "$SERVER_PORT" "chmod 644 \"$SERVER_DIR/releases.json\" \"$SERVER_DIR/install.sh\" \"$SERVER_DIR/install.ps1\" 2>/dev/null; chmod -R 644 \"$remote_version_dir\"/*.gz 2>/dev/null"
 

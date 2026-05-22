@@ -29,7 +29,7 @@ func TestReloadService_WinSvcSentinel(t *testing.T) {
 	}
 }
 
-// TestReloadService_WinSvcSentinelError 验证服务重启失败时错误透传。
+// TestReloadService_WinSvcSentinelError 验证服务重启失败、且无 fallback 时错误透传。
 func TestReloadService_WinSvcSentinelError(t *testing.T) {
 	wantErr := errors.New("scm boom")
 	orig := restartWindowsServiceFunc
@@ -40,6 +40,103 @@ func TestReloadService_WinSvcSentinelError(t *testing.T) {
 	err := b.ReloadService()
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("err = %v, 期望 wrap %v", err, wantErr)
+	}
+}
+
+// TestReloadService_WinSvcFallbackSuccess 验证 SCM 失败但 fallback 命令成功时返回 nil。
+func TestReloadService_WinSvcFallbackSuccess(t *testing.T) {
+	origSvc := restartWindowsServiceFunc
+	restartWindowsServiceFunc = func(_ string) error { return errors.New("scm failed") }
+	defer func() { restartWindowsServiceFunc = origSvc }()
+
+	origFallback := reloadFallbackCommandFunc
+	var receivedCmd string
+	var receivedPrev error
+	reloadFallbackCommandFunc = func(cmd string, prev error) error {
+		receivedCmd = cmd
+		receivedPrev = prev
+		return nil
+	}
+	defer func() { reloadFallbackCommandFunc = origFallback }()
+
+	b := &Base{ReloadCommand: webserver.WinSvcReloadPrefix + "nginx" + webserver.WinSvcFallbackSep + `C:\nginx\nginx.exe -s reload`}
+	if err := b.ReloadService(); err != nil {
+		t.Fatalf("ReloadService 返回错误: %v", err)
+	}
+	if receivedCmd != `C:\nginx\nginx.exe -s reload` {
+		t.Fatalf("fallback 命令 = %q, 期望 %q", receivedCmd, `C:\nginx\nginx.exe -s reload`)
+	}
+	if receivedPrev == nil || receivedPrev.Error() != "scm failed" {
+		t.Fatalf("前置错误 = %v, 期望 scm failed", receivedPrev)
+	}
+}
+
+// TestReloadService_WinSvcFallbackBothFail 验证 SCM 和 fallback 都失败时返回 fallback 错误，
+// 且错误信息包含前置 SCM 错误以便排查。
+func TestReloadService_WinSvcFallbackBothFail(t *testing.T) {
+	origSvc := restartWindowsServiceFunc
+	scmErr := errors.New("scm cannot find binary")
+	restartWindowsServiceFunc = func(_ string) error { return scmErr }
+	defer func() { restartWindowsServiceFunc = origSvc }()
+
+	origFallback := reloadFallbackCommandFunc
+	fallbackErr := errors.New("nginx reload failed")
+	reloadFallbackCommandFunc = func(_ string, _ error) error {
+		return fallbackErr
+	}
+	defer func() { reloadFallbackCommandFunc = origFallback }()
+
+	b := &Base{ReloadCommand: webserver.WinSvcReloadPrefix + "nginx" + webserver.WinSvcFallbackSep + `nginx -s reload`}
+	err := b.ReloadService()
+	if err == nil {
+		t.Fatal("期望返回错误")
+	}
+	if !errors.Is(err, fallbackErr) {
+		t.Errorf("err 应 wrap fallback 错误，实际 = %v", err)
+	}
+}
+
+// TestReloadService_WinSvcOldFormatCompat 验证旧格式 winsvc:<name>（无 fallback）仍可正常工作。
+func TestReloadService_WinSvcOldFormatCompat(t *testing.T) {
+	called := ""
+	orig := restartWindowsServiceFunc
+	restartWindowsServiceFunc = func(name string) error {
+		called = name
+		return nil
+	}
+	defer func() { restartWindowsServiceFunc = orig }()
+
+	b := &Base{ReloadCommand: webserver.WinSvcReloadPrefix + "Apache2.4"}
+	if err := b.ReloadService(); err != nil {
+		t.Fatalf("旧格式应可用: %v", err)
+	}
+	if called != "Apache2.4" {
+		t.Fatalf("svcName = %q, 期望 Apache2.4", called)
+	}
+}
+
+// TestParseWinSvcSentinel 验证哨兵串解析。
+func TestParseWinSvcSentinel(t *testing.T) {
+	cases := []struct {
+		name        string
+		input       string
+		wantSvc     string
+		wantFB      string
+	}{
+		{"old format", "winsvc:nginx", "nginx", ""},
+		{"new format", "winsvc:nginx|nginx -s reload", "nginx", "nginx -s reload"},
+		{"path with backslash", `winsvc:Apache2.4|C:\Apache\bin\httpd.exe -k graceful`, "Apache2.4", `C:\Apache\bin\httpd.exe -k graceful`},
+		{"empty fallback", "winsvc:nginx|", "nginx", ""},
+		{"no service name", "winsvc:|nginx -s reload", "", "nginx -s reload"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			svc, fb := parseWinSvcSentinel(c.input)
+			if svc != c.wantSvc || fb != c.wantFB {
+				t.Errorf("parseWinSvcSentinel(%q) = (%q, %q), want (%q, %q)",
+					c.input, svc, fb, c.wantSvc, c.wantFB)
+			}
+		})
 	}
 }
 
@@ -55,13 +152,8 @@ func TestNeedsProcessRestart_WinSvc(t *testing.T) {
 	}
 }
 
-// TestReloadService_AccessDeniedTriggersFallback 在 Windows 下验证
-// "Access is denied" 错误信息会触发进程重启回退（而不是直接抛错）。
-//
-// 通过让 ReloadCommand 走一个不在白名单的命令制造 executor 错误，无法直接
-// 模拟原生 nginx 的 OpenEvent 报文；这里只检查白名单匹配逻辑：错误消息中
-// 含 "Access is denied" 时不应在 base.go:80 提前 return。我们用一个直接
-// 测试逻辑分支的小函数验证。
+// TestReloadFallbackTriggers 在 Windows 下验证错误信息白名单：
+// "Access is denied" 等错误会触发进程重启回退（而不是直接抛错）。
 func TestReloadFallbackTriggers(t *testing.T) {
 	cases := []struct {
 		msg         string

@@ -2097,3 +2097,59 @@ func TestScanAll_WithInclude(t *testing.T) {
 		}
 	}
 }
+
+
+func TestParseApacheDArg(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"unquoted forward slash", `C:\xampp\apache\bin\httpd.exe -d C:/xampp/apache`, "C:/xampp/apache"},
+		{"unquoted backslash", `httpd.exe -d C:\xampp\apache`, `C:\xampp\apache`},
+		{"quoted with space", `httpd.exe -d "C:/Program Files/Apache"`, "C:/Program Files/Apache"},
+		{"no -d", `httpd.exe -k start`, ""},
+		{"empty", "", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := parseApacheDArg(c.in)
+			if got != c.want {
+				t.Errorf("parseApacheDArg(%q) = %q, want %q", c.in, got, c.want)
+			}
+		})
+	}
+}
+
+func TestParseWinProcList(t *testing.T) {
+	wmicOut := `CommandLine=C:\xampp\apache\bin\httpd.exe -d C:/xampp/apache
+ExecutablePath=C:\xampp\apache\bin\httpd.exe
+
+CommandLine=c:\xampp\apache\bin\httpd.exe
+ExecutablePath=c:\xampp\apache\bin\httpd.exe
+`
+	procs := parseWinProcList(wmicOut)
+	if len(procs) != 2 {
+		t.Fatalf("wmic 期望 2 个进程，实际 %d", len(procs))
+	}
+	if procs[0].commandLine != `C:\xampp\apache\bin\httpd.exe -d C:/xampp/apache` {
+		t.Errorf("wmic procs[0].commandLine 不正确: %q", procs[0].commandLine)
+	}
+	if procs[1].executablePath != `c:\xampp\apache\bin\httpd.exe` {
+		t.Errorf("wmic procs[1].executablePath 不正确: %q", procs[1].executablePath)
+	}
+
+	psOut := `ExecutablePath : C:\xampp\apache\bin\httpd.exe
+CommandLine    : C:\xampp\apache\bin\httpd.exe -d C:/xampp/apache
+
+ExecutablePath : c:\xampp\apache\bin\httpd.exe
+CommandLine    : c:\xampp\apache\bin\httpd.exe
+`
+	procs = parseWinProcList(psOut)
+	if len(procs) != 2 {
+		t.Fatalf("powershell 期望 2 个进程，实际 %d", len(procs))
+	}
+	if procs[0].commandLine != `C:\xampp\apache\bin\httpd.exe -d C:/xampp/apache` {
+		t.Errorf("ps procs[0].commandLine 不正确: %q", procs[0].commandLine)
+	}
+}

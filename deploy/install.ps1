@@ -358,7 +358,7 @@ if ($CurrentVersion) {
             exit 0
         }
     } else {
-        Write-Info "升级: $CurrentVersion -> $TargetVersion"
+        Write-Info "安装: $CurrentVersion -> $TargetVersion"
     }
 }
 

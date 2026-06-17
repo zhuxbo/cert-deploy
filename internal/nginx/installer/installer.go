@@ -67,9 +67,13 @@ func (i *NginxInstaller) Install() (*InstallResult, error) {
 		return nil, fmt.Errorf("生成 SSL 配置失败: %w", err)
 	}
 
-	// 没有实际修改（未找到可处理的 server 块）
+	// 未找到可处理的 server 块（如非 80 端口、无 HTTP server 块）：返回明确错误。
+	// 避免调用方误以为"无需安装"而继续部署证书并误报成功（HTTPS 实际未生效）。
+	// 与 Apache 安装器行为一致（找不到可用 VirtualHost 时也返回错误）。
+	// 此处尚未修改配置，清理无用备份。
 	if newContent == originalContent {
-		return &InstallResult{Modified: false}, nil
+		_ = os.Remove(backupPath)
+		return nil, fmt.Errorf("未找到可安装 HTTPS 的 server 块（需要 listen 80 的 HTTP server 块）")
 	}
 
 	// 5. 写入新配置
@@ -231,6 +235,13 @@ func (i *NginxInstaller) addSSLConfig(content string) (string, error) {
 	rootRe := regexp.MustCompile(`^\s*root\s+`)
 
 	for _, line := range lines {
+		// 跳过注释行：保留输出，但不参与块解析（不计花括号、不匹配指令）
+		// 与 hasSSLConfig 一致，避免注释中的花括号干扰 braceCount 导致 server 块边界错乱
+		if strings.HasPrefix(strings.TrimSpace(line), "#") {
+			result = append(result, line)
+			continue
+		}
+
 		// 等待 { 行（server\n...\n{ 格式，跳过空行）
 		if pendingServer {
 			if strings.TrimSpace(line) == "" {
@@ -287,8 +298,10 @@ func (i *NginxInstaller) addSSLConfig(content string) (string, error) {
 				}
 			}
 
-			// 记录 root 指令位置
-			if rootRe.MatchString(line) {
+			// 记录 root 指令位置（仅 server 块顶层 braceCount==1）
+			// root 写在 location 内时不能作为 SSL 插入锚点，否则 ssl_certificate 会落入
+			// location 块，触发 nginx "ssl_certificate directive is not allowed here"
+			if braceCount == 1 && rootRe.MatchString(line) {
 				rootLineIndex = len(result)
 			}
 

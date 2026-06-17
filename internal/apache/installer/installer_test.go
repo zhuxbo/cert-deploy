@@ -315,6 +315,29 @@ func TestInstall_AlreadyHasSSL(t *testing.T) {
 	}
 }
 
+// TestInstall_NoMatchingVirtualHost_ReturnsError 锁定契约：找不到目标站点的 HTTP
+// VirtualHost 时返回错误（而非静默无操作）。nginx 安装器已对齐此行为，避免调用方
+// 误以为"无需安装"继续部署证书并误报成功。
+func TestInstall_NoMatchingVirtualHost_ReturnsError(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "site.conf")
+
+	// 配置里只有 other.com，目标 example.com 找不到可用的 HTTP VirtualHost
+	content := `<VirtualHost *:80>
+    ServerName other.com
+    DocumentRoot /var/www/other
+</VirtualHost>`
+	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	inst := NewApacheInstaller(configPath, "/ssl/cert.pem", "/ssl/key.pem", "", "example.com", "")
+	result, err := inst.Install()
+	if err == nil {
+		t.Fatalf("找不到目标站点的 HTTP VirtualHost 时应返回错误，实际 result=%+v, err=nil", result)
+	}
+}
+
 func TestRollback_Success(t *testing.T) {
 	tmpDir := t.TempDir()
 	configPath := filepath.Join(tmpDir, "site.conf")

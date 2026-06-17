@@ -240,6 +240,110 @@ server {
 	}
 }
 
+// TestAddSSLConfig_RootInLocation 验证 root 写在 location 块内时（SPA / 前后端分离 / 反代的常见配置），
+// SSL 证书指令必须插入 server 块顶层，而非 location 块内。
+// 回归：root 在 location 内会让 ssl_certificate 被插进 location 块，nginx 报 "ssl_certificate directive is not allowed here"。
+func TestAddSSLConfig_RootInLocation(t *testing.T) {
+	content := `map $http_upgrade $connection_upgrade {
+    default upgrade;
+    '' close;
+}
+
+server {
+    listen 80;
+    server_name 1.14.125.7;
+
+    client_max_body_size 50m;
+
+    location / {
+        root /opt/jixun-im/frontend/dist;
+        index index.html;
+        try_files $uri $uri/ /index.html;
+    }
+
+    location /api/ {
+        proxy_pass http://127.0.0.1:8080;
+    }
+}`
+
+	installer := NewNginxInstaller(
+		"",
+		"/opt/sslctl/certs/cert.pem",
+		"/opt/sslctl/certs/key.pem",
+		"1.14.125.7",
+		"",
+	)
+
+	result, err := installer.addSSLConfig(content)
+	if err != nil {
+		t.Fatalf("addSSLConfig() error = %v", err)
+	}
+
+	// 必须确实插入了 SSL（存在 listen 80）
+	if !strings.Contains(result, "ssl_certificate ") {
+		t.Fatalf("结果应包含 ssl_certificate 指令\n%s", result)
+	}
+
+	// ssl_certificate 必须位于 server 块顶层（花括号深度 1），不能落入 location 块（深度 ≥ 2）
+	if depth := sslCertBraceDepth(result); depth != 1 {
+		t.Errorf("ssl_certificate 应在 server 顶层（深度 1），实际深度 %d，会触发 nginx \"not allowed here\"\n%s", depth, result)
+	}
+}
+
+// sslCertBraceDepth 返回首个 ssl_certificate 指令所在的花括号嵌套深度（server 顶层为 1，location 内为 2）
+func sslCertBraceDepth(config string) int {
+	depth := 0
+	for _, line := range strings.Split(config, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "ssl_certificate ") {
+			return depth
+		}
+		depth += strings.Count(line, "{") - strings.Count(line, "}")
+	}
+	return -1
+}
+
+// TestAddSSLConfig_CommentWithUnbalancedBrace 验证配置注释中含未配对花括号时，
+// 不影响 server 块边界判断，SSL 指令仍正确插入 server 块顶层。
+// 回归：addSSLConfig 曾把注释里的 { / } 计入 braceCount，导致 server 块边界错乱
+// （注释多一个 { 会让块结束永不触发，SSL 完全插不进去）。
+func TestAddSSLConfig_CommentWithUnbalancedBrace(t *testing.T) {
+	content := `server {
+    listen 80;
+    server_name example.com;
+    root /var/www/html;
+    # 旧配置 location /old {
+    location / {
+        try_files $uri $uri/ =404;
+    }
+}`
+
+	installer := NewNginxInstaller(
+		"",
+		"/etc/ssl/cert.crt",
+		"/etc/ssl/key.key",
+		"example.com",
+		"",
+	)
+
+	result, err := installer.addSSLConfig(content)
+	if err != nil {
+		t.Fatalf("addSSLConfig() error = %v", err)
+	}
+
+	// 注释中的未配对花括号不应阻止 SSL 安装
+	if !strings.Contains(result, "ssl_certificate ") {
+		t.Fatalf("结果应包含 ssl_certificate 指令（注释中的花括号不应影响块解析）\n%s", result)
+	}
+	// 注释行必须被原样保留（不能因跳过解析而丢失输出）
+	if !strings.Contains(result, "# 旧配置 location /old {") {
+		t.Errorf("注释行应被保留\n%s", result)
+	}
+	// ssl_certificate 必须在 server 块顶层（深度 1）
+	if depth := sslCertBraceDepth(result); depth != 1 {
+		t.Errorf("ssl_certificate 应在 server 顶层（深度 1），实际深度 %d\n%s", depth, result)
+	}
+}
+
 // TestGetIndent 测试缩进检测
 func TestGetIndent(t *testing.T) {
 	tests := []struct {
@@ -611,6 +715,42 @@ server {
 
 	if result.Modified {
 		t.Error("已有 SSL 配置时不应修改")
+	}
+}
+
+// TestInstall_NoListen80_ReturnsError 验证站点没有 listen 80（如非标准端口）时，
+// Install 返回明确错误，而非静默 Modified=false。
+// 否则 setup/deploy 会以为"无需安装"继续部署证书并误报成功，但 HTTPS 实际未生效。
+func TestInstall_NoListen80_ReturnsError(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "test.conf")
+
+	content := `
+server {
+    listen 8080;
+    server_name example.com;
+    root /var/www/html;
+}`
+	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
+		t.Fatalf("创建配置文件失败: %v", err)
+	}
+
+	installer := NewNginxInstaller(
+		configPath,
+		"/etc/ssl/cert.crt",
+		"/etc/ssl/key.key",
+		"example.com",
+		"",
+	)
+
+	result, err := installer.Install()
+	if err == nil {
+		t.Fatalf("非 80 端口站点应返回错误，实际 result=%+v, err=nil", result)
+	}
+
+	// 未实际安装时不应残留备份文件
+	if baks, _ := filepath.Glob(filepath.Join(tmpDir, "*.bak")); len(baks) > 0 {
+		t.Errorf("未安装时不应残留备份文件，实际残留: %v", baks)
 	}
 }
 

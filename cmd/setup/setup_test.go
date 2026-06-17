@@ -168,6 +168,56 @@ func TestDeployCert_Nginx(t *testing.T) {
 	}
 }
 
+// TestDeploySingleBindings_SkipDisabled 验证 SSL 配置安装失败（Enabled=false）的绑定
+// 被计为失败且不被部署，而非误报"部署成功"。
+// 回归：曾经部署循环不检查 Enabled，导致 SSL 安装失败的站点仍报成功（成功=1, 失败=0）。
+func TestDeploySingleBindings_SkipDisabled(t *testing.T) {
+	tmpDir := t.TempDir()
+	disabledCert := filepath.Join(tmpDir, "disabled", "cert.pem")
+	enabledCert := filepath.Join(tmpDir, "enabled", "cert.pem")
+
+	testCert, err := certs.GenerateValidCert("enabled.example.com", nil)
+	if err != nil {
+		t.Fatalf("生成测试证书失败: %v", err)
+	}
+
+	bindings := []config.SiteBinding{
+		{
+			ServerName: "disabled.example.com", // 模拟 SSL 配置安装失败被禁用
+			ServerType: config.ServerTypeNginx,
+			Enabled:    false,
+			Paths:      config.BindingPaths{Certificate: disabledCert, PrivateKey: filepath.Join(tmpDir, "disabled", "key.pem")},
+		},
+		{
+			ServerName: "enabled.example.com",
+			ServerType: config.ServerTypeNginx,
+			Enabled:    true,
+			Paths:      config.BindingPaths{Certificate: enabledCert, PrivateKey: filepath.Join(tmpDir, "enabled", "key.pem")},
+		},
+	}
+
+	certData := &fetcher.CertData{OrderID: 1, Cert: testCert.CertPEM}
+	success, fail, failedSites := deploySingleBindings(t.Context(), nil, bindings, certData, testCert.KeyPEM)
+
+	if success != 1 {
+		t.Errorf("success = %d, 期望 1（仅 enabled 站点）", success)
+	}
+	if fail != 1 {
+		t.Errorf("fail = %d, 期望 1（disabled 站点计为失败）", fail)
+	}
+	if len(failedSites) != 1 || failedSites[0] != "disabled.example.com" {
+		t.Errorf("failedSites = %v, 期望 [disabled.example.com]", failedSites)
+	}
+	// 禁用的绑定不应被部署：证书文件不应写入
+	if _, err := os.Stat(disabledCert); err == nil {
+		t.Error("禁用的绑定不应写入证书文件（不应被部署）")
+	}
+	// 启用的绑定应正常部署
+	if _, err := os.Stat(enabledCert); os.IsNotExist(err) {
+		t.Error("启用的绑定应写入证书文件")
+	}
+}
+
 // TestDeployCert_Apache 测试 Apache 证书部署
 func TestDeployCert_Apache(t *testing.T) {
 	tmpDir := t.TempDir()

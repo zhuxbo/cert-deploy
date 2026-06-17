@@ -409,23 +409,8 @@ func runSingle(p *setupParams, orderID int) {
 		}
 	}
 
-	// 部署到每个绑定
-	var successCount, failCount int
-	var failedSites []string
-	for i := range bindings {
-		binding := &bindings[i]
-		fmt.Printf("  部署到: %s\n", binding.ServerName)
-
-		if err := deployToSiteBinding(p.ctx, binding, certData, privateKey, p.log); err != nil {
-			fmt.Fprintf(os.Stderr, "    部署失败: %v\n", err)
-			failCount++
-			failedSites = append(failedSites, binding.ServerName)
-			binding.Enabled = false // 标记失败绑定为禁用，避免守护进程持续重试
-			continue
-		}
-		fmt.Printf("    ✓ 部署成功\n")
-		successCount++
-	}
+	// 部署到每个绑定（跳过因 SSL 配置安装失败而被禁用的绑定，计为失败而非误报成功）
+	successCount, failCount, failedSites := deploySingleBindings(p.ctx, p.log, bindings, certData, privateKey)
 
 	// 全部失败时退出
 	if successCount == 0 && failCount > 0 {
@@ -679,6 +664,32 @@ func deployToSiteBinding(ctx context.Context, binding *config.SiteBinding, certD
 	}
 
 	return deployer.Deploy(certData.Cert, certData.IntermediateCert, privateKey)
+}
+
+// deploySingleBindings 部署单证书模式的所有绑定，返回成功数、失败数和失败站点列表。
+func deploySingleBindings(ctx context.Context, log *logger.Logger, bindings []config.SiteBinding, certData *fetcher.CertData, privateKey string) (success, fail int, failedSites []string) {
+	for i := range bindings {
+		binding := &bindings[i]
+		if !binding.Enabled {
+			// SSL 配置安装失败等已禁用该绑定：计为失败，避免误报部署成功
+			fmt.Fprintf(os.Stderr, "    %s: 跳过部署（SSL 配置安装失败）\n", binding.ServerName)
+			fail++
+			failedSites = append(failedSites, binding.ServerName)
+			continue
+		}
+		fmt.Printf("  部署到: %s\n", binding.ServerName)
+
+		if err := deployToSiteBinding(ctx, binding, certData, privateKey, log); err != nil {
+			fmt.Fprintf(os.Stderr, "    部署失败: %v\n", err)
+			fail++
+			failedSites = append(failedSites, binding.ServerName)
+			binding.Enabled = false
+			continue
+		}
+		fmt.Printf("    ✓ 部署成功\n")
+		success++
+	}
+	return
 }
 
 // installService 安装守护服务

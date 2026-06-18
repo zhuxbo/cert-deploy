@@ -544,11 +544,11 @@ func (s *Scanner) parseConfigFile(filePath string) ([]*SSLSite, error) {
 			continue
 		}
 
-		// 解析 ServerName
+		// 解析 ServerName（剥离 [scheme://]fqdn[:port] 中的 scheme 与端口）
 		if matches := serverNameRe.FindStringSubmatch(line); len(matches) > 1 {
 			serverName := strings.TrimSpace(matches[1])
 			serverName = strings.Trim(serverName, `"'`)
-			currentSite.ServerName = serverName
+			currentSite.ServerName = matcher.StripPort(serverName)
 		}
 
 		// 解析 ServerAlias（可能包含多个域名，空格分隔）
@@ -556,7 +556,7 @@ func (s *Scanner) parseConfigFile(filePath string) ([]*SSLSite, error) {
 			aliases := strings.Fields(matches[1])
 			for _, alias := range aliases {
 				alias = strings.Trim(alias, `"'`)
-				currentSite.ServerAlias = append(currentSite.ServerAlias, alias)
+				currentSite.ServerAlias = append(currentSite.ServerAlias, matcher.StripPort(alias))
 			}
 		}
 
@@ -789,11 +789,11 @@ func (s *Scanner) parseHTTPConfigFile(filePath string) ([]*HTTPSite, error) {
 			hasSSL = true
 		}
 
-		// 解析 ServerName
+		// 解析 ServerName（剥离 [scheme://]fqdn[:port] 中的 scheme 与端口）
 		if matches := serverNameRe.FindStringSubmatch(line); len(matches) > 1 {
 			serverName := strings.TrimSpace(matches[1])
 			serverName = strings.Trim(serverName, `"'`)
-			currentSite.ServerName = serverName
+			currentSite.ServerName = matcher.StripPort(serverName)
 		}
 
 		// 解析 DocumentRoot
@@ -1415,11 +1415,11 @@ func (s *Scanner) parseAllConfigFile(filePath string) ([]*Site, error) {
 			currentSite.HasSSL = true
 		}
 
-		// 解析 ServerName
+		// 解析 ServerName（剥离 [scheme://]fqdn[:port] 中的 scheme 与端口）
 		if matches := serverNameRe.FindStringSubmatch(line); len(matches) > 1 {
 			serverName := strings.TrimSpace(matches[1])
 			serverName = strings.Trim(serverName, `"'`)
-			currentSite.ServerName = serverName
+			currentSite.ServerName = matcher.StripPort(serverName)
 		}
 
 		// 解析 ServerAlias（可能包含多个域名，空格分隔）
@@ -1427,7 +1427,7 @@ func (s *Scanner) parseAllConfigFile(filePath string) ([]*Site, error) {
 			aliases := strings.Fields(matches[1])
 			for _, alias := range aliases {
 				alias = strings.Trim(alias, `"'`)
-				currentSite.ServerAlias = append(currentSite.ServerAlias, alias)
+				currentSite.ServerAlias = append(currentSite.ServerAlias, matcher.StripPort(alias))
 			}
 		}
 

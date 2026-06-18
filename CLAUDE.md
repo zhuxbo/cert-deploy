@@ -195,6 +195,7 @@ docker/test/
 - 重试次数超限（> 10 次）自动停止，等待人工处理（不自动重置）
 - 配置扫描防护（Nginx/Apache/Docker 扫描器均有文件数量限制 1000 + 深度限制 100 + 文件大小限制 10MB）
 - Docker 挂载路径精确匹配（防止 `/etc/nginx` 匹配到 `/etc/nginx-backup`）
+- Apache ServerName 端口/scheme 剥离（`httpd-ssl.conf` 默认模板写 `ServerName www.example.com:443`，扫描器/安装器统一用 `matcher.StripPort` 将 `[scheme://]fqdn[:port]` 剥离为纯域名后再匹配与命名证书目录，避免误报"未找到可绑定的站点"，并防止带 `:` 的目录名在 Windows 上非法）
 - 升级解压防护（gzip 解压大小限制，防止 gzip 炸弹攻击）
 - 升级模块 Ed25519 签名验证（`pkg/upgrade`，密钥环已内置 key-1 公钥，签名格式 `ed25519:<key_id>:<base64>` 带 key ID；releases.json 按文件名索引签名 `signatures` map；已配置公钥时拒绝安装未签名版本，防止降级攻击）
 - 升级安装符号链接防护（`copyFile` 写入前检查目标路径，拒绝覆盖符号链接）

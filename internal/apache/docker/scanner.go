@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	nginxDocker "github.com/zhuxbo/sslctl/internal/nginx/docker"
+	"github.com/zhuxbo/sslctl/pkg/matcher"
 	"github.com/zhuxbo/sslctl/pkg/util"
 )
 
@@ -273,15 +274,15 @@ func (s *Scanner) parseConfig(content, configPath string, info *ContainerInfo) [
 			continue
 		}
 
-		// ServerName
+		// ServerName（剥离 [scheme://]fqdn[:port] 中的 scheme 与端口）
 		if matches := serverNameRe.FindStringSubmatch(line); len(matches) > 1 {
-			currentSite.ServerName = strings.Trim(strings.TrimSpace(matches[1]), `"'`)
+			currentSite.ServerName = matcher.StripPort(strings.Trim(strings.TrimSpace(matches[1]), `"'`))
 		}
 
 		// ServerAlias
 		if matches := serverAliasRe.FindStringSubmatch(line); len(matches) > 1 {
 			for _, alias := range strings.Fields(matches[1]) {
-				currentSite.ServerAlias = append(currentSite.ServerAlias, strings.Trim(alias, `"'`))
+				currentSite.ServerAlias = append(currentSite.ServerAlias, matcher.StripPort(strings.Trim(alias, `"'`)))
 			}
 		}
 

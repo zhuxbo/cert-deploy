@@ -247,3 +247,31 @@ func ContainsDomain(domains []string, target string) bool {
 func MatchesDomain(serverName, domain string) bool {
 	return MatchDomain(strings.ToLower(serverName), strings.ToLower(domain))
 }
+
+// StripPort 剥离主机名中可选的 scheme 前缀（如 https://）和端口后缀（如 :443），
+// 返回纯主机名/域名。用于规范化 Apache ServerName/ServerAlias——其语法为
+// [scheme://]fqdn[:port]，httpd-ssl.conf 默认模板会写成 "ServerName www.example.com:443"，
+// 端口若不剥离会导致域名匹配失败，并污染以 ServerName 命名的证书目录（Windows 上 ":" 为非法路径字符）。
+//
+//	"www.example.com:443"         -> "www.example.com"
+//	"https://www.example.com:443" -> "www.example.com"
+//	"www.example.com"             -> "www.example.com"
+//	"[2001:db8::1]:443"           -> "2001:db8::1"
+//	"2001:db8::1"                 -> "2001:db8::1"（裸 IPv6 原样保留）
+//	"_default_"                   -> "_default_"
+func StripPort(host string) string {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return host
+	}
+	// 剥离 scheme 前缀
+	if idx := strings.Index(host, "://"); idx >= 0 {
+		host = host[idx+3:]
+	}
+	// 剥离端口：net.SplitHostPort 能正确处理 [ipv6]:port；
+	// 对无端口或裸 IPv6（多冒号）返回 error，此时保留原值
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		return h
+	}
+	return host
+}

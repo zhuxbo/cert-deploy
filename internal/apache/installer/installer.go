@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/zhuxbo/sslctl/internal/executor"
+	"github.com/zhuxbo/sslctl/pkg/matcher"
 )
 
 // ApacheInstaller Apache HTTPS 安装器
@@ -30,7 +31,7 @@ func NewApacheInstaller(configPath, certPath, keyPath, chainPath, serverName, te
 		certPath:    certPath,
 		keyPath:     keyPath,
 		chainPath:   chainPath,
-		serverName:  serverName,
+		serverName:  matcher.StripPort(serverName),
 		testCommand: testCommand,
 	}
 }
@@ -115,10 +116,10 @@ func (i *ApacheInstaller) hasSSLConfig(content string) bool {
 			continue
 		}
 
-		// 解析 ServerName
+		// 解析 ServerName（剥离端口）
 		if matches := serverNameRe.FindStringSubmatch(line); len(matches) > 1 {
 			name := strings.TrimSpace(matches[1])
-			name = strings.Trim(name, `"'`)
+			name = matcher.StripPort(strings.Trim(name, `"'`))
 			serverNames = append(serverNames, name)
 		}
 
@@ -126,7 +127,7 @@ func (i *ApacheInstaller) hasSSLConfig(content string) bool {
 		if matches := serverAliasRe.FindStringSubmatch(line); len(matches) > 1 {
 			aliases := strings.Fields(matches[1])
 			for _, alias := range aliases {
-				alias = strings.Trim(alias, `"'`)
+				alias = matcher.StripPort(strings.Trim(alias, `"'`))
 				serverNames = append(serverNames, alias)
 			}
 		}
@@ -215,10 +216,10 @@ func (i *ApacheInstaller) extractHTTPVirtualHost(content string) (string, error)
 				depth--
 			}
 
-			// 检查 ServerName
+			// 检查 ServerName（剥离端口后比较）
 			if matches := serverNameRe.FindStringSubmatch(line); len(matches) > 1 {
 				serverName := strings.TrimSpace(matches[1])
-				serverName = strings.Trim(serverName, `"'`)
+				serverName = matcher.StripPort(strings.Trim(serverName, `"'`))
 				if serverName == i.serverName {
 					foundServerName = true
 				}
@@ -313,7 +314,7 @@ func (i *ApacheInstaller) Rollback(backupPath string) error {
 
 // FindHTTPVirtualHost 查找 HTTP VirtualHost 的配置文件
 func FindHTTPVirtualHost(configPath, serverName string) (string, error) {
-	return findConfigWithServerName(configPath, serverName)
+	return findConfigWithServerName(configPath, matcher.StripPort(serverName))
 }
 
 // findConfigWithServerName 递归查找配置文件
@@ -332,10 +333,10 @@ func findConfigWithServerName(configPath, serverName string) (string, error) {
 	for scanner.Scan() {
 		line := scanner.Text()
 
-		// 检查 ServerName
+		// 检查 ServerName（剥离端口后比较）
 		if matches := serverNameRe.FindStringSubmatch(line); len(matches) > 1 {
 			name := strings.TrimSpace(matches[1])
-			name = strings.Trim(name, `"'`)
+			name = matcher.StripPort(strings.Trim(name, `"'`))
 			if name == serverName {
 				return configPath, nil
 			}

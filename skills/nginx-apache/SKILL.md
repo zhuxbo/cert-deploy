@@ -121,6 +121,8 @@ executor.Run("systemctl reload nginx")
 </VirtualHost>
 ```
 
+> **ServerName 端口/scheme 剥离**：Apache `ServerName` 语法为 `[scheme://]fqdn[:port]`，`httpd-ssl.conf` 默认模板常写成 `ServerName www.example.com:443`。扫描器（`parseConfigFile`/`parseHTTPConfigFile`/`parseAllConfigFile`、Docker 扫描器）与安装器（`installer`）在解析 `ServerName`/`ServerAlias`、去引号后统一调用 `matcher.StripPort()` 剥离 scheme 与端口，得到纯域名再做匹配与证书目录命名。否则带端口的 `ServerName` 会导致域名匹配失败（"未找到可绑定的站点"），且 `:` 在 Windows 上是非法路径字符，会污染 `certs/{server_name}/` 目录创建。Nginx 的 `server_name` 与 `listen` 端口分开，无此问题。
+
 ### 重载服务
 
 所有重载命令通过 `internal/executor` 包执行，使用白名单机制：

@@ -35,10 +35,19 @@ const (
 	SpreadMax      = 120 // 最大延迟（秒）
 )
 
+// MaxRenewBeforeDays renew_before_days 的合理上限（deploy-spec 2.9）。
+// 无论续费还是重签，续签动作都应发生在到期前 30 天以内；
+// 异常大值会把全部证书拉入"需要续签"状态、触发每日全量续签风暴，视为服务端异常值拒绝。
+const MaxRenewBeforeDays = 30
+
 // tryUpdateRenewBeforeDays 如果 API 返回了有效的 renew_before_days，更新本地配置
-// 非关键路径，失败仅记录日志
+// 非关键路径，失败仅记录日志；超出合理上限时拒绝并保留旧值
 func (s *Service) tryUpdateRenewBeforeDays(renewBeforeDays int) {
 	if renewBeforeDays <= 0 {
+		return
+	}
+	if renewBeforeDays > MaxRenewBeforeDays {
+		s.log.Warn("服务端返回的 renew_before_days=%d 超过上限 %d（续签应在到期前 30 天内），保留本地配置", renewBeforeDays, MaxRenewBeforeDays)
 		return
 	}
 	if err := s.cfgManager.UpdateSchedule(func(sc *config.ScheduleConfig) {
@@ -87,6 +96,11 @@ func (s *Service) CheckAndRenewAll(ctx context.Context) ([]*RenewResult, error) 
 		if !cert.Enabled {
 			continue
 		}
+		// 到期时间未知的证书会发起一次 API 查询回填，计入延迟统计
+		if cert.Metadata.CertExpiresAt.IsZero() {
+			pendingCount++
+			continue
+		}
 		// 规范 3.2：local 模式 retry_count 超限时前置过滤
 		// 触顶证书仍会发 failure 回调（可见性），计入延迟统计
 		if cert.GetRenewMode(&cfg.Schedule) == config.RenewModeLocal &&
@@ -133,6 +147,16 @@ func (s *Service) CheckAndRenewAll(ctx context.Context) ([]*RenewResult, error) 
 		if api.URL == "" || api.Token == "" {
 			s.log.Warn("证书 %s 的 API 配置不完整，跳过续签", cert.CertName)
 			continue
+		}
+
+		// 到期时间未知（部署成功但元数据保存失败、带外换证等）：
+		// 语义为"未知需处理"，先查询 API 回填元数据再按正常逻辑判定，
+		// 避免"永不续签 + 告警盲区"双盲
+		if cert.Metadata.CertExpiresAt.IsZero() {
+			needsDelay = true
+			if !s.refreshExpiryFromAPI(ctx, &cert, api) {
+				continue
+			}
 		}
 
 		// 前置过滤：local 模式重试超限（规范 3.2 停止自动操作）
@@ -261,6 +285,34 @@ func (s *Service) resetIssueStateForResubmit(cert *config.CertConfig, cause erro
 		s.log.Warn("重置证书 %s 签发状态失败: %v", cert.CertName, err)
 	}
 	return fmt.Errorf("%w（已重置签发状态，下轮将重新提交 CSR）", cause)
+}
+
+// refreshExpiryFromAPI 到期时间未知时查询 API 回填证书元数据，返回是否回填成功
+// 查询失败或服务端无证书内容时记录告警并返回 false（下轮续签检查会再次尝试）
+func (s *Service) refreshExpiryFromAPI(ctx context.Context, cert *config.CertConfig, api config.APIConfig) bool {
+	certData, renewBeforeDays, err := s.fetcher.QueryOrder(ctx, api.URL, api.Token, cert.OrderID)
+	if err != nil {
+		s.log.Warn("证书 %s 到期时间未知且查询失败，跳过本轮: %v", cert.CertName, err)
+		return false
+	}
+	s.tryUpdateRenewBeforeDays(renewBeforeDays)
+	s.syncOrderID(cert, certData)
+	if certData.Cert == "" {
+		s.log.Warn("证书 %s 到期时间未知且服务端未返回证书内容 (status=%s)，跳过本轮", cert.CertName, certData.Status)
+		return false
+	}
+	parsed, err := validator.New("").ValidateCert(certData.Cert)
+	if err != nil || parsed == nil {
+		s.log.Warn("证书 %s 回填到期时间失败（证书解析错误）: %v", cert.CertName, err)
+		return false
+	}
+	cert.Metadata.CertExpiresAt = parsed.NotAfter
+	cert.Metadata.CertSerial = fmt.Sprintf("%X", parsed.SerialNumber)
+	if err := s.cfgManager.UpdateCert(cert); err != nil {
+		s.log.Warn("证书 %s 回填元数据保存失败: %v", cert.CertName, err)
+	}
+	s.log.Info("证书 %s 到期时间已从服务端回填: %s", cert.CertName, parsed.NotAfter.Format("2006-01-02"))
+	return true
 }
 
 // retryMaxDays 失败绑定重试的最大天数，超过后放弃重试

@@ -165,13 +165,22 @@ type MatchResult struct {
 	MissedDomains  []string  // 未匹配的域名
 }
 
-// DaysUntilExpiry 计算证书到期剩余天数
+// DaysUntilExpiry 计算证书到期剩余天数（展示用；判定请用 IsExpired/NeedsRenewal）
 func (c *CertConfig) DaysUntilExpiry() int {
 	if c.Metadata.CertExpiresAt.IsZero() {
 		return 999
 	}
 	duration := time.Until(c.Metadata.CertExpiresAt)
 	return int(duration.Hours() / 24)
+}
+
+// IsExpired 证书是否已过期（按时间点比较，避免整数天截断使"已过期"判定偏移约 24 小时）
+// 到期时间未知（零值）不视为已过期，由调用方先回填元数据
+func (c *CertConfig) IsExpired() bool {
+	if c.Metadata.CertExpiresAt.IsZero() {
+		return false
+	}
+	return time.Now().After(c.Metadata.CertExpiresAt)
 }
 
 // GetRenewMode 获取续签模式（证书级别优先，否则使用全局配置）
@@ -188,17 +197,20 @@ func (c *CertConfig) GetRenewMode(schedule *ScheduleConfig) string {
 }
 
 // NeedsRenewal 判断是否需要续期
-// 已过期证书（days < 0）不再触发续签
+// 到期时间未知（零值）返回 false：语义为"未知需处理"，由续签检查先查询 API 回填元数据后再判定
+// 已过期证书不再触发续签（按时间点判定，过期不足 24 小时也算已过期）
 func (c *CertConfig) NeedsRenewal(schedule *ScheduleConfig) bool {
-	days := c.DaysUntilExpiry()
-	if days < 0 {
+	if c.Metadata.CertExpiresAt.IsZero() {
+		return false
+	}
+	if c.IsExpired() {
 		return false
 	}
 	renewDays := schedule.RenewBeforeDays
 	if renewDays <= 0 {
 		renewDays = DefaultRenewBeforeDays
 	}
-	return days <= renewDays
+	return c.DaysUntilExpiry() <= renewDays
 }
 
 // GetCertDir 获取证书存储目录

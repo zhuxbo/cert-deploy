@@ -108,7 +108,12 @@ func (s *Service) CheckExpiry() {
 
 	now := time.Now()
 	for _, cert := range cfg.Certificates {
-		if !cert.Enabled || cert.Metadata.CertExpiresAt.IsZero() {
+		if !cert.Enabled {
+			continue
+		}
+		// 到期时间未知不再静默跳过（告警盲区），下轮续签检查会自动回填
+		if cert.Metadata.CertExpiresAt.IsZero() {
+			s.log.Warn("证书 %s 到期时间未知（元数据缺失），无法判断过期风险，续签检查将自动回填", cert.CertName)
 			continue
 		}
 

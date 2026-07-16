@@ -189,9 +189,9 @@ func TestCheckExpiry(t *testing.T) {
 			},
 		},
 		{
-			name:       "CertExpiresAt零值跳过",
-			wantLevel:  "",
-			wantAbsent: "zero-cert",
+			// 到期时间未知不再静默跳过（原为告警盲区）：输出"到期时间未知" WARN
+			name:      "CertExpiresAt零值输出未知告警",
+			wantLevel: "WARN",
 			certs: []config.CertConfig{
 				{
 					CertName: "zero-cert",

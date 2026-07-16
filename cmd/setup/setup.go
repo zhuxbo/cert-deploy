@@ -135,6 +135,17 @@ func Run(args []string, debug bool) {
 		log.SetLevel(logger.LevelDebug)
 	}
 
+	// 与守护进程共享续签互斥锁，避免 setup 与自动续签并发操作同一证书目录与配置
+	release, acquired, lockErr := config.AcquireRenewalLock(cfgManager.GetWorkDir())
+	if lockErr != nil {
+		log.Warn("%v，继续执行", lockErr)
+	} else if !acquired {
+		fmt.Fprintln(os.Stderr, "守护进程正在续签（或另一部署进程正在运行），请稍后再试")
+		os.Exit(1)
+	} else {
+		defer release()
+	}
+
 	params := &setupParams{
 		apiURL:         *apiURL,
 		token:          *token,

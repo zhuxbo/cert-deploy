@@ -146,3 +146,74 @@ func TestCalcCheckTimeout(t *testing.T) {
 		t.Errorf("最大超时应 <= 4 小时, got %v", got)
 	}
 }
+
+// TestIsCheckOverdue 验证补偿检查判定：从未检查/超阈值 → 错过；新近检查 → 正常。
+func TestIsCheckOverdue(t *testing.T) {
+	tests := []struct {
+		name        string
+		lastCheckAt time.Time
+		wantOverdue bool
+	}{
+		{"从未检查", time.Time{}, true},
+		{"26 小时前检查过", time.Now().Add(-26 * time.Hour), true},
+		{"3 天前检查过", time.Now().Add(-72 * time.Hour), true},
+		{"1 小时前检查过", time.Now().Add(-1 * time.Hour), false},
+		{"24 小时前检查过", time.Now().Add(-24 * time.Hour), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			cm, err := config.NewConfigManagerWithDir(tmpDir)
+			if err != nil {
+				t.Fatalf("创建配置管理器失败: %v", err)
+			}
+			if !tt.lastCheckAt.IsZero() {
+				if err := cm.UpdateMetadata(func(m *config.ConfigMetadata) {
+					m.LastCheckAt = tt.lastCheckAt
+				}); err != nil {
+					t.Fatalf("写入 LastCheckAt 失败: %v", err)
+				}
+			}
+
+			overdue, _ := isCheckOverdue(cm)
+			if overdue != tt.wantOverdue {
+				t.Errorf("isCheckOverdue() = %v, want %v", overdue, tt.wantOverdue)
+			}
+		})
+	}
+}
+
+// TestNextCheckDelay_OverdueUsesShortDelay 验证错过时使用短补偿延迟（30~60 分钟），
+// 未错过时走常规明天随机调度（至少 1 小时）。
+func TestNextCheckDelay_OverdueUsesShortDelay(t *testing.T) {
+	log := logger.NewNopLogger()
+
+	// 从未检查：补偿延迟 30~60 分钟
+	tmpDir := t.TempDir()
+	cm, err := config.NewConfigManagerWithDir(tmpDir)
+	if err != nil {
+		t.Fatalf("创建配置管理器失败: %v", err)
+	}
+	delay := nextCheckDelay(cm, log, false)
+	if delay < 30*time.Minute || delay > 61*time.Minute {
+		t.Errorf("错过时补偿延迟应在 30~60 分钟，实际 %v", delay)
+	}
+
+	// 首轮跳过补偿判定：启动检查已覆盖，即使 LastCheckAt 过旧也走常规调度，
+	// 避免启动轮与补偿轮双跑
+	delay = nextCheckDelay(cm, log, true)
+	if delay < time.Hour {
+		t.Errorf("首轮应跳过补偿判定走常规调度（≥1 小时），实际 %v", delay)
+	}
+
+	// 新近检查过：常规调度（nextRandomDaily 最短 1 小时）
+	if err := cm.UpdateMetadata(func(m *config.ConfigMetadata) {
+		m.LastCheckAt = time.Now()
+	}); err != nil {
+		t.Fatalf("写入 LastCheckAt 失败: %v", err)
+	}
+	delay = nextCheckDelay(cm, log, false)
+	if delay < time.Hour {
+		t.Errorf("未错过时应走常规调度（≥1 小时），实际 %v", delay)
+	}
+}

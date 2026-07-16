@@ -695,6 +695,17 @@ func runRollback(args []string) {
 		return
 	}
 
+	// 与守护进程共享续签互斥锁，避免回滚与自动续签并发操作同一证书目录（--list 只读不加锁）
+	release, acquired, lockErr := config.AcquireRenewalLock(cfgManager.GetWorkDir())
+	if lockErr != nil {
+		fmt.Fprintf(os.Stderr, "警告: %v，继续执行\n", lockErr)
+	} else if !acquired {
+		fmt.Fprintln(os.Stderr, "守护进程正在续签（或另一部署进程正在运行），请稍后再试")
+		os.Exit(1)
+	} else {
+		defer release()
+	}
+
 	// 执行回滚
 	fmt.Printf("正在回滚站点 %s...\n", *siteName)
 

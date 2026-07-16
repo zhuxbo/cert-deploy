@@ -134,138 +134,13 @@ func (s *Service) CheckAndRenewAll(ctx context.Context) ([]*RenewResult, error) 
 			case <-timer.C:
 			}
 		}
-		needsDelay = false
 
 		// 使用值拷贝而非指针，确保深拷贝保护有效
-		cert := cfg.Certificates[i]
-		if !cert.Enabled {
-			continue
-		}
-
-		// 逐证书检查 API 配置
-		api := cert.GetAPI(s.log)
-		if api.URL == "" || api.Token == "" {
-			s.log.Warn("证书 %s 的 API 配置不完整，跳过续签", cert.CertName)
-			continue
-		}
-
-		// 到期时间未知（部署成功但元数据保存失败、带外换证等）：
-		// 语义为"未知需处理"，先查询 API 回填元数据再按正常逻辑判定，
-		// 避免"永不续签 + 告警盲区"双盲
-		if cert.Metadata.CertExpiresAt.IsZero() {
-			needsDelay = true
-			if !s.refreshExpiryFromAPI(ctx, &cert, api) {
-				continue
-			}
-		}
-
-		// 前置过滤：local 模式重试超限（规范 3.2 停止自动操作）
-		// 但需保证可见性：Error 日志 + 计入本轮统计 + 上报 failure 带原因，避免静默永久死锁
-		if cert.GetRenewMode(&cfg.Schedule) == config.RenewModeLocal &&
-			cert.Metadata.IssueRetryCount >= MaxIssueRetryCount {
-			if !cert.NeedsRenewal(&cfg.Schedule) {
-				continue
-			}
-			s.log.Error("证书 %s 重试次数已达上限 (%d)，已停止自动续签，需人工处理", cert.CertName, MaxIssueRetryCount)
-			result := &RenewResult{
-				CertName: cert.CertName,
-				Mode:     config.RenewModeLocal,
-				Status:   "failure",
-				Error:    fmt.Errorf("重试次数已达上限 (%d)，已停止自动续签，需人工处理", MaxIssueRetryCount),
-			}
-			needsDelay = true
-			s.sendRenewCallback(ctx, &cert, result)
+		result, madeAPICall := s.processCertRenewal(ctx, cfg, cfg.Certificates[i], &processedCount)
+		needsDelay = madeAPICall
+		if result != nil {
 			results = append(results, result)
-			continue
 		}
-
-		// 重试失败的绑定（证书有效但部分绑定上次部署失败）
-		if !cert.NeedsRenewal(&cfg.Schedule) && len(cert.Metadata.FailedBindings) > 0 {
-			if processedCount >= MaxRenewBatch {
-				continue
-			}
-			processedCount++
-			needsDelay = true
-			s.log.Info("证书 %s 重试 %d 个失败绑定...", cert.CertName, len(cert.Metadata.FailedBindings))
-			result := s.retryFailedBindings(ctx, &cert, api)
-			// 与主路径一致：有明确结果时发送回调（pending 不发）
-			if result.Status == "success" || result.Status == "failure" {
-				s.sendRenewCallback(ctx, &cert, result)
-			}
-			results = append(results, result)
-			continue
-		}
-
-		// 检查是否需要续期
-		if !cert.NeedsRenewal(&cfg.Schedule) {
-			s.log.Debug("证书 %s 有效期充足，跳过", cert.CertName)
-			continue
-		}
-
-		if processedCount >= MaxRenewBatch {
-			continue
-		}
-		processedCount++
-
-		// 确认需要续期，将发起 API 请求
-		needsDelay = true
-
-		s.log.Info("证书 %s 需要续期，开始处理...", cert.CertName)
-
-		mode := cert.GetRenewMode(&cfg.Schedule)
-		result := &RenewResult{
-			CertName: cert.CertName,
-			Mode:     mode,
-		}
-
-		var (
-			certData   *fetcher.CertData
-			privateKey string
-		)
-
-		if mode == config.RenewModeLocal {
-			certData, privateKey, err = s.prepareLocalRenew(ctx, &cert, api)
-		} else {
-			certData, privateKey, err = s.preparePullRenew(ctx, &cert, api)
-		}
-
-		if err != nil {
-			result.Status = "failure"
-			result.Error = err
-			s.log.Warn("证书 %s 续签失败: %v", cert.CertName, err)
-			// prepare 阶段失败同样上报回调（原实现跳过了后面的回调块，服务端无法感知失败）
-			s.sendRenewCallback(ctx, &cert, result)
-			results = append(results, result)
-			continue
-		}
-
-		if certData == nil {
-			result.Status = "pending"
-			results = append(results, result)
-			continue
-		}
-
-		// 部署证书
-		deployCount, _, deployErr := s.deployCertToBindings(ctx, &cert, certData, privateKey)
-		result.DeployCount = deployCount
-		if deployErr != nil {
-			result.Status = "failure"
-			result.Error = deployErr
-		} else {
-			result.Status = "success"
-		}
-
-		// 始终持久化元数据（deployCertToBindings 内部已更新 CertExpiresAt、FailedBindings 等）
-		if err := s.cfgManager.UpdateCert(&cert); err != nil {
-			s.log.Warn("更新证书元数据失败: %v", err)
-		}
-
-		// 发送续签回调（仅在有明确结果时）
-		if result.Status == "success" || result.Status == "failure" {
-			s.sendRenewCallback(ctx, &cert, result)
-		}
-
-		results = append(results, result)
 	}
 
 	// 更新检查时间（使用原子更新避免覆盖其他并发修改）
@@ -274,6 +149,151 @@ func (s *Service) CheckAndRenewAll(ctx context.Context) ([]*RenewResult, error) 
 	})
 
 	return results, nil
+}
+
+// processCertRenewal 处理单个证书的续签检查。
+// 含 panic 隔离：单证书处理 panic 记为该证书失败并计入统计，不拖垮整轮续签。
+// 返回 result（nil 表示本证书无需处理）与是否发起过 API 请求（用于证书间分散延迟）。
+func (s *Service) processCertRenewal(ctx context.Context, cfg *config.Config, cert config.CertConfig, processedCount *int) (result *RenewResult, madeAPICall bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			s.log.Error("证书 %s 续签处理 panic（已隔离，继续处理其余证书）: %v", cert.CertName, r)
+			result = &RenewResult{
+				CertName: cert.CertName,
+				Mode:     cert.GetRenewMode(&cfg.Schedule),
+				Status:   "failure",
+				Error:    fmt.Errorf("续签处理 panic: %v", r),
+			}
+			// panic 恢复路径同样上报 failure 回调（与其他失败路径的可见性一致）
+			s.sendRenewCallback(ctx, &cert, result)
+		}
+	}()
+
+	if !cert.Enabled {
+		return nil, false
+	}
+
+	// 逐证书检查 API 配置
+	api := cert.GetAPI(s.log)
+	if api.URL == "" || api.Token == "" {
+		s.log.Warn("证书 %s 的 API 配置不完整，跳过续签", cert.CertName)
+		return nil, false
+	}
+
+	// 到期时间未知（部署成功但元数据保存失败、带外换证等）：
+	// 语义为"未知需处理"，先查询 API 回填元数据再按正常逻辑判定，
+	// 避免"永不续签 + 告警盲区"双盲
+	if cert.Metadata.CertExpiresAt.IsZero() {
+		madeAPICall = true
+		if !s.refreshExpiryFromAPI(ctx, &cert, api) {
+			return nil, madeAPICall
+		}
+	}
+
+	// 前置过滤：local 模式重试超限（规范 3.2 停止自动操作）
+	// 但需保证可见性：Error 日志 + 计入本轮统计 + 上报 failure 带原因，避免静默永久死锁
+	if cert.GetRenewMode(&cfg.Schedule) == config.RenewModeLocal &&
+		cert.Metadata.IssueRetryCount >= MaxIssueRetryCount {
+		if !cert.NeedsRenewal(&cfg.Schedule) {
+			return nil, madeAPICall
+		}
+		s.log.Error("证书 %s 重试次数已达上限 (%d)，已停止自动续签，需人工处理", cert.CertName, MaxIssueRetryCount)
+		madeAPICall = true
+		result = &RenewResult{
+			CertName: cert.CertName,
+			Mode:     config.RenewModeLocal,
+			Status:   "failure",
+			Error:    fmt.Errorf("重试次数已达上限 (%d)，已停止自动续签，需人工处理", MaxIssueRetryCount),
+		}
+		s.sendRenewCallback(ctx, &cert, result)
+		return result, madeAPICall
+	}
+
+	// 重试失败的绑定（证书有效但部分绑定上次部署失败）
+	if !cert.NeedsRenewal(&cfg.Schedule) && len(cert.Metadata.FailedBindings) > 0 {
+		if *processedCount >= MaxRenewBatch {
+			return nil, madeAPICall
+		}
+		*processedCount++
+		madeAPICall = true
+		s.log.Info("证书 %s 重试 %d 个失败绑定...", cert.CertName, len(cert.Metadata.FailedBindings))
+		result = s.retryFailedBindings(ctx, &cert, api)
+		// 与主路径一致：有明确结果时发送回调（pending 不发）
+		if result.Status == "success" || result.Status == "failure" {
+			s.sendRenewCallback(ctx, &cert, result)
+		}
+		return result, madeAPICall
+	}
+
+	// 检查是否需要续期
+	if !cert.NeedsRenewal(&cfg.Schedule) {
+		s.log.Debug("证书 %s 有效期充足，跳过", cert.CertName)
+		return nil, madeAPICall
+	}
+
+	if *processedCount >= MaxRenewBatch {
+		return nil, madeAPICall
+	}
+	*processedCount++
+
+	// 将发起 API 请求：提前置位，panic 恢复路径也保留证书间延迟语义
+	madeAPICall = true
+
+	s.log.Info("证书 %s 需要续期，开始处理...", cert.CertName)
+
+	mode := cert.GetRenewMode(&cfg.Schedule)
+	result = &RenewResult{
+		CertName: cert.CertName,
+		Mode:     mode,
+	}
+
+	var (
+		certData   *fetcher.CertData
+		privateKey string
+		err        error
+	)
+
+	if mode == config.RenewModeLocal {
+		certData, privateKey, err = s.prepareLocalRenew(ctx, &cert, api)
+	} else {
+		certData, privateKey, err = s.preparePullRenew(ctx, &cert, api)
+	}
+
+	if err != nil {
+		result.Status = "failure"
+		result.Error = err
+		s.log.Warn("证书 %s 续签失败: %v", cert.CertName, err)
+		// prepare 阶段失败同样上报回调（原实现跳过了后面的回调块，服务端无法感知失败）
+		s.sendRenewCallback(ctx, &cert, result)
+		return result, madeAPICall
+	}
+
+	if certData == nil {
+		result.Status = "pending"
+		return result, madeAPICall
+	}
+
+	// 部署证书
+	deployCount, _, deployErr := s.deployCertToBindings(ctx, &cert, certData, privateKey)
+	result.DeployCount = deployCount
+	if deployErr != nil {
+		result.Status = "failure"
+		result.Error = deployErr
+	} else {
+		result.Status = "success"
+	}
+
+	// 始终持久化元数据（deployCertToBindings 内部已更新 CertExpiresAt、FailedBindings 等）
+	if err := s.cfgManager.UpdateCert(&cert); err != nil {
+		s.log.Warn("更新证书元数据失败: %v", err)
+	}
+
+	// 发送续签回调（仅在有明确结果时）
+	if result.Status == "success" || result.Status == "failure" {
+		s.sendRenewCallback(ctx, &cert, result)
+	}
+
+	return result, madeAPICall
 }
 
 // resetIssueStateForResubmit 本轮 local 签发流程失效（pending 私钥丢失等）时重置签发状态，

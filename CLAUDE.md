@@ -210,7 +210,7 @@ docker/test/
 - systemd 服务安全限制（NoNewPrivileges + ProtectSystem=strict + ProtectHome + PrivateTmp + ProtectKernelTunables/Modules + ReadWritePaths 白名单）
 - 升级安装权限安全（临时文件保持 0600，仅在最终路径设置 0755）
 - 日志 JSON 输出模式（`SSLCTL_LOG_FORMAT=json`，敏感信息过滤在两种模式下均生效）
-- 部署/续签结果 API 回调（`pkg/certops`，非关键路径，失败仅记录日志，状态枚举统一使用 `success`/`failure`/`pending`）
+- 部署/续签结果 API 回调（`pkg/certops`，非关键路径，失败仅记录日志且传输层含指数退避重试，状态枚举统一使用 `success`/`failure`/`pending`，请求体保持三字段契约；失败原因摘要记本地 Error 日志；prepare 失败、失败绑定重试、重试触顶均上报回调，触顶证书同时记 Error 日志并计入本轮统计，不再静默）
 
 ## CSR 生成
 

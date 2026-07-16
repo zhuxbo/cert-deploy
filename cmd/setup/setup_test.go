@@ -7,12 +7,24 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/zhuxbo/sslctl/pkg/certops"
 	"github.com/zhuxbo/sslctl/pkg/config"
 	"github.com/zhuxbo/sslctl/pkg/fetcher"
+	"github.com/zhuxbo/sslctl/pkg/logger"
 	"github.com/zhuxbo/sslctl/pkg/matcher"
 	"github.com/zhuxbo/sslctl/pkg/webserver"
 	"github.com/zhuxbo/sslctl/testdata/certs"
 )
+
+// newTestDeployService 构建用于部署测试的 certops 服务（备份目录落在 dir 下）
+func newTestDeployService(t *testing.T, dir string) *certops.Service {
+	t.Helper()
+	cm, err := config.NewConfigManagerWithDir(dir)
+	if err != nil {
+		t.Fatalf("创建配置管理器失败: %v", err)
+	}
+	return certops.NewService(cm, logger.NewNopLogger())
+}
 
 // TestCreateBinding_Nginx 测试创建 Nginx 绑定
 func TestCreateBinding_Nginx(t *testing.T) {
@@ -53,6 +65,31 @@ func TestCreateBinding_Nginx(t *testing.T) {
 
 	if !strings.HasSuffix(binding.Reload.ReloadCommand, " -s reload") || !strings.Contains(binding.Reload.ReloadCommand, "nginx") {
 		t.Errorf("ReloadCommand = %s, 应包含 nginx 和 -s reload", binding.Reload.ReloadCommand)
+	}
+}
+
+// TestHasDeployFailures 验证退出码判定：任一失败/未完成即视为失败。
+func TestHasDeployFailures(t *testing.T) {
+	tests := []struct {
+		name     string
+		siteFail int
+		certFail int
+		needKey  int
+		want     bool
+	}{
+		{"全部成功", 0, 0, 0, false},
+		{"部分站点失败", 1, 0, 0, true},
+		{"证书失败", 0, 1, 0, true},
+		{"需要私钥跳过", 0, 0, 1, true},
+		{"多类失败", 2, 1, 3, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := hasDeployFailures(tt.siteFail, tt.certFail, tt.needKey); got != tt.want {
+				t.Errorf("hasDeployFailures(%d,%d,%d) = %v, want %v",
+					tt.siteFail, tt.certFail, tt.needKey, got, tt.want)
+			}
+		})
 	}
 }
 
@@ -152,7 +189,8 @@ func TestDeployCert_Nginx(t *testing.T) {
 		IntermediateCert: "",
 	}
 
-	err = deployToSiteBinding(t.Context(), binding, certData, testCert.KeyPEM, nil)
+	svc := newTestDeployService(t, tmpDir)
+	err = deployToSiteBinding(t.Context(), svc, binding, certData, testCert.KeyPEM)
 	if err != nil {
 		t.Fatalf("deployCert() error = %v", err)
 	}
@@ -197,7 +235,8 @@ func TestDeploySingleBindings_SkipDisabled(t *testing.T) {
 	}
 
 	certData := &fetcher.CertData{OrderID: 1, Cert: testCert.CertPEM}
-	success, fail, failedSites := deploySingleBindings(t.Context(), nil, bindings, certData, testCert.KeyPEM)
+	svc := newTestDeployService(t, tmpDir)
+	success, fail, failedSites := deploySingleBindings(t.Context(), svc, bindings, certData, testCert.KeyPEM)
 
 	if success != 1 {
 		t.Errorf("success = %d, 期望 1（仅 enabled 站点）", success)
@@ -244,7 +283,8 @@ func TestDeployCert_Apache(t *testing.T) {
 		IntermediateCert: intermediateCert.CertPEM,
 	}
 
-	err := deployToSiteBinding(t.Context(), binding, certData, testCert.KeyPEM, nil)
+	svc := newTestDeployService(t, tmpDir)
+	err := deployToSiteBinding(t.Context(), svc, binding, certData, testCert.KeyPEM)
 	if err != nil {
 		t.Fatalf("deployCert() error = %v", err)
 	}
@@ -282,7 +322,8 @@ func TestDeployCert_Apache_Fullchain(t *testing.T) {
 		IntermediateCert: intermediateCert.CertPEM,
 	}
 
-	err := deployToSiteBinding(t.Context(), binding, certData, testCert.KeyPEM, nil)
+	svc := newTestDeployService(t, tmpDir)
+	err := deployToSiteBinding(t.Context(), svc, binding, certData, testCert.KeyPEM)
 	if err != nil {
 		t.Fatalf("deployCert() error = %v", err)
 	}
@@ -330,7 +371,8 @@ func TestDeployCert_CreateDirectory(t *testing.T) {
 		Cert: testCert.CertPEM,
 	}
 
-	err := deployToSiteBinding(t.Context(), binding, certData, testCert.KeyPEM, nil)
+	svc := newTestDeployService(t, tmpDir)
+	err := deployToSiteBinding(t.Context(), svc, binding, certData, testCert.KeyPEM)
 	if err != nil {
 		t.Fatalf("deployCert() error = %v", err)
 	}

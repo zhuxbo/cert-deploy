@@ -50,17 +50,18 @@ func (d *NginxDeployer) Deploy(cert, intermediate, key string) error {
 		)
 	}
 
-	if err := util.AtomicWrite(d.certPath, []byte(fullchain), 0644); err != nil {
-		return errors.NewStructuredDeployError(
-			errors.DeployErrorPermission, errors.PhaseWriteCert,
-			fmt.Sprintf("failed to write certificate file: %s", d.certPath), err,
-		)
-	}
-
+	// 先写私钥再写证书：中途失败时不会留下"新证书 + 旧私钥"的错配状态
 	if err := util.AtomicWrite(d.keyPath, []byte(key), 0600); err != nil {
 		return errors.NewStructuredDeployError(
 			errors.DeployErrorPermission, errors.PhaseWriteKey,
 			fmt.Sprintf("failed to write private key file: %s", d.keyPath), err,
+		)
+	}
+
+	if err := util.AtomicWrite(d.certPath, []byte(fullchain), 0644); err != nil {
+		return errors.NewStructuredDeployError(
+			errors.DeployErrorPermission, errors.PhaseWriteCert,
+			fmt.Sprintf("failed to write certificate file: %s", d.certPath), err,
 		)
 	}
 

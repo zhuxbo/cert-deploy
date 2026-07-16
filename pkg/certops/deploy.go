@@ -137,6 +137,12 @@ func (s *Service) sendDeployCallback(ctx context.Context, cert *config.CertConfi
 	s.sendCallback(ctx, cert.GetAPI(s.log), callbackReq)
 }
 
+// DeployToBinding 将已获取的证书部署到单个绑定（含证书校验、现有证书备份、失败回滚）。
+// 供 setup 等已在外部取得 certData/privateKey 的调用方复用，避免重复实现部署路径。
+func (s *Service) DeployToBinding(ctx context.Context, binding *config.SiteBinding, certData *fetcher.CertData, privateKey string) error {
+	return s.deployToBinding(ctx, binding, certData, privateKey)
+}
+
 // deployToBinding 部署证书到绑定（带备份和回滚）
 func (s *Service) deployToBinding(ctx context.Context, binding *config.SiteBinding, certData *fetcher.CertData, privateKey string) error {
 	// 验证证书与私钥

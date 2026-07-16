@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/zhuxbo/sslctl/pkg/certops"
 	"github.com/zhuxbo/sslctl/pkg/config"
 	"github.com/zhuxbo/sslctl/pkg/fetcher"
 	"github.com/zhuxbo/sslctl/pkg/matcher"
@@ -334,6 +335,11 @@ func runBatch(p *setupParams, query string) {
 			}
 		}
 	}
+
+	// 存在失败/未完成（含需私钥而跳过）时非零退出（部分失败也算失败），便于脚本调用方感知
+	if hasDeployFailures(totalSiteFail, certFail, len(needKeyNames)) {
+		os.Exit(1)
+	}
 }
 
 // resolveSiteConflicts 为每个证书匹配站点，解决多证书匹配同一站点的冲突
@@ -492,6 +498,7 @@ func installSSLForBatch(site *matcher.ScannedSiteInfo, plan *certDeployPlan, p *
 
 // deployPlanBindings 部署证书计划中的所有绑定，返回成功和失败数
 func deployPlanBindings(p *setupParams, plan *certDeployPlan) (success, fail int) {
+	svc := certops.NewService(p.cfgManager, p.log)
 	for i := range plan.Bindings {
 		binding := &plan.Bindings[i]
 		if !binding.Enabled {
@@ -500,7 +507,7 @@ func deployPlanBindings(p *setupParams, plan *certDeployPlan) (success, fail int
 		}
 		fmt.Printf("    部署到: %s\n", binding.ServerName)
 
-		if err := deployToSiteBinding(p.ctx, binding, plan.CertData, plan.PrivateKey, p.log); err != nil {
+		if err := deployToSiteBinding(p.ctx, svc, binding, plan.CertData, plan.PrivateKey); err != nil {
 			fmt.Fprintf(os.Stderr, "      部署失败: %v\n", err)
 			fail++
 			binding.Enabled = false

@@ -176,6 +176,9 @@ docker/test/
 - 中间证书校验（API 部署必须包含中间证书，`deploy local` 的 `--ca` 参数仍可选）
 - SSL 配置自动安装（setup 流程为未启用 SSL 的站点安装 HTTPS 配置，需用户确认，备份原配置、配置测试失败自动回滚；支持 `server\n{` 多行格式；SSL 指令仅插入 server 块顶层，兼容 `root` 写在 `location` 内的 SPA/反代配置）
 - setup 部署失败如实统计（SSL 配置安装失败的绑定标记 `Enabled=false` 后跳过部署并计入失败，单证书与批量模式行为一致，不再误报"部署成功"；nginx 安装器在非 80 端口/无可处理 HTTP server 块时返回明确错误而非静默跳过，与 Apache 一致）
+- setup 退出码语义（`hasDeployFailures`）：任一站点部署失败、任一证书失败、或存在需人工提供私钥而跳过的证书，进程即以退出码 1 结束（部分失败也算失败，先保存成功站点配置再退出），单证书与批量模式一致，便于脚本调用方感知
+- setup 部署复用 certops 部署路径（`Service.DeployToBinding`），与 deploy/续签一致地做证书私钥校验、覆盖前备份现有证书、测试/reload 失败自动回滚，消除 setup 直接覆盖无备份的重复路径
+- 证书部署先写私钥后写证书（nginx/apache deployer），中途失败不留下"新证书 + 旧私钥"的错配状态
 - 文件操作安全（符号链接防护、TOCTOU 保护、AtomicWrite O_EXCL 防护）
 - 备份源文件符号链接检查（`pkg/backup` computeFileHash 拒绝符号链接）
 - 备份恢复安全（Restore 内部备份跳过 cleanup，防止清理掉正在恢复的目标备份；`siteName`/`timestamp` 路径穿越防护）

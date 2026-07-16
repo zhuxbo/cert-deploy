@@ -17,6 +17,7 @@ import (
 
 	apacheScanner "github.com/zhuxbo/sslctl/internal/apache/scanner"
 	nginxScanner "github.com/zhuxbo/sslctl/internal/nginx/scanner"
+	"github.com/zhuxbo/sslctl/pkg/certops"
 	"github.com/zhuxbo/sslctl/pkg/config"
 	sslerrors "github.com/zhuxbo/sslctl/pkg/errors"
 	"github.com/zhuxbo/sslctl/pkg/fetcher"
@@ -410,7 +411,8 @@ func runSingle(p *setupParams, orderID int) {
 	}
 
 	// 部署到每个绑定（跳过因 SSL 配置安装失败而被禁用的绑定，计为失败而非误报成功）
-	successCount, failCount, failedSites := deploySingleBindings(p.ctx, p.log, bindings, certData, privateKey)
+	svc := certops.NewService(p.cfgManager, p.log)
+	successCount, failCount, failedSites := deploySingleBindings(p.ctx, svc, bindings, certData, privateKey)
 
 	// 全部失败时退出
 	if successCount == 0 && failCount > 0 {
@@ -492,6 +494,11 @@ func runSingle(p *setupParams, orderID int) {
 	if hasDockerNonVolume && successCount > 0 {
 		fmt.Println("\n[!] 检测到 Docker 容器站点的证书路径未挂载为卷")
 		fmt.Println("    重建容器后需要重新部署证书")
+	}
+
+	// 存在部署失败的站点时非零退出（部分失败也算失败），便于脚本调用方感知
+	if hasDeployFailures(failCount, 0, 0) {
+		os.Exit(1)
 	}
 }
 
@@ -643,31 +650,13 @@ func processRestartServerName(bindings []config.SiteBinding) string {
 }
 
 // deployToSiteBinding 部署证书到单个站点绑定
-func deployToSiteBinding(ctx context.Context, binding *config.SiteBinding, certData *fetcher.CertData, privateKey string, log *logger.Logger) error {
-	// 确保目录存在
-	certDir := filepath.Dir(binding.Paths.Certificate)
-	if err := util.EnsureDir(certDir, 0700); err != nil {
-		return fmt.Errorf("创建证书目录失败: %w", err)
-	}
-
-	// 使用 webserver 抽象层创建部署器
-	deployer, err := webserver.NewDeployer(
-		webserver.ServerType(binding.ServerType),
-		binding.Paths.Certificate,
-		binding.Paths.PrivateKey,
-		binding.Paths.ChainFile,
-		binding.Reload.TestCommand,
-		binding.Reload.ReloadCommand,
-	)
-	if err != nil {
-		return fmt.Errorf("创建部署器失败: %w", err)
-	}
-
-	return deployer.Deploy(certData.Cert, certData.IntermediateCert, privateKey)
+// 复用 certops 的部署路径（证书校验 + 现有证书备份 + 失败自动回滚），与 deploy/续签路径一致
+func deployToSiteBinding(ctx context.Context, svc *certops.Service, binding *config.SiteBinding, certData *fetcher.CertData, privateKey string) error {
+	return svc.DeployToBinding(ctx, binding, certData, privateKey)
 }
 
 // deploySingleBindings 部署单证书模式的所有绑定，返回成功数、失败数和失败站点列表。
-func deploySingleBindings(ctx context.Context, log *logger.Logger, bindings []config.SiteBinding, certData *fetcher.CertData, privateKey string) (success, fail int, failedSites []string) {
+func deploySingleBindings(ctx context.Context, svc *certops.Service, bindings []config.SiteBinding, certData *fetcher.CertData, privateKey string) (success, fail int, failedSites []string) {
 	for i := range bindings {
 		binding := &bindings[i]
 		if !binding.Enabled {
@@ -679,7 +668,7 @@ func deploySingleBindings(ctx context.Context, log *logger.Logger, bindings []co
 		}
 		fmt.Printf("  部署到: %s\n", binding.ServerName)
 
-		if err := deployToSiteBinding(ctx, binding, certData, privateKey, log); err != nil {
+		if err := deployToSiteBinding(ctx, svc, binding, certData, privateKey); err != nil {
 			fmt.Fprintf(os.Stderr, "    部署失败: %v\n", err)
 			fail++
 			failedSites = append(failedSites, binding.ServerName)
@@ -690,6 +679,13 @@ func deploySingleBindings(ctx context.Context, log *logger.Logger, bindings []co
 		success++
 	}
 	return
+}
+
+// hasDeployFailures 判断本次部署是否存在失败/未完成（用于决定进程退出码）。
+// 任一站点部署失败、任一证书失败、或存在需人工提供私钥而跳过的证书，均视为失败。
+// 部分失败也算失败，便于脚本调用方通过退出码感知，而非误判为全部成功。
+func hasDeployFailures(siteFail, certFail, needKey int) bool {
+	return siteFail > 0 || certFail > 0 || needKey > 0
 }
 
 // installService 安装守护服务

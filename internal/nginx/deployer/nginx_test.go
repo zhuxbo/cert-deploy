@@ -95,6 +95,36 @@ func TestNginxDeployer_Deploy_WriteCert(t *testing.T) {
 	}
 }
 
+// TestNginxDeployer_Deploy_KeyBeforeCert 验证部署时先写私钥再写证书：
+// 让私钥写入失败（keyPath 指向一个已存在的目录，AtomicWrite 的 rename 会失败），
+// 此时证书文件不应被写出，证明私钥先于证书写入，避免"新证书 + 旧私钥"的错配窗口。
+func TestNginxDeployer_Deploy_KeyBeforeCert(t *testing.T) {
+	tmpDir := t.TempDir()
+	certPath := filepath.Join(tmpDir, "cert.pem")
+	keyPath := filepath.Join(tmpDir, "key.pem")
+
+	// 把 keyPath 造成一个目录，使私钥 AtomicWrite 的 rename 失败
+	if err := os.Mkdir(keyPath, 0700); err != nil {
+		t.Fatalf("创建目录失败: %v", err)
+	}
+
+	d := NewNginxDeployer(baseDeployer.Config{CertPath: certPath, KeyPath: keyPath})
+
+	err := d.Deploy(
+		"-----BEGIN CERTIFICATE-----\ntest-cert\n-----END CERTIFICATE-----",
+		"",
+		"-----BEGIN RSA PRIVATE KEY-----\ntest-key\n-----END RSA PRIVATE KEY-----",
+	)
+	if err == nil {
+		t.Fatal("私钥写入失败时 Deploy 应返回错误")
+	}
+
+	// 私钥先写：写失败后不应继续写证书
+	if _, statErr := os.Stat(certPath); statErr == nil {
+		t.Error("私钥写入失败后不应写出证书文件（应先写私钥再写证书）")
+	}
+}
+
 // TestNginxDeployer_Deploy_KeyPermissions 测试私钥权限
 func TestNginxDeployer_Deploy_KeyPermissions(t *testing.T) {
 	tmpDir := t.TempDir()

@@ -152,7 +152,7 @@ docker/test/
 - 定时检查：每天一次，随机选择明天 09:00~23:59 的时间点执行（服务端 0:00~7:59 续签，预留 1 小时签发）；启动即检查一次，运行中若 `LastCheckAt` 距今超 25 小时（停摆/睡眠/任务跳过）则 30~60 分钟内补偿一轮
 - 单证书 panic 隔离：续签循环中单证书处理 panic 记为该证书 failure（Error 日志+计入统计），不拖垮整轮
 - 多证书续签间隔：每个证书处理后随机延迟 30~90 秒，分散 API 请求压力
-- 文件验证支持：`status=processing` 且 API 返回 `file` 字段时，自动将验证文件写入 webroot（`util.JoinUnderDir` 防目录穿越），部署成功后自动清理
+- 文件验证支持：`status=processing` 且 API 返回 `file` 字段时，自动将验证文件写入 webroot（`util.JoinUnderDir` 防目录穿越）；验证文件全部放置失败（无可用 webroot/写入失败）按失败处理并上报原因，不再静默永远 pending；签发完成后无论部署成败均清理验证文件，不残留 webroot
 - processing 状态：保持查询等待，不自动重提交；异常状态停止等待人工处理；active 时 pending 私钥缺失且正式私钥不配对（历史改名残留/误删）则重置签发状态走重新提交 CSR（递增 retry，受 10 次上限约束），避免永久卡死
 - order_id 变更（订单续费）证书改名时同步迁移 `pending-keys/{cert_name}` 目录，local 模式续签不丢 pending 私钥
 - IP 证书支持：证书验证和域名匹配支持 `cert.IPAddresses`，IP 使用精确匹配（不走通配符逻辑）

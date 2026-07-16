@@ -473,14 +473,10 @@ func (s *Service) preparePullRenew(ctx context.Context, cert *config.CertConfig,
 	s.tryUpdateRenewBeforeDays(renewBeforeDays)
 	s.syncOrderID(cert, certData)
 	if certData.Status != "active" || certData.Cert == "" {
-		// processing + 文件验证：放置验证文件
-		if certData.Status == "processing" && certData.File != nil {
-			placed := placeValidationFiles(cert, certData.File, s.log)
-			if len(placed) > 0 {
-				cert.Metadata.ValidationFiles = placed
-				if err := s.cfgManager.UpdateCert(cert); err != nil {
-					s.log.Warn("持久化验证文件路径失败: %v", err)
-				}
+		// processing + 文件验证：放置验证文件（全部放置失败按失败处理，避免静默永远 pending）
+		if certData.Status == "processing" {
+			if err := s.applyValidationFiles(cert, certData.File, true); err != nil {
+				return nil, "", err
 			}
 		}
 		s.log.Debug("证书 %s 状态: %s，跳过", cert.CertName, certData.Status)
@@ -579,13 +575,9 @@ func (s *Service) prepareLocalRenew(ctx context.Context, cert *config.CertConfig
 			return certData, privateKey, nil
 
 		case "processing":
-			// 放置验证文件（如果有新的）
-			if certData.File != nil {
-				placed := placeValidationFiles(cert, certData.File, s.log)
-				if len(placed) > 0 {
-					cert.Metadata.ValidationFiles = placed
-					_ = s.cfgManager.UpdateCert(cert)
-				}
+			// 放置验证文件（如果有新的；全部放置失败按失败处理，避免静默永远 pending）
+			if err := s.applyValidationFiles(cert, certData.File, true); err != nil {
+				return nil, "", err
 			}
 			s.log.Debug("证书 %s CSR 正在处理，跳过", cert.CertName)
 			return nil, "", nil
@@ -649,16 +641,15 @@ func (s *Service) prepareLocalRenew(ctx context.Context, cert *config.CertConfig
 	cert.Metadata.LastIssueState = certData.Status
 
 	if certData.Status != "active" || certData.Cert == "" {
-		// 放置验证文件（如果有）
-		if certData.File != nil {
-			placed := placeValidationFiles(cert, certData.File, s.log)
-			if len(placed) > 0 {
-				cert.Metadata.ValidationFiles = placed
-			}
-		}
+		// 放置验证文件（如果有；全部放置失败按失败处理，但先保存元数据，
+		// LastIssueState=processing 已持久化，下轮走 processing 分支重试放置）
+		placeErr := s.applyValidationFiles(cert, certData.File, false)
 		// 保存元数据变更（OrderID、CSRSubmittedAt、ValidationFiles 等）
 		if err := s.cfgManager.UpdateCert(cert); err != nil {
 			s.log.Warn("保存证书元数据失败: %v", err)
+		}
+		if placeErr != nil {
+			return nil, "", placeErr
 		}
 		s.log.Info("证书 %s CSR 已提交，等待签发 (status=%s)", cert.CertName, certData.Status)
 		return nil, "", nil
@@ -752,11 +743,13 @@ func (s *Service) deployCertToBindings(ctx context.Context, cert *config.CertCon
 		cert.Metadata.LastCSRHash = ""
 		cert.Metadata.LastIssueState = ""
 		cert.Metadata.IssueRetryCount = 0
-		// 清理验证文件
-		if len(cert.Metadata.ValidationFiles) > 0 {
-			cleanupValidationFiles(cert.Metadata.ValidationFiles, s.log)
-			cert.Metadata.ValidationFiles = nil
-		}
+	}
+
+	// 清理验证文件：签发已完成（拿到证书）后验证文件用途已尽，
+	// 无论部署成败都清理，避免部署全失败时验证文件残留在 webroot
+	if len(cert.Metadata.ValidationFiles) > 0 {
+		cleanupValidationFiles(cert.Metadata.ValidationFiles, s.log)
+		cert.Metadata.ValidationFiles = nil
 	}
 
 	return deployCount, failedBindings, lastErr

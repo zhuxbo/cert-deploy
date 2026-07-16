@@ -90,6 +90,27 @@ func placeFileInWebroot(webroot string, file *fetcher.FileChallenge, log *logger
 	return fullPath, nil
 }
 
+// applyValidationFiles 放置验证文件并记录到证书元数据。
+// 挑战存在但一个文件都未放置成功（无可用 webroot 或写入全部失败）时返回错误：
+// 验证文件无法就位则签发永远不会完成，静默等待会让证书每天停在 pending 无人知晓。
+// persist 为 true 时立即持久化元数据（调用方稍后自行保存时传 false）。
+func (s *Service) applyValidationFiles(cert *config.CertConfig, file *fetcher.FileChallenge, persist bool) error {
+	if file == nil {
+		return nil
+	}
+	placed := placeValidationFiles(cert, file, s.log)
+	if len(placed) == 0 {
+		return fmt.Errorf("证书 %s 验证文件无法放置（无可用 webroot 或写入失败），文件验证无法完成，请检查绑定的 webroot 配置", cert.CertName)
+	}
+	cert.Metadata.ValidationFiles = placed
+	if persist {
+		if err := s.cfgManager.UpdateCert(cert); err != nil {
+			s.log.Warn("持久化验证文件路径失败: %v", err)
+		}
+	}
+	return nil
+}
+
 // cleanupValidationFiles 清理已放置的验证文件（非关键路径，失败仅记录日志）
 func cleanupValidationFiles(files []string, log *logger.Logger) {
 	for _, f := range files {

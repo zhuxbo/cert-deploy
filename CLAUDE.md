@@ -186,7 +186,7 @@ docker/test/
 - 文件操作安全（符号链接防护、TOCTOU 保护、AtomicWrite O_EXCL 防护）
 - 备份源文件符号链接检查（`pkg/backup` computeFileHash 拒绝符号链接）
 - 备份恢复安全（Restore 内部备份跳过 cleanup，防止清理掉正在恢复的目标备份；`siteName`/`timestamp` 路径穿越防护）
-- 配置并发安全（深拷贝 + 双重锁 + mtime + SHA256 哈希检测外部修改）
+- 配置并发安全（深拷贝 + 双重锁 + mtime + SHA256 哈希检测外部修改；写路径 `Update*` 统一走 `mutateLocked`：文件锁内感知外部修改并基于最新盘上状态读-改-写，消除 CLI 与 daemon 跨进程丢更新窗口，修改应用于副本、失败不污染缓存）
 - 续签/部署进程互斥（`config.AcquireRenewalLock` 共享 `renewal.lock`：daemon 续签检查与手动 deploy/setup 非阻塞互斥，手动侧被占用时提示"守护进程正在续签"退出，与 deploy-spec §3.7 对齐）
 - 配置保存符号链接防护（saveLocked 拒绝写入符号链接目标）
 - 日志敏感信息过滤（私钥、Bearer Token、Basic Auth、JSON 敏感字段含复合词匹配、URL 参数）

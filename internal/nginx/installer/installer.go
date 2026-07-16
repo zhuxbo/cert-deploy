@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/zhuxbo/sslctl/internal/executor"
+	"github.com/zhuxbo/sslctl/pkg/matcher"
 )
 
 // NginxInstaller Nginx HTTPS 安装器
@@ -50,30 +51,31 @@ func (i *NginxInstaller) Install() (*InstallResult, error) {
 
 	originalContent := string(content)
 
-	// 2. 检查是否已配置 SSL
-	if i.hasSSLConfig(originalContent) {
-		return &InstallResult{Modified: false}, nil
-	}
-
-	// 3. 备份原配置
-	backupPath, err := i.backup(originalContent)
-	if err != nil {
-		return nil, fmt.Errorf("备份配置失败: %w", err)
-	}
-
-	// 4. 生成新配置
+	// 2. 先执行注入（addSSLConfig 已具备"按名注入 + 跳过已配 SSL 块"能力），再据结果判定。
+	// 不能先用 hasSSLConfig 做全局短路：通配符块已配 SSL（如 *.example.com）会命中谓词，
+	// 而目标块（www.example.com，listen 80 无 SSL）仍可注入——短路会静默跳过，
+	// 证书写到无人引用的默认路径并误报成功。
 	newContent, err := i.addSSLConfig(originalContent)
 	if err != nil {
 		return nil, fmt.Errorf("生成 SSL 配置失败: %w", err)
 	}
 
-	// 未找到可处理的 server 块（如非 80 端口、无 HTTP server 块）：返回明确错误。
-	// 避免调用方误以为"无需安装"而继续部署证书并误报成功（HTTPS 实际未生效）。
-	// 与 Apache 安装器行为一致（找不到可用 VirtualHost 时也返回错误）。
-	// 此处尚未修改配置，清理无用备份。
+	// 3. 无可注入块时区分两种结果：
+	// - 匹配目标的块已配置 SSL → 无需安装（Modified=false）
+	// - 找不到可处理的 server 块（如非 80 端口、无 HTTP server 块）→ 返回明确错误，
+	//   避免调用方误以为"无需安装"而继续部署证书并误报成功（HTTPS 实际未生效），
+	//   与 Apache 安装器行为一致
 	if newContent == originalContent {
-		_ = os.Remove(backupPath)
-		return nil, fmt.Errorf("未找到可安装 HTTPS 的 server 块（需要 listen 80 的 HTTP server 块）")
+		if i.hasSSLConfig(originalContent) {
+			return &InstallResult{Modified: false}, nil
+		}
+		return nil, fmt.Errorf("未找到可安装 HTTPS 的 server 块（需要 listen 80 且 server_name 匹配 %s 的 HTTP server 块）", i.serverName)
+	}
+
+	// 4. 备份原配置（确认要写入后才备份，避免产生无用备份文件）
+	backupPath, err := i.backup(originalContent)
+	if err != nil {
+		return nil, fmt.Errorf("备份配置失败: %w", err)
 	}
 
 	// 5. 写入新配置
@@ -186,11 +188,11 @@ func (i *NginxInstaller) hasSSLConfig(content string) bool {
 
 		// server 块结束
 		if braceCount <= 0 {
-			// 检查这个 server 块是否是目标域名且已有 SSL
-			for _, name := range currentServerNames {
-				if name == i.serverName && hasSSLInBlock {
-					return true
-				}
+			// 检查这个 server 块是否匹配目标站点且已有 SSL
+			// （与 addSSLConfig 共用 blockMatchesServerName 谓词：lower + 通配符，
+			// 避免"精确匹配漏检通配符块已有 SSL → addSSLConfig 二次注入 duplicate listen"）
+			if hasSSLInBlock && i.blockMatchesServerName(currentServerNames) {
+				return true
 			}
 			inServerBlock = false
 		}
@@ -223,9 +225,11 @@ func (i *NginxInstaller) addSSLConfig(content string) (string, error) {
 	braceCount := 0
 	hasListen80 := false
 	hasIPv6Listen := false
+	hasSSLInBlock := false
 	listenLineIndex := -1
 	ipv6ListenLineIndex := -1
 	rootLineIndex := -1
+	currentServerNames := []string{}
 
 	// 正则表达式
 	listenRe := regexp.MustCompile(`^\s*listen\s+([^;]+);`)
@@ -233,6 +237,8 @@ func (i *NginxInstaller) addSSLConfig(content string) (string, error) {
 	listen80Re := regexp.MustCompile(`(?:^|[:\s])80(?:\s|;|$)`)
 	ipv6ListenRe := regexp.MustCompile(`\[::\]`)
 	rootRe := regexp.MustCompile(`^\s*root\s+`)
+	serverNameRe := regexp.MustCompile(`^\s*server_name\s+([^;]+);`)
+	sslCertRe := regexp.MustCompile(`^\s*ssl_certificate\s+`)
 
 	for _, line := range lines {
 		// 跳过注释行：保留输出，但不参与块解析（不计花括号、不匹配指令）
@@ -254,9 +260,11 @@ func (i *NginxInstaller) addSSLConfig(content string) (string, error) {
 				braceCount = 1
 				hasListen80 = false
 				hasIPv6Listen = false
+				hasSSLInBlock = false
 				listenLineIndex = -1
 				ipv6ListenLineIndex = -1
 				rootLineIndex = -1
+				currentServerNames = nil
 				result = append(result, line)
 				continue
 			}
@@ -269,9 +277,11 @@ func (i *NginxInstaller) addSSLConfig(content string) (string, error) {
 			braceCount = 1
 			hasListen80 = false
 			hasIPv6Listen = false
+			hasSSLInBlock = false
 			listenLineIndex = -1
 			ipv6ListenLineIndex = -1
 			rootLineIndex = -1
+			currentServerNames = nil
 			result = append(result, line)
 			continue
 		}
@@ -298,6 +308,16 @@ func (i *NginxInstaller) addSSLConfig(content string) (string, error) {
 				}
 			}
 
+			// 解析 server_name（可能一行多名、跨多行累积）
+			if matches := serverNameRe.FindStringSubmatch(line); len(matches) > 1 {
+				currentServerNames = append(currentServerNames, strings.Fields(matches[1])...)
+			}
+
+			// 检测块内已有 SSL 配置（已配 SSL 的块不再注入，防 duplicate listen）
+			if sslCertRe.MatchString(line) {
+				hasSSLInBlock = true
+			}
+
 			// 记录 root 指令位置（仅 server 块顶层 braceCount==1）
 			// root 写在 location 内时不能作为 SSL 插入锚点，否则 ssl_certificate 会落入
 			// location 块，触发 nginx "ssl_certificate directive is not allowed here"
@@ -307,7 +327,10 @@ func (i *NginxInstaller) addSSLConfig(content string) (string, error) {
 
 			// server 块结束
 			if braceCount <= 0 {
-				if hasListen80 && listenLineIndex >= 0 {
+				// 仅向 server_name 匹配目标站点、且尚未配置 SSL 的块注入：
+				// 已有 ssl_certificate 的块（如通配符块已配 SSL 且含 listen 80）再注入
+				// 会产生 duplicate listen 443，导致配置测试失败回滚
+				if hasListen80 && listenLineIndex >= 0 && !hasSSLInBlock && i.blockMatchesServerName(currentServerNames) {
 					// 先插入 SSL 配置（在 root 后或 listen 后），再插入 listen 443（在 listen 80 后）
 					// 注意：先插入靠后的，再插入靠前的，避免索引偏移
 					sslConfigInsertIndex := rootLineIndex
@@ -331,6 +354,26 @@ func (i *NginxInstaller) addSSLConfig(content string) (string, error) {
 	}
 
 	return strings.Join(result, "\n"), nil
+}
+
+// blockMatchesServerName 判断 server 块的 server_name 列表是否命中目标站点。
+// 兼容通配符（*.example.com）两侧匹配；无 server_name 的块（default_server 等）不命中，
+// 因为扫描器已过滤空/`_` server_name，安装器的 serverName 必为真实域名。
+func (i *NginxInstaller) blockMatchesServerName(names []string) bool {
+	if i.serverName == "" {
+		return false
+	}
+	target := strings.ToLower(i.serverName)
+	for _, name := range names {
+		if name == "_" {
+			continue
+		}
+		n := strings.ToLower(name)
+		if matcher.MatchDomain(n, target) || matcher.MatchDomain(target, n) {
+			return true
+		}
+	}
+	return false
 }
 
 // insertListenDirectives 在 listen 80 后插入 listen 443 ssl

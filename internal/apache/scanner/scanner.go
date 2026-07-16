@@ -1223,8 +1223,9 @@ func (s *Scanner) enrichSiteFromConfig(site *Site) {
 		if matches := serverNameRe.FindStringSubmatch(line); len(matches) > 1 {
 			currentServerName = strings.TrimSpace(matches[1])
 			currentServerName = strings.Trim(currentServerName, `"'`)
-			// 检查是否是目标站点
-			if currentServerName == site.ServerName {
+			// 检查是否是目标站点（两侧剥离 [scheme://]fqdn[:port] 后再比较，
+			// 兼容配置写 ServerName www.example.com:443 而 -S 输出裸域名的情形）
+			if matcher.StripPort(currentServerName) == matcher.StripPort(site.ServerName) {
 				inTargetVHost = true
 			}
 		}
@@ -1234,12 +1235,12 @@ func (s *Scanner) enrichSiteFromConfig(site *Site) {
 			continue
 		}
 
-		// 解析 ServerAlias
+		// 解析 ServerAlias（剥离 [scheme://]fqdn[:port] 中的 scheme 与端口）
 		if matches := serverAliasRe.FindStringSubmatch(line); len(matches) > 1 {
 			aliases := strings.Fields(matches[1])
 			for _, alias := range aliases {
 				alias = strings.Trim(alias, `"'`)
-				currentAliases = append(currentAliases, alias)
+				currentAliases = append(currentAliases, matcher.StripPort(alias))
 			}
 		}
 

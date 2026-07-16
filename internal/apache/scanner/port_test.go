@@ -126,6 +126,56 @@ func TestParseAllConfigFile_ServerNameWithPort(t *testing.T) {
 	}
 }
 
+// TestEnrichSiteFromConfig_ServerNameWithPort 验证 apachectl -S 富化路径。
+// -S 输出的 namevhost 是裸域名（site.ServerName=www.example.com），而配置文件里
+// 写 ServerName www.example.com:443，若富化时不剥离端口则两侧不等，
+// 目标 VirtualHost 块永不命中，CertificatePath 无法被补全，setup 误判"未启用 SSL"。
+func TestEnrichSiteFromConfig_ServerNameWithPort(t *testing.T) {
+	content := `
+<VirtualHost _default_:443>
+    ServerName www.example.com:443
+    ServerAlias example.com:443 alt.example.com
+    SSLEngine on
+    SSLCertificateFile /etc/ssl/cert.crt
+    SSLCertificateKeyFile /etc/ssl/cert.key
+    DocumentRoot /var/www/html
+</VirtualHost>
+`
+	tmpDir, err := os.MkdirTemp("", "apache-enrich-port-*")
+	if err != nil {
+		t.Fatalf("创建临时目录失败: %v", err)
+	}
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+
+	confFile := filepath.Join(tmpDir, "example-ssl.conf")
+	if err := os.WriteFile(confFile, []byte(content), 0644); err != nil {
+		t.Fatalf("写入配置失败: %v", err)
+	}
+
+	// 模拟 apachectl -S 已解析出的站点：ServerName 为裸域名，ConfigFile 指向配置
+	site := &Site{
+		ServerName: "www.example.com",
+		ConfigFile: confFile,
+		HasSSL:     true,
+	}
+
+	s := New()
+	s.enrichSiteFromConfig(site)
+
+	if site.CertificatePath != "/etc/ssl/cert.crt" {
+		t.Errorf("CertificatePath 应被富化：期望 /etc/ssl/cert.crt，实际 %q", site.CertificatePath)
+	}
+	if site.PrivateKeyPath != "/etc/ssl/cert.key" {
+		t.Errorf("PrivateKeyPath 应被富化：期望 /etc/ssl/cert.key，实际 %q", site.PrivateKeyPath)
+	}
+	if site.Webroot != "/var/www/html" {
+		t.Errorf("Webroot 应被富化：期望 /var/www/html，实际 %q", site.Webroot)
+	}
+	if len(site.ServerAlias) != 2 || site.ServerAlias[0] != "example.com" || site.ServerAlias[1] != "alt.example.com" {
+		t.Errorf("ServerAlias 应剥离端口：期望 [example.com alt.example.com]，实际 %v", site.ServerAlias)
+	}
+}
+
 // TestEndToEnd_ScanAllPortStrippedMatches 复现并验证用户报告的场景：
 // httpd-ssl.conf 中 ServerName 带 :443，修复前扫描结果带端口导致与证书域名不匹配
 // （"未找到可绑定的站点"）。修复后应能完全匹配。

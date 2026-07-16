@@ -703,3 +703,48 @@ func TestBuildCertName(t *testing.T) {
 		}
 	}
 }
+
+// TestPrewriteKeyThenCert_KeyBeforeCert 验证 needSSLInstall 预写"先写私钥后写证书"：
+// 证书写入失败时私钥应已落盘，证明写序为 key→cert（旧序 cert→key 下私钥不会被写入）。
+func TestPrewriteKeyThenCert_KeyBeforeCert(t *testing.T) {
+	tmpDir := t.TempDir()
+	keyPath := filepath.Join(tmpDir, "key.pem")
+	certPath := filepath.Join(tmpDir, "cert.pem")
+	// 制造证书写入失败：cert 路径为目录
+	if err := os.Mkdir(certPath, 0700); err != nil {
+		t.Fatalf("制造证书写入障碍失败: %v", err)
+	}
+
+	err := prewriteKeyThenCert(certPath, keyPath, "FULLCHAIN", "PRIVATEKEY")
+	if err == nil {
+		t.Fatal("证书路径为目录时预写应失败")
+	}
+	// 关键断言：证书写入失败时私钥已先落盘
+	got, readErr := os.ReadFile(keyPath)
+	if readErr != nil {
+		t.Fatalf("私钥应先于证书写入（写序应为 key→cert）: %v", readErr)
+	}
+	if string(got) != "PRIVATEKEY" {
+		t.Errorf("私钥内容 = %q, want PRIVATEKEY", string(got))
+	}
+}
+
+// TestPrewriteKeyThenCert_Success 正常路径：私钥与证书均写入，私钥权限 0600、证书 0644。
+func TestPrewriteKeyThenCert_Success(t *testing.T) {
+	tmpDir := t.TempDir()
+	keyPath := filepath.Join(tmpDir, "key.pem")
+	certPath := filepath.Join(tmpDir, "cert.pem")
+
+	if err := prewriteKeyThenCert(certPath, keyPath, "FULLCHAIN", "PRIVATEKEY"); err != nil {
+		t.Fatalf("正常预写应成功: %v", err)
+	}
+	if data, _ := os.ReadFile(keyPath); string(data) != "PRIVATEKEY" {
+		t.Errorf("私钥内容 = %q, want PRIVATEKEY", string(data))
+	}
+	if data, _ := os.ReadFile(certPath); string(data) != "FULLCHAIN" {
+		t.Errorf("证书内容 = %q, want FULLCHAIN", string(data))
+	}
+	if fi, err := os.Stat(keyPath); err == nil && fi.Mode().Perm() != 0600 {
+		t.Errorf("私钥权限 = %o, want 0600", fi.Mode().Perm())
+	}
+}

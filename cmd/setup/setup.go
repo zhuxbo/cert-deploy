@@ -397,13 +397,8 @@ func runSingle(p *setupParams, orderID int) {
 		if certData.IntermediateCert != "" {
 			fullchain += "\n" + certData.IntermediateCert
 		}
-		if err := util.AtomicWrite(binding.Paths.Certificate, []byte(fullchain), 0644); err != nil {
-			fmt.Fprintf(os.Stderr, "    %s: 写入证书失败: %v\n", site.ServerName, err)
-			binding.Enabled = false
-			continue
-		}
-		if err := util.AtomicWrite(binding.Paths.PrivateKey, []byte(privateKey), 0600); err != nil {
-			fmt.Fprintf(os.Stderr, "    %s: 写入私钥失败: %v\n", site.ServerName, err)
+		if err := prewriteKeyThenCert(binding.Paths.Certificate, binding.Paths.PrivateKey, fullchain, privateKey); err != nil {
+			fmt.Fprintf(os.Stderr, "    %s: %v\n", site.ServerName, err)
 			binding.Enabled = false
 			continue
 		}
@@ -752,6 +747,19 @@ func installService() error {
 
 	// 启动服务
 	return svcMgr.Start()
+}
+
+// prewriteKeyThenCert 为待安装 SSL 的站点预写证书文件：先写私钥后写证书，
+// 与全项目"先写私钥后写证书"原则一致，中途失败不留下"新证书 + 旧私钥"的错配状态。
+// 注意：两文件各自原子写，但两者之间尚未事务化（TODO：needSSLInstall 预写整体事务化）。
+func prewriteKeyThenCert(certPath, keyPath, fullchain, privateKey string) error {
+	if err := util.AtomicWrite(keyPath, []byte(privateKey), 0600); err != nil {
+		return fmt.Errorf("写入私钥失败: %w", err)
+	}
+	if err := util.AtomicWrite(certPath, []byte(fullchain), 0644); err != nil {
+		return fmt.Errorf("写入证书失败: %w", err)
+	}
+	return nil
 }
 
 // installSSLConfig 为未启用 SSL 的站点安装 HTTPS 配置

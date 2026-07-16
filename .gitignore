@@ -55,3 +55,6 @@ release-key.pub
 public_key.go
 build/keys/
 mock-api
+
+# 过程性文档（不入库）
+.superpowers/

@@ -36,9 +36,10 @@ type ScannedSite struct {
 	ChainFilePath   string `json:"chain_file_path,omitempty"`    // 证书链路径（Apache SSLCertificateChainFile）
 
 	// Docker 特有（宿主机路径）
-	HostCertPath string `json:"host_cert_path,omitempty"` // 宿主机证书路径
-	HostKeyPath  string `json:"host_key_path,omitempty"`  // 宿主机私钥路径
-	VolumeMode   bool   `json:"volume_mode,omitempty"`    // 是否挂载卷模式
+	HostCertPath  string `json:"host_cert_path,omitempty"`  // 宿主机证书路径
+	HostKeyPath   string `json:"host_key_path,omitempty"`   // 宿主机私钥路径
+	HostChainPath string `json:"host_chain_path,omitempty"` // 宿主机证书链路径（Apache）
+	VolumeMode    bool   `json:"volume_mode,omitempty"`     // 是否挂载卷模式
 }
 
 // getWorkDir 获取工作目录

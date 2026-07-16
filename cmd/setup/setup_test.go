@@ -93,6 +93,118 @@ func TestHasDeployFailures(t *testing.T) {
 	}
 }
 
+// TestCreateBinding_DockerNginx_Volume 验证 Docker Nginx 站点绑定：
+// 证书路径用宿主机挂载路径、命令为 docker exec 容器化命令、Docker 信息为 volume 模式。
+func TestCreateBinding_DockerNginx_Volume(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgManager, _ := config.NewConfigManagerWithDir(tmpDir)
+
+	site := &matcher.ScannedSiteInfo{
+		ServerName:    "docker.example.com",
+		ConfigFile:    "/etc/nginx/conf.d/docker.conf",
+		HasSSL:        true,
+		CertPath:      "/etc/nginx/certs/cert.pem", // 容器内路径
+		KeyPath:       "/etc/nginx/certs/key.pem",
+		ServerType:    config.ServerTypeDockerNginx,
+		ContainerID:   "abc123",
+		ContainerName: "nginx-web",
+		HostCertPath:  "/opt/docker/certs/cert.pem", // 宿主机挂载路径
+		HostKeyPath:   "/opt/docker/certs/key.pem",
+		VolumeMode:    true,
+	}
+
+	binding := createBinding(site, cfgManager)
+
+	// 证书路径应为宿主机侧挂载路径（而非容器内路径）
+	if binding.Paths.Certificate != "/opt/docker/certs/cert.pem" {
+		t.Errorf("Certificate = %s, 应为宿主机挂载路径", binding.Paths.Certificate)
+	}
+	if binding.Paths.PrivateKey != "/opt/docker/certs/key.pem" {
+		t.Errorf("PrivateKey = %s, 应为宿主机挂载路径", binding.Paths.PrivateKey)
+	}
+	// 命令应为容器化 docker exec 命令
+	if binding.Reload.TestCommand != "docker exec nginx-web nginx -t" {
+		t.Errorf("TestCommand = %q, 应为 docker exec nginx-web nginx -t", binding.Reload.TestCommand)
+	}
+	if binding.Reload.ReloadCommand != "docker exec nginx-web nginx -s reload" {
+		t.Errorf("ReloadCommand = %q, 应为 docker exec nginx-web nginx -s reload", binding.Reload.ReloadCommand)
+	}
+	// Docker 信息应为 volume 模式
+	if binding.Docker == nil || binding.Docker.DeployMode != "volume" || binding.Docker.ContainerName != "nginx-web" {
+		t.Errorf("Docker 信息不正确: %+v", binding.Docker)
+	}
+	// 校验应通过（可安全部署）
+	if err := config.ValidateDockerBinding(&binding); err != nil {
+		t.Errorf("挂载卷 Docker 绑定应可部署: %v", err)
+	}
+}
+
+// TestCreateBinding_DockerNginx_NoMount 验证无宿主机挂载路径的 Docker 站点为 copy 模式，
+// 部署校验会拒绝（不可通过通用路径安全部署）。
+func TestCreateBinding_DockerNginx_NoMount(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgManager, _ := config.NewConfigManagerWithDir(tmpDir)
+
+	site := &matcher.ScannedSiteInfo{
+		ServerName:    "docker2.example.com",
+		ConfigFile:    "/etc/nginx/conf.d/docker2.conf",
+		HasSSL:        true,
+		CertPath:      "/etc/nginx/certs/cert.pem",
+		KeyPath:       "/etc/nginx/certs/key.pem",
+		ServerType:    config.ServerTypeDockerNginx,
+		ContainerName: "nginx-web2",
+		VolumeMode:    false, // 无挂载卷
+	}
+
+	binding := createBinding(site, cfgManager)
+
+	if binding.Docker == nil || binding.Docker.DeployMode != "copy" {
+		t.Errorf("无挂载卷应为 copy 模式: %+v", binding.Docker)
+	}
+	if err := config.ValidateDockerBinding(&binding); err == nil {
+		t.Error("copy 模式 Docker 绑定应被部署校验拒绝")
+	}
+}
+
+// TestCreateBinding_DockerApache_VolumeChainHostPath 验证 Docker Apache 卷模式下证书链使用宿主机路径：
+// 此前 createBinding 只取容器内 ChainPath，卷模式会把证书链写到宿主机错误位置。
+func TestCreateBinding_DockerApache_VolumeChainHostPath(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgManager, _ := config.NewConfigManagerWithDir(tmpDir)
+
+	site := &matcher.ScannedSiteInfo{
+		ServerName:    "docker-apache.example.com",
+		ConfigFile:    "/etc/apache2/sites/docker.conf",
+		HasSSL:        true,
+		CertPath:      "/etc/apache2/ssl/cert.pem", // 容器内路径
+		KeyPath:       "/etc/apache2/ssl/key.pem",
+		ChainPath:     "/etc/apache2/ssl/chain.pem", // 容器内链路径
+		ServerType:    config.ServerTypeDockerApache,
+		ContainerID:   "def456",
+		ContainerName: "apache-web",
+		HostCertPath:  "/opt/docker/ssl/cert.pem", // 宿主机挂载路径
+		HostKeyPath:   "/opt/docker/ssl/key.pem",
+		HostChainPath: "/opt/docker/ssl/chain.pem",
+		VolumeMode:    true,
+	}
+
+	binding := createBinding(site, cfgManager)
+
+	// 证书链应为宿主机侧挂载路径（而非容器内路径）
+	if binding.Paths.ChainFile != "/opt/docker/ssl/chain.pem" {
+		t.Errorf("ChainFile = %s, 应为宿主机链路径 /opt/docker/ssl/chain.pem", binding.Paths.ChainFile)
+	}
+	if binding.Paths.Certificate != "/opt/docker/ssl/cert.pem" {
+		t.Errorf("Certificate = %s, 应为宿主机路径", binding.Paths.Certificate)
+	}
+	if binding.Docker == nil || binding.Docker.DeployMode != "volume" {
+		t.Errorf("应为 volume 模式: %+v", binding.Docker)
+	}
+	if err := config.ValidateDockerBinding(&binding); err != nil {
+		t.Errorf("宿主机路径齐全的卷绑定应可部署: %v", err)
+	}
+}
+
 // TestCreateBinding_Apache 测试创建 Apache 绑定
 func TestCreateBinding_Apache(t *testing.T) {
 	tmpDir := t.TempDir()

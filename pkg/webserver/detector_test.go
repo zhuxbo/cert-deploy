@@ -504,3 +504,29 @@ func TestDetectDockerServer_AllInvalidChars(t *testing.T) {
 		}
 	}
 }
+
+// TestDetectDockerCommands 测试 Docker 容器化 test/reload 命令构建
+func TestDetectDockerCommands(t *testing.T) {
+	tests := []struct {
+		name       string
+		serverType ServerType
+		container  string
+		wantTest   string
+		wantReload string
+	}{
+		{"docker-nginx", TypeDockerNginx, "my-nginx", "docker exec my-nginx nginx -t", "docker exec my-nginx nginx -s reload"},
+		{"docker-apache", TypeDockerApache, "web_1", "docker exec web_1 apachectl -t", "docker exec web_1 apachectl graceful"},
+		{"空容器名返回空命令", TypeDockerNginx, "", "", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmds := DetectDockerCommands(tt.serverType, tt.container)
+			if cmds.TestCmd != tt.wantTest {
+				t.Errorf("TestCmd = %q, want %q", cmds.TestCmd, tt.wantTest)
+			}
+			if cmds.ReloadCmd != tt.wantReload {
+				t.Errorf("ReloadCmd = %q, want %q", cmds.ReloadCmd, tt.wantReload)
+			}
+		})
+	}
+}

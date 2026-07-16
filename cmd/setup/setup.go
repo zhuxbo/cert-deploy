@@ -536,16 +536,20 @@ func scanSites(serverType string, log *logger.Logger) []*matcher.ScannedSiteInfo
 	// 转换为 matcher.ScannedSiteInfo
 	for _, site := range allSites {
 		sites = append(sites, &matcher.ScannedSiteInfo{
-			ServerName:  site.ServerName,
-			ServerAlias: site.ServerAlias,
-			ConfigFile:  site.ConfigFile,
-			HasSSL:      site.CertificatePath != "",
-			CertPath:    site.CertificatePath,
-			KeyPath:     site.PrivateKeyPath,
-			ChainPath:   site.ChainFile,
-			ServerType:  string(site.ServerType),
-			ContainerID: site.ContainerID,
-			VolumeMode:  site.VolumeMode,
+			ServerName:    site.ServerName,
+			ServerAlias:   site.ServerAlias,
+			ConfigFile:    site.ConfigFile,
+			HasSSL:        site.CertificatePath != "",
+			CertPath:      site.CertificatePath,
+			KeyPath:       site.PrivateKeyPath,
+			ChainPath:     site.ChainFile,
+			ServerType:    string(site.ServerType),
+			ContainerID:   site.ContainerID,
+			ContainerName: site.ContainerName,
+			HostCertPath:  site.HostCertPath,
+			HostKeyPath:   site.HostKeyPath,
+			HostChainPath: site.HostChainPath,
+			VolumeMode:    site.VolumeMode,
 		})
 	}
 
@@ -589,12 +593,24 @@ func mergeSameNameSites(sites []*matcher.ScannedSiteInfo) []*matcher.ScannedSite
 
 // createBinding 创建站点绑定
 func createBinding(site *matcher.ScannedSiteInfo, cm *config.ConfigManager) config.SiteBinding {
+	isDocker := config.IsDockerType(site.ServerType)
+
 	// 确定证书路径
 	certPath := site.CertPath
 	keyPath := site.KeyPath
 
-	// 如果站点没有 SSL 配置，使用默认路径
-	if certPath == "" {
+	// Docker 站点：证书写入宿主机侧挂载路径（容器内路径不能直接写）
+	if isDocker {
+		if site.HostCertPath != "" {
+			certPath = site.HostCertPath
+		}
+		if site.HostKeyPath != "" {
+			keyPath = site.HostKeyPath
+		}
+	}
+
+	// 本地站点无 SSL 配置时使用默认路径；Docker 站点缺挂载路径由部署层报错，不落默认路径
+	if certPath == "" && !isDocker {
 		certDir, _ := cm.EnsureSiteCertsDir(site.ServerName)
 		certPath = filepath.Join(certDir, "cert.pem")
 		keyPath = filepath.Join(certDir, "key.pem")
@@ -613,16 +629,31 @@ func createBinding(site *matcher.ScannedSiteInfo, cm *config.ConfigManager) conf
 	}
 
 	// Apache：保留扫描到的 ChainFile 路径（已有 SSLCertificateChainFile 的站点）
-	// 新安装 SSL 的站点 ChainPath 为空，使用 fullchain 模式
-	if site.ChainPath != "" {
+	// 新安装 SSL 的站点 ChainPath 为空，使用 fullchain 模式。
+	// Docker 卷模式必须用宿主机链路径，否则会把证书链写到容器内路径（宿主机错误位置）。
+	if site.VolumeMode && site.HostChainPath != "" {
+		binding.Paths.ChainFile = site.HostChainPath
+	} else if site.ChainPath != "" {
 		binding.Paths.ChainFile = site.ChainPath
 	}
 
 	// 设置重载命令（根据系统环境动态检测）
 	var cmds webserver.ServerCommands
-	if site.ServerType == config.ServerTypeNginx {
+	switch {
+	case isDocker:
+		// Docker 站点：容器化 test/reload 命令 + Docker 元信息
+		cmds = webserver.DetectDockerCommands(webserver.ServerType(site.ServerType), site.ContainerName)
+		deployMode := "copy"
+		if site.VolumeMode && site.HostCertPath != "" {
+			deployMode = "volume"
+		}
+		binding.Docker = &config.DockerInfo{
+			ContainerName: site.ContainerName,
+			DeployMode:    deployMode,
+		}
+	case site.ServerType == config.ServerTypeNginx:
 		cmds = webserver.DetectNginxCommands()
-	} else if site.ServerType == config.ServerTypeApache {
+	case site.ServerType == config.ServerTypeApache:
 		cmds = webserver.DetectApacheCommands()
 	}
 	if cmds.TestCmd != "" {

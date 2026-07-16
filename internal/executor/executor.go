@@ -5,12 +5,46 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
+	"regexp"
 	"strings"
 	"time"
 )
 
 // DefaultTimeout 命令执行默认超时时间
 const DefaultTimeout = 30 * time.Second
+
+// dockerContainerNameRe 校验 docker 容器名/ID（防止 docker exec 命令注入）
+// docker 命名规则：首字符为字母数字，其后允许字母数字与 _ . -
+var dockerContainerNameRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$`)
+
+// allowedDockerInnerCommands docker exec 允许在容器内执行的测试/重载命令
+// 仅放行固定的 Web 服务器测试与重载命令，容器名单独做字符白名单校验
+var allowedDockerInnerCommands = map[string]bool{
+	"nginx -t":            true,
+	"nginx -s reload":     true,
+	"apachectl -t":        true,
+	"apachectl graceful":  true,
+	"apache2ctl -t":       true,
+	"apache2ctl graceful": true,
+	"httpd -t":            true,
+	"httpd -k graceful":   true,
+}
+
+// parseDockerExec 解析 "docker exec <container> <inner...>"
+// 返回容器名与内层命令；非 docker exec 命令返回 ok=false
+func parseDockerExec(cmdStr string) (container, inner string, ok bool) {
+	fields := strings.Fields(cmdStr)
+	if len(fields) < 4 || fields[0] != "docker" || fields[1] != "exec" {
+		return "", "", false
+	}
+	return fields[2], strings.Join(fields[3:], " "), true
+}
+
+// IsDockerExecCommand 判断命令是否为受支持的 docker exec 容器重载命令
+func IsDockerExecCommand(cmdStr string) bool {
+	container, inner, ok := parseDockerExec(cmdStr)
+	return ok && dockerContainerNameRe.MatchString(container) && allowedDockerInnerCommands[inner]
+}
 
 // AllowedCommands 允许的命令白名单（支持多发行版和 Windows）
 var AllowedCommands = map[string]bool{
@@ -175,6 +209,23 @@ func RunContext(ctx context.Context, cmdStr string) error {
 	if AllowedCommands[cmdStr] {
 		executable, args := ParseCommand(cmdStr)
 		cmd := exec.CommandContext(ctx, executable, args...)
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("%w: %s", err, string(output))
+		}
+		return nil
+	}
+
+	// docker exec 容器内重载：容器名做字符白名单校验，内层命令做固定白名单校验
+	if container, inner, ok := parseDockerExec(cmdStr); ok {
+		if !dockerContainerNameRe.MatchString(container) {
+			return fmt.Errorf("invalid docker container name: %s", container)
+		}
+		if !allowedDockerInnerCommands[inner] {
+			return fmt.Errorf("docker inner command not in whitelist: %s", inner)
+		}
+		args := append([]string{"exec", container}, strings.Fields(inner)...)
+		cmd := exec.CommandContext(ctx, "docker", args...)
 		output, err := cmd.CombinedOutput()
 		if err != nil {
 			return fmt.Errorf("%w: %s", err, string(output))

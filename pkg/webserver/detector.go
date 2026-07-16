@@ -385,6 +385,28 @@ func DetectApacheCommands() ServerCommands {
 	return cmds
 }
 
+// DetectDockerCommands 构建 Docker 容器内的测试/重载命令
+// 命令通过 `docker exec <容器名> <Web 服务器命令>` 在容器内执行，
+// 容器内 nginx/apache 二进制在标准 PATH 中，无需宿主机路径探测。
+// containerName 为空时返回空命令，表示无法构建（调用方据此判定绑定不可部署）。
+func DetectDockerCommands(serverType ServerType, containerName string) ServerCommands {
+	if containerName == "" {
+		return ServerCommands{}
+	}
+	prefix := "docker exec " + containerName + " "
+	if serverType == TypeDockerApache {
+		return ServerCommands{
+			TestCmd:   prefix + "apachectl -t",
+			ReloadCmd: prefix + "apachectl graceful",
+		}
+	}
+	// 默认按 docker-nginx 处理
+	return ServerCommands{
+		TestCmd:   prefix + "nginx -t",
+		ReloadCmd: prefix + "nginx -s reload",
+	}
+}
+
 // findApacheWindowsService 优先匹配二进制路径含 httpd 的服务，其次匹配 apache。
 // 拆分两次匹配避免 nginx/apache 二进制路径互相误命中。
 func findApacheWindowsService() string {

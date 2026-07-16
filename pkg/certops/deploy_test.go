@@ -695,8 +695,9 @@ func TestDeployToBinding_WithBackup(t *testing.T) {
 	}
 }
 
-// TestDeployToBinding_DockerNginx 测试 Docker Nginx 部署
-func TestDeployToBinding_DockerNginx(t *testing.T) {
+// TestDeployToBinding_DockerNginx_RejectsUnsafe 验证 Docker Nginx 绑定在非挂载卷模式
+// （无 Docker 信息、无容器重载命令）时被拒绝部署，而非静默写到错误位置并"报成功"。
+func TestDeployToBinding_DockerNginx_RejectsUnsafe(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	cm, err := config.NewConfigManagerWithDir(tmpDir)
@@ -707,7 +708,6 @@ func TestDeployToBinding_DockerNginx(t *testing.T) {
 	log := logger.NewNopLogger()
 	svc := NewService(cm, log)
 
-	// 生成有效证书
 	testCert, err := certs.GenerateValidCert("test.example.com", []string{"test.example.com"})
 	if err != nil {
 		t.Fatalf("生成测试证书失败: %v", err)
@@ -725,19 +725,20 @@ func TestDeployToBinding_DockerNginx(t *testing.T) {
 		},
 	}
 
-	certData := &fetcher.CertData{
-		Cert:             testCert.CertPEM,
-		IntermediateCert: "",
-	}
+	certData := &fetcher.CertData{Cert: testCert.CertPEM}
 
 	err = svc.deployToBinding(t.Context(), binding, certData, testCert.KeyPEM)
-	if err != nil {
-		t.Errorf("Docker Nginx 部署失败: %v", err)
+	if err == nil {
+		t.Fatal("非挂载卷 Docker 绑定应被拒绝部署（避免静默写错位置并报成功）")
+	}
+	// 拒绝时不应写出证书文件
+	if _, statErr := os.Stat(certPath); statErr == nil {
+		t.Error("被拒绝的 Docker 部署不应写出证书文件")
 	}
 }
 
-// TestDeployToBinding_DockerApache 测试 Docker Apache 部署
-func TestDeployToBinding_DockerApache(t *testing.T) {
+// TestDeployToBinding_DockerApache_RejectsUnsafe 同上，针对 Docker Apache。
+func TestDeployToBinding_DockerApache_RejectsUnsafe(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	cm, err := config.NewConfigManagerWithDir(tmpDir)
@@ -748,7 +749,6 @@ func TestDeployToBinding_DockerApache(t *testing.T) {
 	log := logger.NewNopLogger()
 	svc := NewService(cm, log)
 
-	// 生成有效证书
 	testCert, err := certs.GenerateValidCert("test.example.com", []string{"test.example.com"})
 	if err != nil {
 		t.Fatalf("生成测试证书失败: %v", err)
@@ -766,14 +766,14 @@ func TestDeployToBinding_DockerApache(t *testing.T) {
 		},
 	}
 
-	certData := &fetcher.CertData{
-		Cert:             testCert.CertPEM,
-		IntermediateCert: "",
-	}
+	certData := &fetcher.CertData{Cert: testCert.CertPEM}
 
 	err = svc.deployToBinding(t.Context(), binding, certData, testCert.KeyPEM)
-	if err != nil {
-		t.Errorf("Docker Apache 部署失败: %v", err)
+	if err == nil {
+		t.Fatal("非挂载卷 Docker 绑定应被拒绝部署（避免静默写错位置并报成功）")
+	}
+	if _, statErr := os.Stat(certPath); statErr == nil {
+		t.Error("被拒绝的 Docker 部署不应写出证书文件")
 	}
 }
 

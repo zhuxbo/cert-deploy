@@ -174,8 +174,12 @@ type ScannedSiteInfo struct {
 	ServerType  string   // 服务器类型
 
 	// Docker 特有
-	ContainerID string // 容器 ID（非空表示 Docker 站点）
-	VolumeMode  bool   // 证书路径是否挂载为卷
+	ContainerID   string // 容器 ID（非空表示 Docker 站点）
+	ContainerName string // 容器名（用于构建 docker exec 重载命令）
+	HostCertPath  string // 宿主机证书路径（挂载卷映射后的路径）
+	HostKeyPath   string // 宿主机私钥路径
+	HostChainPath string // 宿主机证书链路径（Apache SSLCertificateChainFile 的挂载映射）
+	VolumeMode    bool   // 证书路径是否挂载为卷
 }
 
 // MatchSites 批量匹配站点

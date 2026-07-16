@@ -321,10 +321,12 @@ func (s *Scanner) parseConfig(content, configPath string, info *ContainerInfo) [
 }
 
 // resolveHostPaths 解析宿主机路径
+// VolumeMode 仅在待写的每个证书文件都解析出宿主机映射时才置位：证书、私钥必须解析出宿主机路径，
+// 若配置了 SSLCertificateChainFile，则证书链也必须解析出宿主机路径。任一未挂载都判为非卷模式，
+// 交由 config.ValidateDockerBinding 明确报错并计为失败，避免把未挂载文件写到宿主机错误位置后误报成功。
 func (s *Scanner) resolveHostPaths(site *SSLSite) {
 	if m := s.client.FindMountForPath(s.mounts, site.CertificatePath); m != nil {
 		site.HostCertPath = s.client.ResolveHostPath(site.CertificatePath, m)
-		site.VolumeMode = true
 	}
 	if m := s.client.FindMountForPath(s.mounts, site.PrivateKeyPath); m != nil {
 		site.HostKeyPath = s.client.ResolveHostPath(site.PrivateKeyPath, m)
@@ -334,6 +336,9 @@ func (s *Scanner) resolveHostPaths(site *SSLSite) {
 			site.HostChainPath = s.client.ResolveHostPath(site.ChainPath, m)
 		}
 	}
+	// 证书 + 私钥必须解析出宿主机路径；若配置了证书链，则链也必须解析出宿主机路径
+	site.VolumeMode = site.HostCertPath != "" && site.HostKeyPath != "" &&
+		(site.ChainPath == "" || site.HostChainPath != "")
 	if site.Webroot != "" {
 		if m := s.client.FindMountForPath(s.mounts, site.Webroot); m != nil {
 			site.HostWebroot = s.client.ResolveHostPath(site.Webroot, m)

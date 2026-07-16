@@ -242,6 +242,15 @@ func fixCertName(cfgManager *config.ConfigManager, cert *config.CertConfig, log 
 
 // deployToBinding 部署到绑定（带备份和回滚）
 func deployToBinding(binding *config.SiteBinding, certData *fetcher.CertData, privateKey string, backupMgr *backup.Manager, log *logger.Logger) error {
+	// Docker 站点：校验可安全部署（挂载卷模式 + 容器重载命令），否则如实报错而非静默成功
+	if config.IsDockerType(binding.ServerType) {
+		if err := config.ValidateDockerBinding(binding); err != nil {
+			return err
+		}
+	} else if binding.Reload.ReloadCommand == "" && log != nil {
+		log.Warn("站点 %s 无重载命令，部署后不会自动重载服务", binding.ServerName)
+	}
+
 	certDir := filepath.Dir(binding.Paths.Certificate)
 	if err := util.EnsureDir(certDir, 0700); err != nil {
 		return fmt.Errorf("创建证书目录失败: %w", err)
@@ -701,28 +710,36 @@ func buildBindingFromScanResult(site *config.ScannedSite, cfgManager *config.Con
 	}
 
 	// Apache：保留扫描到的 ChainFile 路径（已有 SSLCertificateChainFile 的站点）
-	// 新站点 ChainFilePath 为空，使用 fullchain 模式
-	if site.ChainFilePath != "" {
+	// 新站点 ChainFilePath 为空，使用 fullchain 模式。
+	// Docker 卷模式必须用宿主机链路径，否则会把证书链写到容器内路径（宿主机错误位置）。
+	if site.VolumeMode && site.HostChainPath != "" {
+		binding.Paths.ChainFile = site.HostChainPath
+	} else if site.ChainFilePath != "" {
 		binding.Paths.ChainFile = site.ChainFilePath
 	}
 
 	// Docker 站点添加信息
-	if site.Source == "docker" {
+	isDocker := config.IsDockerType(serverType)
+	if isDocker {
+		// 仅当卷模式且已解析出宿主机路径时，才算可通过宿主机写入部署（volume）
+		deployMode := "copy"
+		if site.VolumeMode && site.HostCertPath != "" {
+			deployMode = "volume"
+		}
 		binding.Docker = &config.DockerInfo{
 			ContainerName: site.ContainerName,
-		}
-		if site.VolumeMode {
-			binding.Docker.DeployMode = "volume"
-		} else {
-			binding.Docker.DeployMode = "copy"
+			DeployMode:    deployMode,
 		}
 	}
 
 	// 添加默认重载命令（根据系统环境动态检测）
 	var cmds webserver.ServerCommands
-	if serverType == config.ServerTypeNginx {
+	switch {
+	case isDocker:
+		cmds = webserver.DetectDockerCommands(webserver.ServerType(serverType), site.ContainerName)
+	case serverType == config.ServerTypeNginx:
 		cmds = webserver.DetectNginxCommands()
-	} else if serverType == config.ServerTypeApache {
+	case serverType == config.ServerTypeApache:
 		cmds = webserver.DetectApacheCommands()
 	}
 	if cmds.TestCmd != "" {

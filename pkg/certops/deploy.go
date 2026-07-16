@@ -145,6 +145,16 @@ func (s *Service) DeployToBinding(ctx context.Context, binding *config.SiteBindi
 
 // deployToBinding 部署证书到绑定（带备份和回滚）
 func (s *Service) deployToBinding(ctx context.Context, binding *config.SiteBinding, certData *fetcher.CertData, privateKey string) error {
+	// Docker 站点：校验可安全部署（挂载卷模式 + 容器重载命令），否则如实报错而非静默成功
+	if config.IsDockerType(binding.ServerType) {
+		if err := config.ValidateDockerBinding(binding); err != nil {
+			return errors.NewStructuredDeployError(errors.DeployErrorConfig, errors.PhaseWriteCert, err.Error(), nil)
+		}
+	} else if binding.Reload.ReloadCommand == "" {
+		// 非 Docker 站点无重载命令：保留原有跳过行为，但记录告警提示部署后未重载
+		s.log.Warn("站点 %s 无重载命令，部署后不会自动重载服务", binding.ServerName)
+	}
+
 	// 验证证书与私钥
 	v := validator.New("")
 	if _, err := v.ValidateCert(certData.Cert); err != nil {

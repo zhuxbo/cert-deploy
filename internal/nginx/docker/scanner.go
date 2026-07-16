@@ -362,19 +362,22 @@ func (s *Scanner) parseConfig(content, configPath string, info *ContainerInfo) [
 }
 
 // resolveHostPaths 解析宿主机路径
+// VolumeMode 仅在证书与私钥都解析出宿主机映射时才置位：只有部分文件挂载时（如证书挂载、
+// 私钥未挂载）通过通用部署路径写入会把未挂载文件落到宿主机错误位置，必须判为非卷模式，
+// 交由 config.ValidateDockerBinding 明确报错并计为失败，而非静默"部署成功"。
 func (s *Scanner) resolveHostPaths(site *SSLSite) {
 	// 查找证书路径对应的挂载
-	certMount := s.client.FindMountForPath(s.mounts, site.CertificatePath)
-	if certMount != nil {
+	if certMount := s.client.FindMountForPath(s.mounts, site.CertificatePath); certMount != nil {
 		site.HostCertPath = s.client.ResolveHostPath(site.CertificatePath, certMount)
-		site.VolumeMode = true
 	}
 
 	// 查找私钥路径对应的挂载
-	keyMount := s.client.FindMountForPath(s.mounts, site.PrivateKeyPath)
-	if keyMount != nil {
+	if keyMount := s.client.FindMountForPath(s.mounts, site.PrivateKeyPath); keyMount != nil {
 		site.HostKeyPath = s.client.ResolveHostPath(site.PrivateKeyPath, keyMount)
 	}
+
+	// 证书与私钥都解析出宿主机路径才算可安全通过宿主机写入部署（Nginx 用 fullchain，无独立 chain）
+	site.VolumeMode = site.HostCertPath != "" && site.HostKeyPath != ""
 
 	// 查找 webroot 对应的挂载
 	if site.Webroot != "" {

@@ -312,6 +312,7 @@ func (a *apacheScannerAdapter) ScanDocker() ([]webserver.Site, error) {
 				ContainerName:   ds.ContainerName,
 				HostCertPath:    ds.HostCertPath,
 				HostKeyPath:     ds.HostKeyPath,
+				HostChainPath:   ds.HostChainPath,
 				VolumeMode:      ds.VolumeMode,
 			})
 		}

@@ -198,6 +198,7 @@ docker/test/
 - 重试次数超限（> 10 次）自动停止，等待人工处理（不自动重置）
 - 配置扫描防护（Nginx/Apache/Docker 扫描器均有文件数量限制 1000 + 深度限制 100 + 文件大小限制 10MB）
 - Docker 挂载路径精确匹配（防止 `/etc/nginx` 匹配到 `/etc/nginx-backup`）
+- Docker 站点部署（setup/deploy）：证书写入宿主机侧挂载路径（`HostCertPath`，非容器内路径），test/reload 用容器化命令 `docker exec <容器> nginx -t`/`nginx -s reload`（apache 用 `apachectl`）；executor 放行 `docker exec <容器> <固定命令>`（容器名字符白名单 + 内层命令白名单）；base deployer 对 docker exec 命令跳过宿主机 SIGUSR1/进程重启回退；非挂载卷（copy 模式）或缺容器重载命令时 `config.ValidateDockerBinding` 返回明确错误、如实计为失败，不再静默写错位置报成功；旧版本 setup 创建的存量绑定升级后持续报失败属预期，需重跑 setup 补齐容器命令与卷校验（见 README「存量 Docker 绑定升级说明」；apache 容器内仅 httpd/apache2ctl 时 reload 明确报错，自动探测待后续支持）
 - Apache ServerName 端口/scheme 剥离（`httpd-ssl.conf` 默认模板写 `ServerName www.example.com:443`，扫描器/安装器统一用 `matcher.StripPort` 将 `[scheme://]fqdn[:port]` 剥离为纯域名后再匹配与命名证书目录，避免误报"未找到可绑定的站点"，并防止带 `:` 的目录名在 Windows 上非法）
 - 升级解压防护（gzip 解压大小限制，防止 gzip 炸弹攻击）
 - 升级模块 Ed25519 签名验证（`pkg/upgrade`，密钥环已内置 key-1 公钥，签名格式 `ed25519:<key_id>:<base64>` 带 key ID；releases.json 按文件名索引签名 `signatures` map；已配置公钥时拒绝安装未签名版本，防止降级攻击）

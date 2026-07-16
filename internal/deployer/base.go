@@ -80,6 +80,12 @@ func (b *Base) ReloadService() error {
 		return b.reloadWinSvc()
 	}
 
+	// docker exec 重载命令直接在容器内执行，宿主机侧的 SIGUSR1/进程重启回退不适用
+	// （Apache/nginx master 进程在容器内，宿主机没有对应进程）
+	if executor.IsDockerExecCommand(b.ReloadCommand) {
+		return executor.Run(b.ReloadCommand)
+	}
+
 	// Linux 容器环境预检：如果 systemd 不可用且命令涉及 httpd/apache，
 	// 先尝试通过 SIGUSR1 信号 reload（避免 httpd -k graceful 因无 dbus 导致进程异常退出）
 	if runtime.GOOS != "windows" && !isSystemdAvailable() && b.isApacheReload() {

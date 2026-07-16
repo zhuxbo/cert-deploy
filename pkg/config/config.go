@@ -2,6 +2,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"time"
 
@@ -115,6 +116,38 @@ const (
 	ServerTypeDockerNginx  = string(webserver.TypeDockerNginx)
 	ServerTypeDockerApache = string(webserver.TypeDockerApache)
 )
+
+// IsDockerType 判断服务器类型是否为 Docker 变体（docker-nginx / docker-apache）
+func IsDockerType(serverType string) bool {
+	return serverType == ServerTypeDockerNginx || serverType == ServerTypeDockerApache
+}
+
+// ValidateDockerBinding 校验 Docker 站点绑定能否通过通用部署路径安全部署。
+// 通用部署器只能写宿主机文件并用 docker exec 重载，因此要求：
+//   - 挂载卷模式（证书目录已映射到宿主机），否则写入会落到错误位置；
+//   - 存在容器重载命令（能确定容器名），否则部署后无法在容器内生效；
+//   - 待写的证书与私钥路径均非空（卷模式下应为扫描解析出的宿主机路径）。
+//     路径为空意味着宿主机映射解析失败，写入会落到错误位置或失败，须计为失败而非静默"成功"。
+// 不满足时返回错误，调用方应中止并如实计为失败，而非静默"部署成功"。
+// 非 Docker 类型返回 nil。
+func ValidateDockerBinding(binding *SiteBinding) error {
+	if !IsDockerType(binding.ServerType) {
+		return nil
+	}
+	if binding.Docker == nil || binding.Docker.DeployMode != "volume" {
+		return fmt.Errorf("站点 %s 的 Docker 证书目录未挂载为宿主机卷（copy 模式），通用部署路径无法安全写入，跳过部署", binding.ServerName)
+	}
+	if binding.Reload.ReloadCommand == "" {
+		return fmt.Errorf("站点 %s 缺少 Docker 容器重载命令（未能确定容器名），跳过部署", binding.ServerName)
+	}
+	if binding.Paths.Certificate == "" {
+		return fmt.Errorf("站点 %s 的 Docker 证书宿主机路径为空（挂载映射解析失败），跳过部署", binding.ServerName)
+	}
+	if binding.Paths.PrivateKey == "" {
+		return fmt.Errorf("站点 %s 的 Docker 私钥宿主机路径为空（挂载映射解析失败），跳过部署", binding.ServerName)
+	}
+	return nil
+}
 
 // MatchType 匹配类型
 type MatchType string

@@ -4,6 +4,22 @@
 
 ---
 
+## 0. 检查范围
+
+先确定本次检查的 diff 范围，后续所有"审查改动"的步骤都以此范围为准：
+
+- **工作区模式**（默认）：改动尚未提交，范围是 `git diff` + `git diff --cached`。
+- **工作分支模式**：改动已按批次提交到特性分支，以基线分支（通常 `dev`）为对照：
+
+```bash
+git log --oneline <base>..HEAD    # 逐提交清单
+git diff <base>...HEAD            # 全量改动
+```
+
+分支模式还需逐提交检查：每个提交只含单一主题的相关文件；提交信息为 `type: 中文主题` + 2–10 条要点式 body；无任何 AI 署名。
+
+---
+
 ## 1. 编译检查
 
 运行交叉编译，确认三个目标平台均能编译通过：
@@ -43,6 +59,8 @@ GOOS=windows golangci-lint run ./... --timeout=5m    # Windows 视角
 - 不要通过添加 `//nolint` 注释来绕过检查，除非有充分理由并加注释说明
 - 跨平台 lint 在任意机器上都能跑，无需 Windows 物理机
 
+gofmt 要求：go.mod 目标为 `go 1.24`，CI 也用 Go 1.24 工具链，且 `.golangci.yml` 未启用 gofmt/gofumpt，故 CI 不单独检查格式。若本机 Go 工具链比 1.24 新（如 1.26），其 gofmt 采用了更新的规范（例如删除函数尾部空行），会对约 40 个基线文件报告差异——这是**工具链版本漂移，非仓库缺陷**。要求：本次改动的行符合 go.mod 目标版本（go 1.24）的 gofmt；不要因本机新版 gofmt 而重排未触碰的既有代码。
+
 ## 4. Go 项目专项检查
 
 ### 4.1 平台兼容性
@@ -50,9 +68,12 @@ GOOS=windows golangci-lint run ./... --timeout=5m    # Windows 视角
 检查是否涉及平台相关代码。本项目使用 Build Tag 隔离平台实现：
 
 - `pkg/util/inode_unix.go` / `inode_windows.go`
-- `pkg/util/selinux_linux.go`
+- `pkg/util/selinux_linux.go` / `selinux_other.go`
 - `pkg/config/flock_unix.go` / `flock_windows.go`
-- `cmd/console_windows.go`
+- `internal/executor/detach_unix.go` / `detach_windows.go`
+- `internal/deployer/signal_unix.go` / `signal_windows.go`
+- `pkg/service/systemd.go` / `openrc.go` / `sysvinit.go` / `windows.go` / `windows_stub.go`
+- `cmd/console_windows.go` / `console_other.go`
 
 如果修改了平台相关逻辑，确认：
 
@@ -99,14 +120,39 @@ GOOS=windows golangci-lint run ./... --timeout=5m    # Windows 视角
 - 错误是否包含类型分类、阶段定位和可重试判断？
 - API 回调错误是否仅记录日志而非阻断主流程？
 
-## 5. Git Diff 审查
+### 4.7 部署链专项（涉及 pkg/certops、cmd/setup、cmd/deploy、internal/*/installer 时）
 
-运行以下命令查看完整改动：
+- **回调契约**：回调请求体是否严格三字段（order_id/status/deployed_at）？status 仅 success/failure/pending？新增失败路径（prepare/重试/触顶/panic）是否都发送 failure 回调？
+- **假成功语义**：success 与退出码是否以实际生效为前提——部分失败退出码非零；reload/test 失败不算成功且回滚；docker 绑定空命令/无卷必须明确报错而非静默跳过；安装器"无可注入块"必须报错而非 Modified=false。
+- **pending 私钥生命周期**（spec §3.8/§5.3）：配对校验通过且部署成功后才转正/清理；校验失败保留 pending、不触碰线上私钥；重试与手动部署路径必须能感知 pending（GetPrivateKeyForCert）；部署全失败时不得更新到期元数据（保持下轮完整自愈）。
+- **备份/回滚对齐**：所有部署入口（setup/deploy/续签）覆盖站点证书前先备份、失败回滚；回滚用文件操作有符号链接防护。
+- **并发互斥**：证书操作入口（deploy/setup/rollback/daemon）是否共享续签锁；配置写路径是否走锁内 fresh-load 读-改-写。
+
+### 4.8 deploy-spec.md 跨仓一致性（改动触碰 deploy-spec.md 时）
+
+`deploy-spec.md` 是四仓（sslctl / sslctlw / sslbt / sslnas）共享的统一部署规范，必须**逐字节一致**。若本次改动触碰了 `deploy-spec.md`，同步更新另三仓后逐一比对：
 
 ```bash
-git diff
-git diff --cached
+for d in ../sslctlw ../sslbt ../sslnas; do
+  if diff -q deploy-spec.md "$d/deploy-spec.md" >/dev/null 2>&1; then
+    echo "OK   $d 一致"
+  else
+    echo "DIFF $d 不一致"; diff deploy-spec.md "$d/deploy-spec.md"
+  fi
+done
+```
+
+- 全部输出 `OK` 才算通过；任一 `DIFF` 需把四仓改到字节一致后再提交。
+- 客户端代码若引用了 spec 的条款编号（如回调契约、pending 私钥生命周期、renew_before_days 上限），确认编号与 spec 现行版本对应。
+
+## 5. Git Diff 审查
+
+按第 0 步确定的范围查看完整改动：
+
+```bash
 git status
+git diff && git diff --cached        # 工作区模式
+git diff <base>...HEAD               # 工作分支模式（并逐提交 git show）
 ```
 
 逐项确认：
@@ -126,12 +172,13 @@ git status
 go test -coverprofile=coverage.out ./... && go tool cover -func=coverage.out | tail -1
 ```
 
-核心包的覆盖率基线：
+核心包的覆盖率基线（实测）：
 
-- `pkg/errors` — 100%
-- `pkg/config` — 76%
-- `pkg/backup` — 75%
-- 整体 — 48%+
+- `pkg/errors` — 98.6%
+- `pkg/config` — 83.7%
+- `pkg/backup` — 85.9%
+- `pkg/certops` — 78.5%
+- 整体 — 53.5%（`go tool cover -func` 全量语句加权，含 `cmd/*`、`internal/deployer` 等低覆盖入口包；核心业务包普遍 78%+）
 
 新增代码应有对应的测试。覆盖率不应显著下降。
 

@@ -149,8 +149,12 @@ func fetchAndDeployCert(ctx context.Context, cfgManager *config.ConfigManager, c
 		cert.OrderID = certData.OrderID
 	}
 
-	// 修正 cert_name：确保与 order_id 一致
-	fixCertName(cfgManager, cert, log)
+	// 修正 cert_name：确保与 order_id 一致（复用 certops 单一实现，含 pending 私钥迁移）
+	oldCertName := cert.CertName
+	certops.FixCertName(cfgManager, cert, log)
+	if cert.CertName != oldCertName {
+		fmt.Printf("  证书名称修正: %s -> %s\n", oldCertName, cert.CertName)
+	}
 
 	if certData.Status != "active" || certData.Cert == "" {
 		return fmt.Errorf("证书未就绪: status=%s", certData.Status)
@@ -163,8 +167,9 @@ func fetchAndDeployCert(ctx context.Context, cfgManager *config.ConfigManager, c
 		return fmt.Errorf("证书验证失败: %w", err)
 	}
 
-	// 获取私钥：优先使用 API 返回，否则从本地读取
-	privateKey, err := certops.GetPrivateKeyFromBindings(cert.Bindings, certData.PrivateKey)
+	// 获取私钥：优先使用 API 返回，否则从本地读取（pending 感知，配对校验；
+	// 续签部署全失败后 pending 私钥尚未转正，手动 deploy 须能用它补救）
+	privateKey, err := certops.GetPrivateKeyForCert(cfgManager.GetWorkDir(), cert, certData.Cert, certData.PrivateKey, log)
 	if err != nil {
 		return err
 	}
@@ -216,28 +221,11 @@ func fetchAndDeployCert(ctx context.Context, cfgManager *config.ConfigManager, c
 		cert.Metadata.LastDeployAt = time.Now()
 		cert.Metadata.CertExpiresAt = parsedCert.NotAfter
 		cert.Metadata.CertSerial = fmt.Sprintf("%X", parsedCert.SerialNumber)
+		// 部署成功后补转正 pending 私钥（若本次使用的正是 pending 私钥）
+		certops.CommitPendingKeyIfMatches(cfgManager.GetWorkDir(), cert, privateKey, log)
 	}
 
 	return cfgManager.UpdateCert(cert)
-}
-
-// fixCertName 修正 cert_name 使其与 order_id 一致
-// cert_name 格式: {domain}-{order_id}
-func fixCertName(cfgManager *config.ConfigManager, cert *config.CertConfig, log *logger.Logger) {
-	idx := strings.LastIndex(cert.CertName, "-")
-	if idx < 0 {
-		return
-	}
-	expectedName := fmt.Sprintf("%s-%d", cert.CertName[:idx], cert.OrderID)
-	if expectedName == cert.CertName {
-		return
-	}
-	oldName := cert.CertName
-	cert.CertName = expectedName
-	fmt.Printf("  证书名称修正: %s -> %s\n", oldName, expectedName)
-	if err := cfgManager.RenameCert(oldName, cert); err != nil {
-		log.Warn("重命名证书配置失败: %v", err)
-	}
 }
 
 // deployToBinding 部署到绑定（带备份和回滚）
@@ -403,8 +391,8 @@ func installSSLForSite(ctx context.Context, site *config.ScannedSite, binding *c
 		return fmt.Errorf("证书未就绪: status=%s", certData.Status)
 	}
 
-	// 获取私钥
-	privateKey, err := certops.GetPrivateKeyFromBindings(cert.Bindings, certData.PrivateKey)
+	// 获取私钥（pending 感知，配对校验）
+	privateKey, err := certops.GetPrivateKeyForCert(cfgManager.GetWorkDir(), cert, certData.Cert, certData.PrivateKey, nil)
 	if err != nil {
 		return err
 	}

@@ -151,7 +151,8 @@ docker/test/
 - 定时检查：每天一次，随机选择明天 09:00~23:59 的时间点执行（服务端 0:00~7:59 续签，预留 1 小时签发）
 - 多证书续签间隔：每个证书处理后随机延迟 30~90 秒，分散 API 请求压力
 - 文件验证支持：`status=processing` 且 API 返回 `file` 字段时，自动将验证文件写入 webroot（`util.JoinUnderDir` 防目录穿越），部署成功后自动清理
-- processing 状态：保持查询等待，不自动重提交；异常状态停止等待人工处理
+- processing 状态：保持查询等待，不自动重提交；异常状态停止等待人工处理；active 时 pending 私钥缺失且正式私钥不配对（历史改名残留/误删）则重置签发状态走重新提交 CSR（递增 retry，受 10 次上限约束），避免永久卡死
+- order_id 变更（订单续费）证书改名时同步迁移 `pending-keys/{cert_name}` 目录，local 模式续签不丢 pending 私钥
 - IP 证书支持：证书验证和域名匹配支持 `cert.IPAddresses`，IP 使用精确匹配（不走通配符逻辑）
 
 详见 `skills/deploy-ops/SKILL.md`
@@ -179,6 +180,7 @@ docker/test/
 - setup 退出码语义（`hasDeployFailures`）：任一站点部署失败、任一证书失败、或存在需人工提供私钥而跳过的证书，进程即以退出码 1 结束（部分失败也算失败，先保存成功站点配置再退出），单证书与批量模式一致，便于脚本调用方感知
 - setup 部署复用 certops 部署路径（`Service.DeployToBinding`），与 deploy/续签一致地做证书私钥校验、覆盖前备份现有证书、测试/reload 失败自动回滚，消除 setup 直接覆盖无备份的重复路径
 - 证书部署先写私钥后写证书（nginx/apache deployer），中途失败不留下"新证书 + 旧私钥"的错配状态
+- pending 私钥转正时机（local 续签）：签发 active 后先校验服务端证书与 pending 私钥配对，不配对按失败处理（保留 pending、不动线上私钥）；配对通过部署成功后才转正（deploy-spec §3.8），旧线上私钥由部署路径覆盖前备份
 - 文件操作安全（符号链接防护、TOCTOU 保护、AtomicWrite O_EXCL 防护）
 - 备份源文件符号链接检查（`pkg/backup` computeFileHash 拒绝符号链接）
 - 备份恢复安全（Restore 内部备份跳过 cleanup，防止清理掉正在恢复的目标备份；`siteName`/`timestamp` 路径穿越防护）

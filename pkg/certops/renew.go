@@ -14,6 +14,7 @@ import (
 	"github.com/zhuxbo/sslctl/pkg/config"
 	"github.com/zhuxbo/sslctl/pkg/csr"
 	"github.com/zhuxbo/sslctl/pkg/fetcher"
+	"github.com/zhuxbo/sslctl/pkg/logger"
 	"github.com/zhuxbo/sslctl/pkg/util"
 	"github.com/zhuxbo/sslctl/pkg/validator"
 )
@@ -228,6 +229,17 @@ func (s *Service) CheckAndRenewAll(ctx context.Context) ([]*RenewResult, error) 
 	return results, nil
 }
 
+// resetIssueStateForResubmit 本轮 local 签发流程失效（pending 私钥丢失等）时重置签发状态，
+// 使下一轮续签检查走重新提交 CSR 路径（提交时递增 issue_retry_count，受 10 次上限约束，
+// 触顶后停止并上报，符合规范 3.5 生命周期），避免 processing 状态永久卡死
+func (s *Service) resetIssueStateForResubmit(cert *config.CertConfig, cause error) error {
+	cert.Metadata.LastIssueState = ""
+	if err := s.cfgManager.UpdateCert(cert); err != nil {
+		s.log.Warn("重置证书 %s 签发状态失败: %v", cert.CertName, err)
+	}
+	return fmt.Errorf("%w（已重置签发状态，下轮将重新提交 CSR）", cause)
+}
+
 // retryMaxDays 失败绑定重试的最大天数，超过后放弃重试
 const retryMaxDays = 7
 
@@ -265,7 +277,9 @@ func (s *Service) retryFailedBindings(ctx context.Context, cert *config.CertConf
 		return result
 	}
 
-	privateKey, err := GetPrivateKey(cert, certData.PrivateKey, s.log)
+	// pending 感知：续签部署全失败后 pending 私钥尚未转正，重试须能读到它，
+	// 否则旧私钥与新证书配对必败，重试期满后站点走向真实过期
+	privateKey, err := GetPrivateKeyForCert(s.cfgManager.GetWorkDir(), cert, certData.Cert, certData.PrivateKey, s.log)
 	if err != nil {
 		s.log.Warn("重试失败绑定: 获取私钥失败: %v", err)
 		result.Status = "failure"
@@ -302,6 +316,10 @@ func (s *Service) retryFailedBindings(ctx context.Context, cert *config.CertConf
 	} else {
 		result.Status = "failure"
 		result.Error = fmt.Errorf("%d 个绑定仍然失败", len(stillFailed))
+	}
+	// 重试部署成功后补转正 pending 私钥（若本次使用的正是 pending 私钥）
+	if result.DeployCount > 0 {
+		s.commitPendingKeyAfterDeploy(cert, privateKey)
 	}
 	if err := s.cfgManager.UpdateCert(cert); err != nil {
 		s.log.Warn("更新证书元数据失败: %v", err)
@@ -359,8 +377,8 @@ func (s *Service) preparePullRenew(ctx context.Context, cert *config.CertConfig,
 		return nil, "", fmt.Errorf("中间证书为空，等待下一周期重试")
 	}
 
-	// 获取私钥：优先使用 API 返回，否则从本地读取
-	privateKey, err := GetPrivateKey(cert, certData.PrivateKey, s.log)
+	// 获取私钥：优先使用 API 返回，否则从本地读取（pending 感知，配对校验）
+	privateKey, err := GetPrivateKeyForCert(s.cfgManager.GetWorkDir(), cert, certData.Cert, certData.PrivateKey, s.log)
 	if err != nil {
 		return nil, "", err
 	}
@@ -381,11 +399,15 @@ func (s *Service) prepareLocalRenew(ctx context.Context, cert *config.CertConfig
 		return nil, "", fmt.Errorf("missing local private key path")
 	}
 
-	// 如果上次提交仍在处理中，查询当前订单状态
-	if cert.Metadata.LastIssueState == "processing" {
-		// 规范 3.5：processing 状态下证书已过期则停止，等待人工处理
-		if cert.DaysUntilExpiry() < 0 {
-			s.log.Error("证书 %s 已过期且 CSR 仍在处理中，等待人工处理", cert.CertName)
+	// 上次提交仍在处理中（processing），或已秒签为 active 但尚未部署成功：
+	// 两者都先查询当前订单状态，据结果读取 pending 私钥复用部署路径，
+	// 避免重新生成 CSR 覆盖与已签发证书配对的 pending 私钥（秒签全失败续跑关键分支）。
+	entryState := cert.Metadata.LastIssueState
+	if entryState == "processing" || entryState == "active" {
+		// 规范 3.5：证书已过期则停止，等待人工处理
+		// 按时间点判定，避免整数天截断使过期不足 24 小时的证书仍被继续处理
+		if cert.IsExpired() {
+			s.log.Error("证书 %s 已过期且签发未完成部署（状态 %s），等待人工处理", cert.CertName, entryState)
 			return nil, "", fmt.Errorf("证书已过期，等待人工处理")
 		}
 		certData, renewBeforeDays, err := s.fetcher.QueryOrder(ctx, api.URL, api.Token, cert.OrderID)
@@ -402,23 +424,43 @@ func (s *Service) prepareLocalRenew(ctx context.Context, cert *config.CertConfig
 				s.log.Debug("证书 %s 状态 active 但内容为空，跳过", cert.CertName)
 				return nil, "", nil
 			}
-			// 签发成功，尝试读取待确认私钥
-			privateKey, err := readPendingKey(workDir, cert.CertName)
-			if err != nil {
-				// 回退到正式私钥，使用安全读取函数
-				keyData, readErr := util.SafeReadFile(keyPath, config.MaxPrivateKeySize)
-				if readErr != nil {
-					return nil, "", fmt.Errorf("读取私钥失败: %w", readErr)
-				}
-				privateKey = string(keyData)
-			} else {
-				// 将待确认私钥提交为正式私钥
-				if err := commitPendingKey(workDir, cert.CertName, keyPath); err != nil {
-					return nil, "", fmt.Errorf("提交待确认私钥失败: %w", err)
-				}
-			}
 			if certData.IntermediateCert == "" {
 				return nil, "", fmt.Errorf("中间证书为空，等待下一周期重试")
+			}
+			// 签发成功，尝试读取待确认私钥（仅读取内容，不动线上私钥；
+			// 转正在部署成功后由 deployCertToBindings 执行，遵循规范 3.8）
+			privateKey, err := readPendingKey(workDir, cert.CertName)
+			usedFallbackKey := false
+			if err != nil {
+				// pending 私钥缺失（历史 order_id 变更未迁移、被误删等）：回退到正式私钥
+				keyData, readErr := util.SafeReadFile(keyPath, config.MaxPrivateKeySize)
+				if readErr != nil {
+					// pending 与正式私钥都不可用：本轮签发流程已失效，重置状态走重新提交 CSR
+					return nil, "", s.resetIssueStateForResubmit(cert,
+						fmt.Errorf("pending 私钥缺失且正式私钥不可读: %w", readErr))
+				}
+				privateKey = string(keyData)
+				usedFallbackKey = true
+			}
+			// 部署前先校验服务端返回的证书与私钥配对，
+			// 不配对时按失败处理（pending 私钥保留、线上私钥不受影响）
+			if err := validator.New("").ValidateCertKeyPair(certData.Cert, privateKey); err != nil {
+				if usedFallbackKey {
+					// pending 缺失且正式私钥也不配对：无法完成本轮签发，
+					// 若不重置状态会每天走到这里且 retry 不递增，永久卡死。
+					// 重置后下轮重新提交 CSR（提交时递增 retry，受上限约束）
+					return nil, "", s.resetIssueStateForResubmit(cert,
+						fmt.Errorf("pending 私钥缺失且正式私钥与服务端证书不配对: %w", err))
+				}
+				return nil, "", fmt.Errorf("服务端返回的证书与本地私钥不配对（pending 私钥已保留，线上私钥未改动）: %w", err)
+			}
+			// active 自愈（秒签已签发、等待部署）：每次进入即一次部署尝试，递增 issue_retry_count，
+			// 使"证书已签发但全部绑定部署失败"的续跑循环受 MaxIssueRetryCount 约束并最终触顶停机上报，
+			// 而非无限次重试部署已签发证书。计数持久化交由上层 deployCertToBindings 后的 UpdateCert
+			// （部署成功复位为 0、失败保留递增值，与既有路径一致）。
+			// processing 首签路径不在此计数，保持既有语义（其计数在提交 CSR 时已递增）。
+			if entryState == "active" {
+				cert.Metadata.IssueRetryCount++
 			}
 			return certData, privateKey, nil
 
@@ -508,24 +550,27 @@ func (s *Service) prepareLocalRenew(ctx context.Context, cert *config.CertConfig
 		return nil, "", nil
 	}
 
-	// 签发成功，将待确认私钥提交为正式私钥
-	if err := commitPendingKey(workDir, cert.CertName, keyPath); err != nil {
-		return nil, "", fmt.Errorf("提交待确认私钥失败: %w", err)
-	}
-
-	// 签发成功，清零续签状态并持久化
-	// 设计说明：此处提前清零是安全网——若后续部署失败或进程崩溃，
-	// CSR 状态不会永久卡在 processing。deployCertToBindings 中会再次清零（覆盖所有模式）。
-	cert.Metadata.CSRSubmittedAt = time.Time{}
-	cert.Metadata.LastCSRHash = ""
-	cert.Metadata.LastIssueState = ""
-	cert.Metadata.IssueRetryCount = 0
-	if err := s.cfgManager.UpdateCert(cert); err != nil {
-		s.log.Warn("保存证书元数据失败: %v", err)
-	}
-
 	if certData.IntermediateCert == "" {
 		return nil, "", fmt.Errorf("中间证书为空，等待下一周期重试")
+	}
+
+	// 部署前先校验服务端返回的证书与本次生成的私钥配对，
+	// 不配对（如服务端返回旧订单证书）时按失败处理，pending 私钥保留、线上私钥不受影响。
+	// 注意：私钥转正在部署成功后由 deployCertToBindings 执行，遵循规范 3.8。
+	if err := validator.New("").ValidateCertKeyPair(certData.Cert, privateKey); err != nil {
+		return nil, "", fmt.Errorf("服务端返回的证书与本次 CSR 私钥不配对（pending 私钥已保留，线上私钥未改动）: %w", err)
+	}
+
+	// 秒签：服务端在提交 CSR 后立即返回 active 证书。此处不清零签发状态——
+	// 部署可能全部失败，一旦清零，下轮 NeedsRenewal 仍为 true 却因状态为空重新生成 CSR，
+	// 覆盖与本次已签发证书配对的 pending 私钥，且 IssueRetryCount 复位旁路 MaxIssueRetryCount 停机保护，
+	// 每个续签周期重签一次直到旧证书过期。
+	// 保留 CSRSubmittedAt/LastCSRHash/IssueRetryCount，持久化 LastIssueState="active" 作为崩溃安全网，
+	// 使部署失败后下轮走 active 自愈分支：查询订单→读 pending→配对→复用部署路径。
+	// 部署成功由 deployCertToBindings 统一清零状态并转正 pending（规范 3.8）。
+	cert.Metadata.LastIssueState = "active"
+	if err := s.cfgManager.UpdateCert(cert); err != nil {
+		s.log.Warn("保存证书元数据失败: %v", err)
 	}
 
 	return certData, privateKey, nil
@@ -565,14 +610,6 @@ func (s *Service) deployCertToBindings(ctx context.Context, cert *config.CertCon
 		deployCount++
 	}
 
-	// 从证书 PEM 提取域名更新配置（规范 5.5：确保 domains 反映实际证书内容）
-	if domains := extractDomainsFromParsedCert(parsedCert); len(domains) > 0 {
-		cert.Domains = domains
-	}
-
-	// 更新证书过期时间（证书本身有效，无论部署是否全部成功都应记录）
-	cert.Metadata.CertExpiresAt = parsedCert.NotAfter
-	cert.Metadata.CertSerial = fmt.Sprintf("%X", parsedCert.SerialNumber)
 	cert.Metadata.FailedBindings = failedBindings
 	if len(failedBindings) > 0 && cert.Metadata.FailedBindingsAt.IsZero() {
 		cert.Metadata.FailedBindingsAt = time.Now()
@@ -580,8 +617,22 @@ func (s *Service) deployCertToBindings(ctx context.Context, cert *config.CertCon
 		cert.Metadata.FailedBindingsAt = time.Time{}
 	}
 
+	// 元数据不变式：仅至少一个绑定部署成功后才更新证书元数据与 CSR 状态。
+	// 全部失败时保持旧 CertExpiresAt/Domains 与 pending 状态，下轮 NeedsRenewal 仍为 true，
+	// 走完整 prepare→读 pending→部署 的自愈循环；若提前更新 CertExpiresAt，
+	// 下轮只会走 retryFailedBindings，而未转正的 pending 私钥读不到，
+	// 旧私钥与新证书配对必败，站点将挂着旧证书走向真实过期。
 	if deployCount > 0 {
+		// 从证书 PEM 提取域名更新配置（规范 5.5：确保 domains 反映实际部署的证书内容）
+		if domains := extractDomainsFromParsedCert(parsedCert); len(domains) > 0 {
+			cert.Domains = domains
+		}
+		cert.Metadata.CertExpiresAt = parsedCert.NotAfter
+		cert.Metadata.CertSerial = fmt.Sprintf("%X", parsedCert.SerialNumber)
 		cert.Metadata.LastDeployAt = time.Now()
+		// 部署成功后才将 pending 私钥转正（规范 3.8：部署成功后清理 pending key）。
+		// 部署路径（deployToBinding）已在覆盖前备份各绑定的旧证书与私钥。
+		s.commitPendingKeyAfterDeploy(cert, privateKey)
 		// 成功后清理本地续签状态
 		cert.Metadata.CSRSubmittedAt = time.Time{}
 		cert.Metadata.LastCSRHash = ""
@@ -595,6 +646,36 @@ func (s *Service) deployCertToBindings(ctx context.Context, cert *config.CertCon
 	}
 
 	return deployCount, failedBindings, lastErr
+}
+
+// commitPendingKeyAfterDeploy 部署成功后将 pending 私钥转正（Service 包装）
+func (s *Service) commitPendingKeyAfterDeploy(cert *config.CertConfig, deployedKey string) {
+	CommitPendingKeyIfMatches(s.cfgManager.GetWorkDir(), cert, deployedKey, s.log)
+}
+
+// CommitPendingKeyIfMatches 部署成功后将与已部署私钥一致的 pending 私钥转正并清理 pending 文件。
+// 供续签、失败绑定重试与 CLI 手动部署链共用（规范 3.8：部署成功后清理 pending key）。
+// 仅当 pending 内容与本次部署使用的私钥一致才转正，防止误转不相关的残留文件
+// （pull 模式或已清理时无 pending 文件，直接跳过）。
+// 转正失败不影响部署结果：各绑定已通过部署路径写入新私钥，仅记录告警。
+func CommitPendingKeyIfMatches(workDir string, cert *config.CertConfig, deployedKey string, log *logger.Logger) {
+	pendingKey, err := readPendingKey(workDir, cert.CertName)
+	if err != nil {
+		return // 无 pending 私钥（pull 模式或已清理）
+	}
+	if pendingKey != deployedKey {
+		if log != nil {
+			log.Warn("证书 %s 的 pending 私钥与本次部署私钥不一致，保留 pending 文件待人工确认", cert.CertName)
+		}
+		return
+	}
+	keyPath := pickKeyPath(cert)
+	if keyPath == "" {
+		return
+	}
+	if err := commitPendingKey(workDir, cert.CertName, keyPath); err != nil && log != nil {
+		log.Warn("转正 pending 私钥失败（部署已成功，不影响本次结果）: %v", err)
+	}
 }
 
 // getPendingKeyPath 获取待确认私钥路径
@@ -684,6 +765,25 @@ func extractDomainsFromParsedCert(cert *x509.Certificate) []string {
 	}
 	add(cert.Subject.CommonName)
 	return domains
+}
+
+// renamePendingKey 证书改名（order_id 变更）时迁移 pending 私钥（不存在则跳过）
+// pending 私钥按 certName 组织，不迁移会导致 local 模式续签读不到 pending key
+func renamePendingKey(workDir, oldName, newName string) error {
+	oldPath := getPendingKeyPath(workDir, oldName)
+	if _, err := os.Lstat(oldPath); os.IsNotExist(err) {
+		return nil
+	}
+	newPath := getPendingKeyPath(workDir, newName)
+	if err := util.EnsureDir(filepath.Dir(newPath), 0700); err != nil {
+		return err
+	}
+	if err := os.Rename(oldPath, newPath); err != nil {
+		return err
+	}
+	// 清理旧的空目录
+	_ = os.Remove(filepath.Dir(oldPath))
+	return nil
 }
 
 // cleanupPendingKey 清理待确认私钥，返回清理过程中遇到的第一个错误

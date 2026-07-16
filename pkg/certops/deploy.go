@@ -46,8 +46,8 @@ func (s *Service) DeployOne(ctx context.Context, certName string) (*DeployResult
 		return nil, fmt.Errorf("中间证书为空，等待下一周期重试")
 	}
 
-	// 获取私钥：优先使用 API 返回，否则从本地读取
-	privateKey, err := GetPrivateKey(cert, certData.PrivateKey, s.log)
+	// 获取私钥：优先使用 API 返回，否则从本地读取（pending 感知，配对校验）
+	privateKey, err := GetPrivateKeyForCert(s.cfgManager.GetWorkDir(), cert, certData.Cert, certData.PrivateKey, s.log)
 	if err != nil {
 		return nil, err
 	}
@@ -77,6 +77,11 @@ func (s *Service) DeployOne(ctx context.Context, certName string) (*DeployResult
 			s.log.Info("证书已部署到 %s", binding.ServerName)
 			successCount++
 		}
+	}
+
+	// 部署成功后补转正 pending 私钥（若本次使用的正是 pending 私钥）
+	if successCount > 0 {
+		s.commitPendingKeyAfterDeploy(cert, privateKey)
 	}
 
 	// 持久化配置变更（订单号更新等）

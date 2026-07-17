@@ -186,6 +186,11 @@ chown root:root /opt/sslctl/certs/
 6. 验证证书生效
 7. 发送回调通知
 
+### 证书写入顺序与校验
+
+- **先写私钥后写证书**（nginx/apache deployer）：中途失败不留下"新证书 + 旧私钥"的错配状态。
+- **中间证书校验**：API 部署必须包含中间证书（缺失报错、等待下一周期重试）；`deploy local` 的 `--ca` 参数仍可选。
+
 ### 回滚
 
 部署前备份旧证书：
@@ -196,6 +201,35 @@ chown root:root /opt/sslctl/certs/
 ├── privkey.pem
 └── ...
 ```
+
+所有部署入口（setup/deploy/续签）覆盖站点证书前先备份、失败自动回滚；回滚用文件操作带符号链接防护。
+
+---
+
+## SSL 配置自动安装（setup）
+
+setup 流程为**未启用 SSL** 的站点安装 HTTPS 配置（需用户确认），备份原配置、配置测试失败自动回滚。
+
+- 支持 `server\n{` 多行格式；SSL 指令仅插入 server 块顶层，兼容 `root` 写在 `location` 内的 SPA / 反代配置。
+- **nginx**：仅向 `server_name` 匹配目标站点、且尚未配置 SSL 的 `:80` 块注入证书（已配 SSL 的块跳过防 duplicate listen）。"已配置 SSL"检测与注入共用同一匹配谓词（lower + 通配符），避免同文件多域名块被统一注入。
+- **Apache**：生成 `:443` VirtualHost 时按地址 token 精确替换端口，仅端口恰为 80 才换，`*:8080` 等自定义端口不受污染。
+
+### 安装器失败语义
+
+- SSL 配置安装失败的绑定标记 `Enabled=false` 后跳过部署并计入失败（单证书与批量模式一致），不误报"部署成功"。
+- nginx 安装器在非 80 端口 / 无可处理 HTTP server 块时返回明确错误而非静默跳过，与 Apache 一致；安装器"无可注入块"必须报错而非返回 `Modified=false`。
+
+## Docker 站点部署（setup/deploy）
+
+- 证书写入**宿主机侧挂载路径**（`HostCertPath`，非容器内路径）。
+- test/reload 使用容器化命令：`docker exec <容器> nginx -t` / `nginx -s reload`（apache 用 `apachectl`）；executor 放行 `docker exec <容器> <固定命令>`（容器名字符白名单 + 内层命令白名单）；base deployer 对 docker exec 命令跳过宿主机 SIGUSR1 / 进程重启回退。
+- 非挂载卷（copy 模式）或缺容器重载命令时 `config.ValidateDockerBinding` 返回明确错误、如实计为失败，不再静默写错位置报成功。旧版本 setup 创建的存量绑定升级后持续报失败属预期，需重跑 setup 补齐容器命令与卷校验（见根 `README.md`「存量 Docker 绑定升级说明」）。
+- Apache 容器内仅 `httpd`/`apache2ctl` 时 reload 明确报错，自动探测待后续支持。
+- **挂载路径精确匹配**：Docker 挂载路径按精确匹配，防止 `/etc/nginx` 匹配到 `/etc/nginx-backup`。
+
+## 扫描防护
+
+Nginx / Apache / Docker 扫描器均有文件数量限制 1000 + 目录深度限制 100 + 单文件大小限制 10MB，防止异常配置树拖垮扫描。
 
 ---
 

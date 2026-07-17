@@ -23,14 +23,14 @@ cmd/           # CLI 入口（构建时使用 ./cmd/ 整个包，不能指定单
 pkg/           # 可复用包
   certops/     # 证书操作服务层（扫描/部署/续签/私钥管理），依赖 webserver 抽象层
   webserver/   # Web 服务器抽象层（统一 Scanner/Deployer/Rollback 接口）
-  config/      # 配置管理（文件锁+内存锁双重保护，返回深拷贝确保并发安全，含 SSRF 防护）
+  config/      # 配置管理（文件锁+内存锁+深拷贝并发安全，含 SSRF 防护）
   errors/      # 错误类型定义（含结构化部署错误 StructuredDeployError）
   csr/         # CSR + 私钥生成（RSA/ECDSA）
   matcher/     # 域名匹配
   fetcher/     # API 客户端（含 SSRF/DNS Rebinding 防护）
   backup/      # 备份管理（哈希校验 TOCTOU 保护）
   service/     # 系统服务管理
-  upgrade/     # 升级模块（版本检查/下载/Ed25519签名验证/校验/安装）
+  upgrade/     # 升级模块（版本检查/下载/Ed25519 签名验证/校验/安装）
   logger/      # 日志（含敏感信息过滤、路径脱敏、日志轮转）
   util/        # 工具函数（文件操作/权限检查）
 internal/      # 内部实现
@@ -103,117 +103,13 @@ go test -coverprofile=coverage.out ./...   # 测试并生成覆盖率
 bash build/test-linux.sh                   # Linux 发行版服务管理测试
 
 # 容器端到端测试（Bats + Docker Compose）
-bash docker/test/scripts/run-tests.sh                              # 全部测试
+bash docker/test/scripts/run-tests.sh                                 # 全部测试
 bash docker/test/scripts/run-tests.sh --distro ubuntu --server nginx  # 指定目标
-bash docker/test/scripts/run-tests.sh --dind                       # Docker-in-Docker 测试
-bash docker/test/scripts/run-tests.sh --no-build --test scan       # 跳过构建，指定测试
+bash docker/test/scripts/run-tests.sh --dind                          # Docker-in-Docker 测试
+bash docker/test/scripts/run-tests.sh --no-build --test scan          # 跳过构建，指定测试
 ```
 
-## 容器测试目录
-
-```text
-docker/test/
-├── docker-compose.yml # 10 服务（mock-api + nginx×4 + apache×4 + dind）
-├── scripts/
-│   ├── build.sh       # 编译二进制 + 构建镜像
-│   └── run-tests.sh   # 测试入口（--distro/--server/--test/--dind/--no-build）
-├── tests/             # Bats 测试用例
-│   ├── helpers/
-│   │   └── common.bash  # 公共函数（Mock API/Web 服务器/断言/生命周期）
-│   ├── setup.bats       # setup 命令测试
-│   ├── deploy.bats      # deploy 命令测试
-│   ├── deploy-local.bats # deploy local 测试
-│   ├── scan.bats        # scan 命令测试
-│   ├── status.bats      # status/version 命令测试
-│   ├── rollback.bats    # rollback 命令测试
-│   ├── daemon.bats      # daemon 启动/续签测试
-│   ├── upgrade.bats     # upgrade 命令测试
-│   ├── uninstall.bats   # uninstall 测试（必须最后执行）
-│   └── docker-scan.bats # DinD 环境 Docker 容器扫描测试
-├── nginx/             # Nginx 测试容器（ubuntu/debian/alpine/rocky）
-├── apache/            # Apache 测试容器（ubuntu/debian/alpine/rocky）
-├── dind/              # Docker-in-Docker 测试容器
-├── mock-api/          # Mock API 服务（多阶段 Docker 构建）
-│   ├── main.go        # 9 场景、CA→服务器证书分层、releases 端点
-│   └── Dockerfile
-└── reports/           # TAP 测试报告输出
-```
-
-## 续签模式
-
-| 模式    | 说明             | 启用方式                 |
-| ------- | ---------------- | ------------------------ |
-| `local` | 本机提交         | `--local-key` / `--key` / `--file-validation` 或配置文件 |
-| `pull`  | 自动签发（默认） | 默认行为                 |
-
-- 两种模式统一：`renew_before_days` 默认 14 天，由服务端控制，每次 API 交互后更新本地配置（上限 30，无论续费或重签都应在到期前 30 天内，超限拒绝并保留旧值，防止异常值触发每日全量续签）
-- 已过期证书不再触发续签（`IsExpired` 按时间点判定，过期不足 24 小时也算已过期，无整数天截断偏移）
-- 到期时间未知（元数据零值，如部署成功但保存失败、带外换证）不再静默跳过：续签检查自动查询 API 回填元数据后按正常逻辑判定，过期告警输出"到期时间未知"
-- 定时检查：每天一次，随机选择明天 09:00~23:59 的时间点执行（服务端 0:00~7:59 续签，预留 1 小时签发）；启动即检查一次，运行中若 `LastCheckAt` 距今超 25 小时（停摆/睡眠/任务跳过）则 30~60 分钟内补偿一轮
-- 单证书 panic 隔离：续签循环中单证书处理 panic 记为该证书 failure（Error 日志+计入统计），不拖垮整轮
-- 多证书续签间隔：每个证书处理后随机延迟 30~90 秒，分散 API 请求压力
-- 文件验证支持：`status=processing` 且 API 返回 `file` 字段时，自动将验证文件写入 webroot（`util.JoinUnderDir` 防目录穿越）；验证文件全部放置失败（无可用 webroot/写入失败）按失败处理并上报原因，不再静默永远 pending；签发完成后无论部署成败均清理验证文件，不残留 webroot
-- processing 状态：保持查询等待，不自动重提交；异常状态停止等待人工处理；active 时 pending 私钥缺失且正式私钥不配对（历史改名残留/误删）则重置签发状态走重新提交 CSR（递增 retry，受 10 次上限约束），避免永久卡死
-- order_id 变更（订单续费）证书改名时同步迁移 `pending-keys/{cert_name}` 目录，local 模式续签不丢 pending 私钥
-- IP 证书支持：证书验证和域名匹配支持 `cert.IPAddresses`，IP 使用精确匹配（不走通配符逻辑）
-
-详见 `skills/deploy-ops/SKILL.md`
-
-## 代码质量
-
-- CI 全绿（Test + Lint + Build），支持 linux/amd64、linux/arm64、windows/amd64 交叉编译
-- golangci-lint 配置：errcheck、govet、staticcheck、gosec、unused、ineffassign（排除 G101/G204/G306 误报）；CI 同时跑 Linux 与 `GOOS=windows` 两轮 lint，覆盖 Windows 专属源（svc/mgr、kernel32 等）
-- 接口参数命名统一（`Deployer.Deploy` 接口参数名与 Nginx/Apache 实现一致使用 `intermediate`）
-- Windows 服务管理错误处理完善（`Control`/`UpdateConfig` 返回值均已检查）
-- 测试覆盖率 48%+，核心包 `pkg/errors` 100%，`pkg/config` 76%，`pkg/backup` 85%，`pkg/upgrade` 78%，`pkg/service` 39%，`apache/scanner` 75%，`nginx/docker` 51%
-- 结构化部署错误（`StructuredDeployError`）支持类型分类、阶段定位和可重试判断
-- 平台相关代码使用 Build Tag 隔离（`inode_unix.go`/`inode_windows.go`、`selinux_linux.go`、`console_windows.go`、`detach_unix.go`/`detach_windows.go`）
-- Windows 控制台分版本处理（`cmd/console_windows.go`）：Win10/Server2016+ 通过 `SetConsoleMode` 开 VT 后回读验证，确认成功才设置 UTF-8 CP 并启用 ANSI 颜色；老系统（Server 2012 R2 等）完全不动控制台 CP 和字体，避免触发 Windows 把字体自动切换回 Raster Font 覆盖用户手动设的 TrueType 字体；`SSLCTL_CONSOLE_DEBUG=1` 开启启动期 stderr 诊断
-
-## 安全机制
-
-详见 `skills/go-dev/SKILL.md` 安全开发规范章节：
-
-- 命令执行白名单 + 超时控制（`internal/executor`，默认 30 秒超时，支持 Context 取消）
-- SSRF/DNS Rebinding 防护（`pkg/fetcher`、`pkg/validator`，含 `IsUnspecified()` 检查防止 `0.0.0.0` 绕过）
-- 中间证书校验（API 部署必须包含中间证书，`deploy local` 的 `--ca` 参数仍可选）
-- SSL 配置自动安装（setup 流程为未启用 SSL 的站点安装 HTTPS 配置，需用户确认，备份原配置、配置测试失败自动回滚；支持 `server\n{` 多行格式；SSL 指令仅插入 server 块顶层，兼容 `root` 写在 `location` 内的 SPA/反代配置；nginx 仅向 `server_name` 匹配目标站点、且尚未配置 SSL 的 `:80` 块注入证书（已配 SSL 的块跳过防 duplicate listen），"已配置 SSL"检测与注入共用同一匹配谓词（lower+通配符），避免同文件多域名块被统一注入；Apache 生成 `:443` VirtualHost 时按地址 token 精确替换端口，仅端口恰为 80 才换，`*:8080` 等自定义端口不受污染）
-- setup 部署失败如实统计（SSL 配置安装失败的绑定标记 `Enabled=false` 后跳过部署并计入失败，单证书与批量模式行为一致，不再误报"部署成功"；nginx 安装器在非 80 端口/无可处理 HTTP server 块时返回明确错误而非静默跳过，与 Apache 一致）
-- setup 退出码语义（`hasDeployFailures`）：任一站点部署失败、任一证书失败、或存在需人工提供私钥而跳过的证书，进程即以退出码 1 结束（部分失败也算失败，先保存成功站点配置再退出），单证书与批量模式一致，便于脚本调用方感知
-- setup 部署复用 certops 部署路径（`Service.DeployToBinding`），与 deploy/续签一致地做证书私钥校验、覆盖前备份现有证书、测试/reload 失败自动回滚，消除 setup 直接覆盖无备份的重复路径
-- 证书部署先写私钥后写证书（nginx/apache deployer），中途失败不留下"新证书 + 旧私钥"的错配状态
-- pending 私钥转正时机（local 续签）：签发 active 后先校验服务端证书与 pending 私钥配对，不配对按失败处理（保留 pending、不动线上私钥）；配对通过部署成功后才转正（deploy-spec §3.8），旧线上私钥由部署路径覆盖前备份
-- 文件操作安全（符号链接防护、TOCTOU 保护、AtomicWrite O_EXCL 防护）
-- 备份源文件符号链接检查（`pkg/backup` computeFileHash 拒绝符号链接）
-- 备份恢复安全（Restore 内部备份跳过 cleanup，防止清理掉正在恢复的目标备份；`siteName`/`timestamp` 路径穿越防护）
-- 配置并发安全（深拷贝 + 双重锁 + mtime + SHA256 哈希检测外部修改；写路径 `Update*` 统一走 `mutateLocked`：文件锁内感知外部修改并基于最新盘上状态读-改-写，消除 CLI 与 daemon 跨进程丢更新窗口，修改应用于副本、失败不污染缓存）
-- 续签/部署进程互斥（`config.AcquireRenewalLock` 共享 `renewal.lock`：daemon 续签检查与手动 deploy/setup 非阻塞互斥，手动侧被占用时提示"守护进程正在续签"退出，与 deploy-spec §3.7 对齐）
-- 配置保存符号链接防护（saveLocked 拒绝写入符号链接目标）
-- 日志敏感信息过滤（私钥、Bearer Token、Basic Auth、JSON 敏感字段含复合词匹配、URL 参数）
-- 日志记录器并发安全（`minLevel`/`jsonMode` 使用 `atomic` 类型，`SetLevel`/`SetJSONMode` 线程安全）
-- 升级模块 TLS 安全（HTTPS + TLS 1.2+）
-- 升级流程平台差异化（Linux：先替换再重启，零停机；Windows：先停服务释放 exe 句柄再替换再启动，失败时恢复服务；Windows 上 rename 策略替换运行中 exe，重试等待文件句柄释放）
-- Windows 服务停止等待（`Stop()` 轮询至 `Stopped` 状态，确保进程完全退出后才返回）
-- Windows 非服务模式重载（reload 命令失败时回退到进程重启：taskkill → 等待守护进程拉起 → 否则手动启动；回退白名单含 `Access is denied`，覆盖 sslctl 与 SYSTEM master 进程权限错配场景）
-- Windows 服务模式重载（detector 检测到 nginx/apache 注册为 Windows 服务、且其 BinaryPath 文件存在并与当前运行进程路径一致时，ReloadCmd 设为 `winsvc:<服务名>|<reload 命令>` 哨兵；`Base.ReloadService` 先走 SCM Stop+Start，SCM 失败时回退执行哨兵编入的 reload 命令，再失败按白名单走进程重启；避免残留服务/wrapper 损坏导致部署失败）
-- 守护进程优雅停止（`RunAsService` 通过 context 通知 daemon，不再依赖 SIGTERM；Windows SCM 停止立即生效）
-- SELinux 兼容（部署后自动恢复文件安全上下文，`restorecon` 失败时返回错误）
-- IDN/Punycode 域名支持（`pkg/matcher`）
-- 证书过期告警（守护进程周期检查，7 天/14 天阈值）
-- 重试次数超限（> 10 次）自动停止，等待人工处理（不自动重置）
-- 配置扫描防护（Nginx/Apache/Docker 扫描器均有文件数量限制 1000 + 深度限制 100 + 文件大小限制 10MB）
-- Docker 挂载路径精确匹配（防止 `/etc/nginx` 匹配到 `/etc/nginx-backup`）
-- Docker 站点部署（setup/deploy）：证书写入宿主机侧挂载路径（`HostCertPath`，非容器内路径），test/reload 用容器化命令 `docker exec <容器> nginx -t`/`nginx -s reload`（apache 用 `apachectl`）；executor 放行 `docker exec <容器> <固定命令>`（容器名字符白名单 + 内层命令白名单）；base deployer 对 docker exec 命令跳过宿主机 SIGUSR1/进程重启回退；非挂载卷（copy 模式）或缺容器重载命令时 `config.ValidateDockerBinding` 返回明确错误、如实计为失败，不再静默写错位置报成功；旧版本 setup 创建的存量绑定升级后持续报失败属预期，需重跑 setup 补齐容器命令与卷校验（见 README「存量 Docker 绑定升级说明」；apache 容器内仅 httpd/apache2ctl 时 reload 明确报错，自动探测待后续支持）
-- Apache ServerName 端口/scheme 剥离（`httpd-ssl.conf` 默认模板写 `ServerName www.example.com:443`，扫描器/安装器统一用 `matcher.StripPort` 将 `[scheme://]fqdn[:port]` 剥离为纯域名后再匹配与命名证书目录，避免误报"未找到可绑定的站点"，并防止带 `:` 的目录名在 Windows 上非法）
-- 升级解压防护（gzip 解压大小限制，防止 gzip 炸弹攻击）
-- 升级模块 Ed25519 签名验证（`pkg/upgrade`，密钥环已内置 key-1 公钥，签名格式 `ed25519:<key_id>:<base64>` 带 key ID；releases.json 按文件名索引签名 `signatures` map；已配置公钥时拒绝安装未签名版本，防止降级攻击）
-- 升级安装符号链接防护（`copyFile` 写入前检查目标路径，拒绝覆盖符号链接）
-- 升级签名密钥轮换（密钥不匹配时提示用 `install.sh` 重装；`ErrKeyNotFound`/`ErrNoPublicKeys` 统一处理）
-- 升级通道白名单（`upgrade_channel` 配置仅允许 main/dev，releases.json 通道名为顶层 key，每通道保留最近 5 个版本）
-- systemd 服务安全限制（NoNewPrivileges + ProtectSystem=strict + ProtectHome + PrivateTmp + ProtectKernelTunables/Modules + ReadWritePaths 白名单）
-- 升级安装权限安全（临时文件保持 0600，仅在最终路径设置 0755）
-- 日志 JSON 输出模式（`SSLCTL_LOG_FORMAT=json`，敏感信息过滤在两种模式下均生效）
-- 部署/续签结果 API 回调（`pkg/certops`，非关键路径，失败仅记录日志且传输层含指数退避重试，状态枚举统一使用 `success`/`failure`/`pending`，回调请求体为三字段（order_id/status/deployed_at）+ 可选 `message`（仅 failure 携带，客户端复用 `logger.Sanitize` 脱敏并按 rune 截断 ≤256，服务端上限 500）；失败原因同时记本地 Error 日志；prepare 失败、失败绑定重试、重试触顶均上报回调，触顶证书同时记 Error 日志并计入本轮统计，不再静默）
+容器测试目录结构、用例清单与 Mock API 说明见 `skills/build-release/SKILL.md`。
 
 ## CSR 生成
 
@@ -221,11 +117,23 @@ docker/test/
 - CA 签发证书的 SAN 必定包含 CN
 - 默认密钥类型：RSA 2048，支持 ECDSA
 
-## 开发规范
+## 续签模式速查
 
-详见 `skills/` 目录：
+| 模式    | 说明             | 启用方式                                                 |
+| ------- | ---------------- | -------------------------------------------------------- |
+| `local` | 本机提交         | `--local-key` / `--key` / `--file-validation` 或配置文件 |
+| `pull`  | 自动签发（默认） | 默认行为                                                 |
 
-- `go-dev/` - Go 开发规范
-- `nginx-apache/` - 配置解析、证书部署
-- `deploy-ops/` - 部署运维、续签流程、API 接口
-- `build-release/` - 构建发布
+- `renew_before_days` 默认 14 天、上限 30 天，由服务端控制并在每次 API 交互后回写本地配置
+- 判定逻辑、定时调度、秒签、文件验证、processing/active 状态、order_id 改名迁移、IP 证书等细节见 `skills/deploy-ops/SKILL.md`
+
+## 开发规范（skills 索引）
+
+按当前任务类型阅读对应 skill 获取详细规范：
+
+| 领域         | 目录              | 涵盖内容                                                             |
+| ------------ | ----------------- | ------------------------------------------------------------------- |
+| Go 开发      | `go-dev/`         | 代码风格、错误处理、**安全开发规范**（全部安全机制）、**代码质量**、平台隔离、测试覆盖率 |
+| Nginx/Apache | `nginx-apache/`   | 配置解析、证书部署、SSL 配置自动安装、安装器失败语义、Docker 站点部署    |
+| 部署运维     | `deploy-ops/`     | 部署/续签流程、续签判定与调度、API 与回调契约、systemd、daemon        |
+| 构建发布     | `build-release/`  | 版本发布、交叉编译、CI/CD、容器 E2E 测试目录                          |

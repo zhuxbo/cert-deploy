@@ -169,7 +169,37 @@ bash docker/test/scripts/run-tests.sh --dind
 bash docker/test/scripts/run-tests.sh --no-build
 ```
 
-测试框架：Bats + Docker Compose，详见 `docker/test/` 目录。发行版矩阵：ubuntu:24.04、debian:12、alpine:3.21、rockylinux:9。
+测试框架：Bats + Docker Compose。发行版矩阵：ubuntu:24.04、debian:12、alpine:3.21、rockylinux:9。
+
+### 容器测试目录结构
+
+```text
+docker/test/
+├── docker-compose.yml # 10 服务（mock-api + nginx×4 + apache×4 + dind）
+├── scripts/
+│   ├── build.sh       # 编译二进制 + 构建镜像
+│   └── run-tests.sh   # 测试入口（--distro/--server/--test/--dind/--no-build）
+├── tests/             # Bats 测试用例
+│   ├── helpers/
+│   │   └── common.bash  # 公共函数（Mock API/Web 服务器/断言/生命周期）
+│   ├── setup.bats       # setup 命令测试
+│   ├── deploy.bats      # deploy 命令测试
+│   ├── deploy-local.bats # deploy local 测试
+│   ├── scan.bats        # scan 命令测试
+│   ├── status.bats      # status/version 命令测试
+│   ├── rollback.bats    # rollback 命令测试
+│   ├── daemon.bats      # daemon 启动/续签测试
+│   ├── upgrade.bats     # upgrade 命令测试
+│   ├── uninstall.bats   # uninstall 测试（必须最后执行）
+│   └── docker-scan.bats # DinD 环境 Docker 容器扫描测试
+├── nginx/             # Nginx 测试容器（ubuntu/debian/alpine/rocky）
+├── apache/            # Apache 测试容器（ubuntu/debian/alpine/rocky）
+├── dind/              # Docker-in-Docker 测试容器
+├── mock-api/          # Mock API 服务（多阶段 Docker 构建）
+│   ├── main.go        # 9 场景、CA→服务器证书分层、releases 端点
+│   └── Dockerfile
+└── reports/           # TAP 测试报告输出
+```
 
 ---
 

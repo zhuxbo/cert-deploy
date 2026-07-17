@@ -3,6 +3,7 @@ package certops
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/zhuxbo/sslctl/pkg/config"
 	"github.com/zhuxbo/sslctl/pkg/fetcher"
@@ -102,9 +104,15 @@ func TestCheckAndRenewAll_PrepareFailureSendsCallback(t *testing.T) {
 	if cbs[0].Status != "failure" || cbs[0].OrderID != 400 {
 		t.Errorf("回调内容不正确: %+v", cbs[0])
 	}
-	// 契约：回调请求体保持三字段（spec 2.8），失败原因不进请求体（仅本地日志）
-	if raw := rec.raw(); strings.Contains(raw[0], "reason") {
-		t.Errorf("回调请求体不应包含 reason 字段: %s", raw[0])
+	// 契约（spec 2.8）：failure 回调携带 message 原因摘要，且 ≤256 rune
+	if cbs[0].Message == "" {
+		t.Error("failure 回调应携带 message 原因摘要")
+	}
+	if n := len([]rune(cbs[0].Message)); n > callbackMessageMaxLen {
+		t.Errorf("message 超过 %d rune 上限: %d", callbackMessageMaxLen, n)
+	}
+	if raw := rec.raw(); !strings.Contains(raw[0], `"message"`) {
+		t.Errorf("failure 回调请求体应包含 message 字段: %s", raw[0])
 	}
 }
 
@@ -208,8 +216,95 @@ func TestCheckAndRenewAll_RetryCapVisible(t *testing.T) {
 	if cbs[0].Status != "failure" || cbs[0].OrderID != 600 {
 		t.Errorf("回调应为 failure: %+v", cbs[0])
 	}
-	// 契约：请求体三字段，重试超限原因仅进本地 Error 日志
-	if raw := rec.raw(); strings.Contains(raw[0], "reason") {
-		t.Errorf("回调请求体不应包含 reason 字段: %s", raw[0])
+	// 契约（spec 2.8）：failure 回调 message 携带重试超限原因
+	if !strings.Contains(cbs[0].Message, "上限") {
+		t.Errorf("回调 message 应含重试超限原因: %q", cbs[0].Message)
+	}
+}
+
+// TestSendDeployCallback_MessageContract 验证 message 契约：
+// success 不携带 message（omitempty），failure 携带且已脱敏（不泄漏 Bearer token）。
+func TestSendDeployCallback_MessageContract(t *testing.T) {
+	tmpDir := t.TempDir()
+	cm, err := config.NewConfigManagerWithDir(tmpDir)
+	if err != nil {
+		t.Fatalf("创建配置管理器失败: %v", err)
+	}
+	svc := NewService(cm, logger.NewNopLogger())
+
+	rec := &callbackRecorder{}
+	server := httptest.NewServer(rec.handler())
+	defer server.Close()
+
+	cert := &config.CertConfig{
+		CertName: "cb.example.com-700",
+		OrderID:  700,
+		Enabled:  true,
+		API:      config.APIConfig{URL: server.URL, Token: "test-token"},
+	}
+
+	// success：不携带 message
+	svc.sendDeployCallback(t.Context(), cert, &DeployResult{CertName: cert.CertName, Success: true})
+	// failure：错误串内含 Bearer token，message 必须脱敏后携带
+	svc.sendDeployCallback(t.Context(), cert, &DeployResult{
+		CertName: cert.CertName,
+		Success:  false,
+		Error:    fmt.Errorf("部署失败，Authorization: Bearer secret-token-abc123 不应泄漏"),
+	})
+
+	cbs := rec.recorded()
+	raw := rec.raw()
+	if len(cbs) != 2 {
+		t.Fatalf("应记录 2 次回调，实际 %d", len(cbs))
+	}
+
+	// success 回调：Status=success 且不含 message
+	if cbs[0].Status != "success" || cbs[0].Message != "" {
+		t.Errorf("success 回调不应携带 message: %+v", cbs[0])
+	}
+	if strings.Contains(raw[0], "message") {
+		t.Errorf("success 回调请求体不应出现 message 字段: %s", raw[0])
+	}
+
+	// failure 回调：携带 message，且已脱敏（不含明文 token、含 REDACTED 标记）
+	if cbs[1].Status != "failure" || cbs[1].Message == "" {
+		t.Errorf("failure 回调应携带 message: %+v", cbs[1])
+	}
+	if strings.Contains(cbs[1].Message, "secret-token-abc123") {
+		t.Errorf("message 泄漏了 Bearer token: %q", cbs[1].Message)
+	}
+	if !strings.Contains(cbs[1].Message, "REDACTED") {
+		t.Errorf("message 应包含脱敏标记: %q", cbs[1].Message)
+	}
+}
+
+// TestCallbackMessage_TruncatesToRuneLimit 验证 message 按 rune 截断且不劈开多字节字符。
+func TestCallbackMessage_TruncatesToRuneLimit(t *testing.T) {
+	// nil error 返回空
+	if callbackMessage(nil) != "" {
+		t.Error("nil error 应返回空 message")
+	}
+
+	// 300 个多字节字符，超过 256 rune 上限
+	long := strings.Repeat("错", 300)
+	msg := callbackMessage(fmt.Errorf("%s", long))
+	if n := len([]rune(msg)); n != callbackMessageMaxLen {
+		t.Errorf("超长 message 应截断到 %d rune，实际 %d", callbackMessageMaxLen, n)
+	}
+	if !utf8.ValidString(msg) {
+		t.Error("截断后不应产生非法 UTF-8（劈开多字节字符）")
+	}
+}
+
+// TestCallbackMessage_SanitizeBeforeTruncate 密钥材料在 256 截断点之内、END 标记在点外：
+// 若实现改成"先截断后脱敏"，截断产物含 BEGIN+材料但无 END，私钥正则不命中即泄漏，本用例转红。
+func TestCallbackMessage_SanitizeBeforeTruncate(t *testing.T) {
+	raw := strings.Repeat("x", 150) + "-----BEGIN RSA PRIVATE KEY-----\nLEAKMATERIAL" + strings.Repeat("A", 80) + "\n-----END RSA PRIVATE KEY-----"
+	msg := callbackMessage(fmt.Errorf("%s", raw))
+	if strings.Contains(msg, "LEAKMATERIAL") {
+		t.Errorf("跨界私钥不应泄漏任何片段: %q", msg)
+	}
+	if !strings.Contains(msg, "***REDACTED PRIVATE KEY***") {
+		t.Errorf("私钥块应先于截断被整体脱敏: %q", msg)
 	}
 }

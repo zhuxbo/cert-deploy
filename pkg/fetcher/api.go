@@ -135,6 +135,9 @@ type CallbackRequest struct {
 	OrderID    int    `json:"order_id"`
 	Status     string `json:"status"` // success, failure
 	DeployedAt string `json:"deployed_at"`
+	// Message 失败原因摘要，可选，仅 status=failure 时填充；
+	// 客户端已脱敏并按 rune 截断 ≤256，success 不携带（omitempty）
+	Message string `json:"message,omitempty"`
 }
 
 // UpdateResponse update 接口的 data 字段结构

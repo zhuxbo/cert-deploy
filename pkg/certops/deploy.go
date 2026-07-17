@@ -138,7 +138,8 @@ func (s *Service) sendDeployCallback(ctx context.Context, cert *config.CertConfi
 		DeployedAt: time.Now().Format(time.RFC3339),
 	}
 	if !result.Success {
-		s.log.Error("证书 %s 部署失败（已上报 failure 回调）: %s", cert.CertName, callbackReason(result.Error))
+		callbackReq.Message = callbackMessage(result.Error)
+		s.log.Error("证书 %s 部署失败（已上报 failure 回调）: %s", cert.CertName, callbackReq.Message)
 	}
 
 	fillCertMetadata(callbackReq, cert)

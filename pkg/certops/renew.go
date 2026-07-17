@@ -102,10 +102,10 @@ func (s *Service) CheckAndRenewAll(ctx context.Context) ([]*RenewResult, error) 
 			continue
 		}
 		// 规范 3.2：local 模式 retry_count 超限时前置过滤
-		// 触顶证书仍会发 failure 回调（可见性），计入延迟统计
+		// 临期触顶或已过期触顶都会发一次 failure 回调（可见性），计入延迟统计
 		if cert.GetRenewMode(&cfg.Schedule) == config.RenewModeLocal &&
 			cert.Metadata.IssueRetryCount >= MaxIssueRetryCount {
-			if cert.NeedsRenewal(&cfg.Schedule) {
+			if cert.NeedsRenewal(&cfg.Schedule) || cert.IsExpired() {
 				pendingCount++
 			}
 			continue
@@ -195,6 +195,21 @@ func (s *Service) processCertRenewal(ctx context.Context, cfg *config.Config, ce
 	if cert.GetRenewMode(&cfg.Schedule) == config.RenewModeLocal &&
 		cert.Metadata.IssueRetryCount >= MaxIssueRetryCount {
 		if !cert.NeedsRenewal(&cfg.Schedule) {
+			// 既过期又触顶：证书已死且自动续签已停，与下方"临期触顶"路径对齐上报可见性，
+			// 不再静默（否则 Error 日志 / failure 回调 / 统计三缺，运维无从感知需人工处理）。
+			// 未过期、只是尚未进入续签窗口的触顶证书仍静默跳过（无需处理，避免每日噪声）。
+			if cert.IsExpired() {
+				s.log.Error("证书 %s 已过期且重试次数达上限 (%d)，已停止自动续签，需人工处理", cert.CertName, MaxIssueRetryCount)
+				madeAPICall = true
+				result = &RenewResult{
+					CertName: cert.CertName,
+					Mode:     config.RenewModeLocal,
+					Status:   "failure",
+					Error:    fmt.Errorf("证书已过期且重试超限，需人工处理"),
+				}
+				s.sendRenewCallback(ctx, &cert, result)
+				return result, madeAPICall
+			}
 			return nil, madeAPICall
 		}
 		s.log.Error("证书 %s 重试次数已达上限 (%d)，已停止自动续签，需人工处理", cert.CertName, MaxIssueRetryCount)
@@ -422,24 +437,34 @@ func (s *Service) retryFailedBindings(ctx context.Context, cert *config.CertConf
 	return result
 }
 
-// callbackReasonMaxLen 失败原因摘要的最大长度（本地日志用）
-const callbackReasonMaxLen = 200
+// callbackMessageMaxLen 回调 message 字段最大长度（按 rune 计）。
+// 服务端上限为 500，客户端取更严格的 256，超长整条会被服务端拒收。
+const callbackMessageMaxLen = 256
 
-// callbackReason 从续签错误生成失败原因摘要（截断，防止过长）
-func callbackReason(err error) string {
+// callbackMessage 从失败错误生成回调 message：先脱敏（复用 logger 过滤规则）再按 rune 截断，
+// 确保 Bearer token / 私钥块 / URL token 参数不会随失败原因泄漏进回调请求体。
+func callbackMessage(err error) string {
 	if err == nil {
 		return ""
 	}
-	msg := err.Error()
-	if len(msg) > callbackReasonMaxLen {
-		msg = msg[:callbackReasonMaxLen]
+	return truncateRunes(logger.Sanitize(err.Error()), callbackMessageMaxLen)
+}
+
+// truncateRunes 按 rune 截断字符串，不劈开多字节字符
+func truncateRunes(s string, max int) string {
+	if max <= 0 {
+		return ""
 	}
-	return msg
+	runes := []rune(s)
+	if len(runes) <= max {
+		return s
+	}
+	return string(runes[:max])
 }
 
 // sendRenewCallback 向 API 发送续签结果回调
 // 非关键路径，失败仅记录日志（传输层已含网络错误/5xx 的指数退避重试）
-// 回调请求体保持三字段契约（spec 2.8），失败原因仅记本地 Error 日志
+// 失败回调携带脱敏后的原因摘要（message，仅 failure），同时记本地 Error 日志（spec 2.8）
 func (s *Service) sendRenewCallback(ctx context.Context, cert *config.CertConfig, result *RenewResult) {
 	callbackReq := &fetcher.CallbackRequest{
 		OrderID:    cert.OrderID,
@@ -447,7 +472,8 @@ func (s *Service) sendRenewCallback(ctx context.Context, cert *config.CertConfig
 		DeployedAt: time.Now().Format(time.RFC3339),
 	}
 	if result.Status == "failure" {
-		s.log.Error("证书 %s 续签失败（已上报 failure 回调）: %s", cert.CertName, callbackReason(result.Error))
+		callbackReq.Message = callbackMessage(result.Error)
+		s.log.Error("证书 %s 续签失败（已上报 failure 回调）: %s", cert.CertName, callbackReq.Message)
 	}
 
 	fillCertMetadata(callbackReq, cert)

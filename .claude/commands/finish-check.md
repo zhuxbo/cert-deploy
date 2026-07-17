@@ -122,7 +122,7 @@ gofmt 要求：go.mod 目标为 `go 1.24`，CI 也用 Go 1.24 工具链，且 `.
 
 ### 4.7 部署链专项（涉及 pkg/certops、cmd/setup、cmd/deploy、internal/*/installer 时）
 
-- **回调契约**：回调请求体是否严格三字段（order_id/status/deployed_at）？status 仅 success/failure/pending？新增失败路径（prepare/重试/触顶/panic）是否都发送 failure 回调？
+- **回调契约**：回调请求体是否为三字段（order_id/status/deployed_at）+ 可选 message（仅 failure，脱敏且 ≤256 rune）？回调 status 仅 success/failure（pending 不上报回调）？新增失败路径（prepare/重试/触顶/panic/过期触顶）是否都发送 failure 回调？
 - **假成功语义**：success 与退出码是否以实际生效为前提——部分失败退出码非零；reload/test 失败不算成功且回滚；docker 绑定空命令/无卷必须明确报错而非静默跳过；安装器"无可注入块"必须报错而非 Modified=false。
 - **pending 私钥生命周期**（spec §3.8/§5.3）：配对校验通过且部署成功后才转正/清理；校验失败保留 pending、不触碰线上私钥；重试与手动部署路径必须能感知 pending（GetPrivateKeyForCert）；部署全失败时不得更新到期元数据（保持下轮完整自愈）。
 - **备份/回滚对齐**：所有部署入口（setup/deploy/续签）覆盖站点证书前先备份、失败回滚；回滚用文件操作有符号链接防护。

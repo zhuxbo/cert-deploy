@@ -41,7 +41,10 @@ mkdir -p "$OUTPUT_DIR"
 # 使用 Go 生成 Ed25519 密钥对
 log_info "生成 Ed25519 密钥对（Key ID: $KEY_ID）..."
 
-go run - "$OUTPUT_DIR" "$KEY_ID" << 'GOEOF'
+KEY_TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/sslctl-keygen.XXXXXX")"
+KEY_PROGRAM="$KEY_TEMP_DIR/main.go"
+trap 'rm -rf "$KEY_TEMP_DIR"' EXIT
+cat >"$KEY_PROGRAM" <<'GOEOF'
 package main
 
 import (
@@ -106,6 +109,7 @@ func init() {
 	fmt.Println("密钥对已生成")
 }
 GOEOF
+go run "$KEY_PROGRAM" "$OUTPUT_DIR" "$KEY_ID"
 
 log_success "密钥对生成完成"
 echo ""

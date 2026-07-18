@@ -1,694 +1,361 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# sslctl 发布阶段执行器。Git/PR/GitHub Release 编排见 skills/remote-release.md。
 
-# sslctl 远程发布脚本
-# 将构建产物部署到远程 Linux 服务器
-#
-# 用法:
-#   ./release.sh <版本号>      # 必须指定版本号
-#   ./release.sh 0.0.10-beta  # 发布指定版本
-#   ./release.sh --server cn  # 只发布到指定服务器
-#   ./release.sh --test       # 测试 SSH 连接
-#   ./release.sh --upload-only # 只上传，跳过构建
+set -euo pipefail
 
-set -e
-
-# ========================================
-# 配置
-# ========================================
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 CONFIG_FILE="$SCRIPT_DIR/release.conf"
-DIST_DIR="$PROJECT_ROOT/dist"
-
-# 默认配置
+HELPER="$SCRIPT_DIR/release_helper.py"
 KEEP_VERSIONS=5
 SSH_TIMEOUT=10
-
-# 颜色
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
-
-log_info()    { echo -e "${BLUE}[INFO]${NC} $1"; }
-log_success() { echo -e "${GREEN}[OK]${NC} $1"; }
-log_warning() { echo -e "${YELLOW}[WARN]${NC} $1"; }
-log_error()   { echo -e "${RED}[ERROR]${NC} $1"; }
-log_step()    { echo -e "\n${GREEN}==>${NC} $1"; }
-
-# ========================================
-# 加载配置
-# ========================================
-load_config() {
-    if [ ! -f "$CONFIG_FILE" ]; then
-        log_error "配置文件不存在: $CONFIG_FILE"
-        log_info "请复制 release.conf.example 并配置:"
-        log_info "  cp $SCRIPT_DIR/release.conf.example $CONFIG_FILE"
-        exit 1
-    fi
-
-    # 检查配置文件权限（应为 600）
-    local perms=$(stat -c %a "$CONFIG_FILE" 2>/dev/null || stat -f %OLp "$CONFIG_FILE" 2>/dev/null || echo "")
-    if [ -n "$perms" ] && [ "$perms" != "600" ]; then
-        log_warning "配置文件权限不安全（当前: $perms），建议设置为 600:"
-        log_info "  chmod 600 $CONFIG_FILE"
-    fi
-
-    # 加载配置
-    source "$CONFIG_FILE"
-
-    # 验证必要配置
-    if [ ${#SERVERS[@]} -eq 0 ]; then
-        log_error "未配置服务器列表 SERVERS"
-        exit 1
-    fi
-
-    if [ -z "$SSH_USER" ]; then
-        log_error "未配置 SSH_USER"
-        exit 1
-    fi
-
-    if [ -z "$SSH_KEY" ]; then
-        log_error "未配置 SSH_KEY"
-        exit 1
-    fi
-
-    # 展开 SSH_KEY 路径中的 ~
-    SSH_KEY="${SSH_KEY/#\~/$HOME}"
-
-    if [ ! -f "$SSH_KEY" ]; then
-        log_error "SSH 密钥文件不存在: $SSH_KEY"
-        exit 1
-    fi
-
-    # 将 SIGN_KEY 相对路径解析为绝对路径（相对于项目根目录）
-    if [ -n "$SIGN_KEY" ] && [[ "$SIGN_KEY" != /* ]]; then
-        SIGN_KEY="$PROJECT_ROOT/$SIGN_KEY"
-    fi
-}
-
-# ========================================
-# 解析服务器配置
-# 格式: "名称,主机,端口,目录"
-# ========================================
-parse_server() {
-    local server_str="$1"
-    IFS=',' read -r SERVER_NAME SERVER_HOST SERVER_PORT SERVER_DIR <<< "$server_str"
-    SERVER_PORT=${SERVER_PORT:-22}
-}
-
-# ========================================
-# SSH 命令封装
-# ========================================
-ssh_cmd() {
-    local host="$1"
-    local port="$2"
-    shift 2
-    ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=$SSH_TIMEOUT \
-        -p "$port" "$SSH_USER@$host" "$@"
-}
-
-rsync_cmd() {
-    local src="$1"
-    local host="$2"
-    local port="$3"
-    local dest="$4"
-    rsync -avz --progress -e "ssh -i $SSH_KEY -o StrictHostKeyChecking=accept-new -p $port" \
-        "$src" "$SSH_USER@$host:$dest"
-}
-
-# ========================================
-# 测试 SSH 连接
-# ========================================
-test_ssh_connection() {
-    local server_str="$1"
-    parse_server "$server_str"
-
-    log_info "测试连接: $SERVER_NAME ($SERVER_HOST:$SERVER_PORT)"
-
-    if ssh_cmd "$SERVER_HOST" "$SERVER_PORT" "echo 'SSH 连接成功'" 2>/dev/null; then
-        log_success "$SERVER_NAME: 连接成功"
-        return 0
-    else
-        log_error "$SERVER_NAME: 连接失败"
-        return 1
-    fi
-}
-
-test_all_connections() {
-    log_step "测试所有服务器连接..."
-    local failed=0
-
-    for server in "${SERVERS[@]}"; do
-        if ! test_ssh_connection "$server"; then
-            failed=$((failed + 1))
-        fi
-    done
-
-    if [ $failed -gt 0 ]; then
-        log_error "$failed 个服务器连接失败"
-        return 1
-    fi
-
-    log_success "所有服务器连接正常"
-    return 0
-}
-
-# ========================================
-# 确定发布通道
-# ========================================
-get_channel() {
-    local version="$1"
-    if [[ "$version" == *"-"* ]]; then
-        echo "dev"
-    else
-        echo "main"
-    fi
-}
-
-# ========================================
-# 确保 tag 存在并指向当前提交
-# ========================================
-ensure_tag() {
-    local tag="$1"
-    local head_commit=$(git rev-parse HEAD)
-    local tag_commit=$(git rev-parse "refs/tags/$tag" 2>/dev/null || echo "")
-
-    if [ -z "$tag_commit" ]; then
-        log_info "创建 tag: $tag"
-        git tag "$tag"
-        git push origin "$tag"
-    elif [ "$tag_commit" != "$head_commit" ]; then
-        log_warning "tag $tag 指向其他提交，更新到当前提交"
-        git tag -d "$tag" 2>/dev/null || true
-        git push origin ":refs/tags/$tag" 2>/dev/null || true
-        git tag "$tag"
-        git push origin "$tag"
-    else
-        log_info "tag $tag 已指向当前提交"
-    fi
-}
-
-# ========================================
-# 本地计算校验和和签名
-# ========================================
-compute_checksums_and_sign_local() {
-    local version="$1"
-
-    CHECKSUMS_JSON="{"
-    SIGNATURES_JSON="{"
-    local ck_first=true
-    local sig_first=true
-
-    for gz in "$DIST_DIR"/*.gz; do
-        [ -f "$gz" ] || continue
-        local filename=$(basename "$gz")
-        local checksum
-        checksum="sha256:$(shasum -a 256 "$gz" | cut -d' ' -f1)"
-
-        if [ "$ck_first" = true ]; then ck_first=false; else CHECKSUMS_JSON+=","; fi
-        CHECKSUMS_JSON+="\"$filename\":\"$checksum\""
-
-        # 签名
-        if [ -n "$SIGN_KEY" ] && [ -f "$SIGN_KEY" ]; then
-            local sig
-            sig=$(sign_file_local "$gz" "$SIGN_KEY" "${SIGN_KEY_ID:-key-1}")
-            if [ -z "$sig" ]; then
-                log_error "签名生成失败: $filename"
-                exit 1
-            fi
-            if [ "$sig_first" = true ]; then sig_first=false; else SIGNATURES_JSON+=","; fi
-            SIGNATURES_JSON+="\"$filename\":\"$sig\""
-        fi
-    done
-
-    CHECKSUMS_JSON+="}"
-    SIGNATURES_JSON+="}"
-
-    if [ -n "$SIGN_KEY" ] && [ ! -f "$SIGN_KEY" ]; then
-        log_warning "签名密钥文件不存在: $SIGN_KEY，发布将不包含签名"
-    fi
-}
-
-# 本地对单个文件签名（返回 ed25519:key_id:base64 格式）
-sign_file_local() {
-    local file="$1"
-    local key_file="$2"
-    local key_id="$3"
-
-    local SIGN_GO=$(mktemp /tmp/sign-XXXXXX.go)
-    cat > "$SIGN_GO" << 'GOEOF'
-package main
-
-import (
-	"crypto/ed25519"
-	"encoding/base64"
-	"fmt"
-	"os"
-	"strings"
-)
-
-func main() {
-	seedB64, _ := os.ReadFile(os.Args[1])
-	seed, _ := base64.StdEncoding.DecodeString(strings.TrimSpace(string(seedB64)))
-	privKey := ed25519.NewKeyFromSeed(seed)
-	fileData, _ := os.ReadFile(os.Args[2])
-	sig := ed25519.Sign(privKey, fileData)
-	fmt.Printf("ed25519:%s:%s", os.Args[3], base64.StdEncoding.EncodeToString(sig))
-}
-GOEOF
-    go run "$SIGN_GO" "$key_file" "$file" "$key_id"
-    rm -f "$SIGN_GO"
-}
-
-# 远程更新 versions 字段（校验和+签名）
-# ========================================
-update_versions_remote() {
-    local server_str="$1"
-    local version="$2"
-    local checksums_json="$3"
-    local signatures_json="$4"
-    local channel="$5"
-
-    parse_server "$server_str"
-
-    ssh_cmd "$SERVER_HOST" "$SERVER_PORT" "RELEASES_FILE='$SERVER_DIR/releases.json' VERSION='$version' CHANNEL='$channel' CHECKSUMS_JSON='$checksums_json' SIGNATURES_JSON='$signatures_json' python3 << 'PYEOF'
-import json, os
-
-releases_file = os.environ['RELEASES_FILE']
-version = os.environ['VERSION']
-channel = os.environ['CHANNEL']
-
-# 版本号不带 v 前缀
-bare_version = version[1:] if version.startswith('v') else version
-
-data = {}
-if os.path.exists(releases_file):
-    try:
-        with open(releases_file, 'r') as f:
-            data = json.load(f)
-    except:
-        pass
-
-if channel not in data:
-    data[channel] = {'latest': '', 'versions': []}
-
-checksums = json.loads(os.environ['CHECKSUMS_JSON'])
-signatures = json.loads(os.environ['SIGNATURES_JSON'])
-
-# 在版本列表中找到对应条目并更新 checksums/signatures
-versions = data[channel].get('versions', [])
-found = False
-for v in versions:
-    if v['version'] == bare_version:
-        v['checksums'] = checksums
-        if signatures:
-            v['signatures'] = signatures
-        found = True
-        break
-
-if not found:
-    entry = {'version': bare_version, 'checksums': checksums}
-    if signatures:
-        entry['signatures'] = signatures
-    versions.insert(0, entry)
-
-with open(releases_file, 'w') as f:
-    json.dump(data, f, indent=2)
-os.chmod(releases_file, 0o644)
-
-sig_msg = '（含签名）' if signatures else ''
-print(f'已更新 {len(checksums)} 个文件的校验和{sig_msg}')
-PYEOF"
-}
-
-# ========================================
-# 远程更新 releases.json
-# ========================================
-update_releases_json_remote() {
-    local server_str="$1"
-    local version="$2"
-    local channel="$3"
-
-    parse_server "$server_str"
-
-    log_info "更新 releases.json..."
-
-    local releases_file="$SERVER_DIR/releases.json"
-    local version_dir="$channel/$version"
-
-    ssh_cmd "$SERVER_HOST" "$SERVER_PORT" "RELEASES_FILE='$releases_file' VERSION='$version' CHANNEL='$channel' KEEP_VERSIONS='$KEEP_VERSIONS' python3 << 'PYEOF'
-import json
-import os
-from datetime import datetime
-
-releases_file = os.environ['RELEASES_FILE']
-version = os.environ['VERSION']
-channel = os.environ['CHANNEL']
-keep_versions = int(os.environ.get('KEEP_VERSIONS', '5'))
-
-# 版本号不带 v 前缀存储（规范要求）
-bare_version = version[1:] if version.startswith('v') else version
-
-# 读取现有数据（通道名为顶层 key）
-data = {}
-if os.path.exists(releases_file):
-    try:
-        with open(releases_file, 'r') as f:
-            data = json.load(f)
-    except:
-        pass
-
-if channel not in data:
-    data[channel] = {'latest': '', 'versions': []}
-
-# 添加新版本条目（checksums 由 update_versions_remote 单独更新）
-versions = data[channel]['versions']
-version_entry = {
-    'version': bare_version,
-    'released_at': datetime.now().strftime('%Y-%m-%d'),
-    'checksums': {}
-}
-
-# 检查版本是否已存在
-existing = [i for i, v in enumerate(versions) if v['version'] == bare_version]
-if existing:
-    # 保留已有 checksums/signatures
-    old = versions[existing[0]]
-    version_entry['checksums'] = old.get('checksums', {})
-    if 'signatures' in old:
-        version_entry['signatures'] = old['signatures']
-    versions[existing[0]] = version_entry
-else:
-    versions.insert(0, version_entry)
-
-# 保留最近 N 个版本
-data[channel]['versions'] = versions[:keep_versions]
-
-# 更新 latest
-data[channel]['latest'] = bare_version
-
-# 写入文件
-with open(releases_file, 'w') as f:
-    json.dump(data, f, indent=2)
-os.chmod(releases_file, 0o644)
-
-print(f'已更新 releases.json: {channel}/{bare_version}')
-PYEOF"
-}
-
-# ========================================
-# 远程清理旧版本
-# ========================================
-cleanup_old_versions_remote() {
-    local server_str="$1"
-    local channel="$2"
-
-    parse_server "$server_str"
-
-    log_info "清理旧版本（保留 $KEEP_VERSIONS 个）..."
-
-    ssh_cmd "$SERVER_HOST" "$SERVER_PORT" "
-        cd \"$SERVER_DIR/$channel\" 2>/dev/null || exit 0
-        removed=\$(ls -dt v* 2>/dev/null | tail -n +$((KEEP_VERSIONS + 1)))
-        if [ -n \"\$removed\" ]; then
-            echo \"\$removed\" | xargs -r rm -rf
-        fi
-    "
-
-    # 同步更新 releases.json
-    sync_releases_json_remote "$server_str" "$channel"
-}
-
-# ========================================
-# 远程同步 releases.json（移除已删除版本）
-# ========================================
-sync_releases_json_remote() {
-    local server_str="$1"
-    local channel="$2"
-
-    parse_server "$server_str"
-
-    ssh_cmd "$SERVER_HOST" "$SERVER_PORT" "python3 << 'PYEOF'
-import json
-import os
-
-releases_file = '$SERVER_DIR/releases.json'
-channel = '$channel'
-channel_dir = '$SERVER_DIR/$channel'
-
-if not os.path.exists(releases_file):
-    exit(0)
-
-with open(releases_file, 'r') as f:
-    data = json.load(f)
-
-if channel not in data:
-    exit(0)
-
-# 获取实际存在的版本目录（目录名带 v 前缀，版本号不带）
-existing = set()
-if os.path.isdir(channel_dir):
-    for d in os.listdir(channel_dir):
-        if d.startswith('v'):
-            existing.add(d[1:])  # 去掉 v 前缀
-
-# 过滤掉已删除的版本
-versions = data[channel].get('versions', [])
-data[channel]['versions'] = [v for v in versions if v['version'] in existing]
-
-with open(releases_file, 'w') as f:
-    json.dump(data, f, indent=2)
-os.chmod(releases_file, 0o644)
-PYEOF"
-}
-
-# ========================================
-# 上传到服务器
-# ========================================
-upload_to_server() {
-    local server_str="$1"
-    local version="$2"
-    local channel="$3"
-
-    parse_server "$server_str"
-
-    log_step "部署到 $SERVER_NAME ($SERVER_HOST)..."
-
-    local remote_version_dir="$SERVER_DIR/$channel/$version"
-
-    # 创建远程目录
-    log_info "创建目录: $remote_version_dir"
-    ssh_cmd "$SERVER_HOST" "$SERVER_PORT" "mkdir -p \"$remote_version_dir\" && rm -f \"$remote_version_dir\"/*.gz"
-
-    # 上传包文件
-    log_info "上传包文件..."
-    for pkg in "$DIST_DIR"/*.gz; do
-        if [ -f "$pkg" ]; then
-            local filename=$(basename "$pkg")
-            log_info "  上传: $filename"
-            rsync_cmd "$pkg" "$SERVER_HOST" "$SERVER_PORT" "$remote_version_dir/"
-        fi
-    done
-
-    # 上传 install.sh（通用脚本，用户通过参数传入域名）
-    log_info "上传 install.sh..."
-    rsync_cmd "$PROJECT_ROOT/deploy/install.sh" "$SERVER_HOST" "$SERVER_PORT" "$SERVER_DIR/install.sh"
-
-    # 上传 install.ps1
-    log_info "上传 install.ps1..."
-    rsync_cmd "$PROJECT_ROOT/deploy/install.ps1" "$SERVER_HOST" "$SERVER_PORT" "$SERVER_DIR/install.ps1"
-
-    # 更新校验和和签名
-    log_info "更新校验和和签名..."
-    update_versions_remote "$server_str" "$version" "$CHECKSUMS_JSON" "$SIGNATURES_JSON" "$channel"
-
-    # 更新 releases.json
-    update_releases_json_remote "$server_str" "$version" "$channel"
-
-    # 修复文件权限（确保 Nginx 可读）
-    ssh_cmd "$SERVER_HOST" "$SERVER_PORT" "chmod 644 \"$SERVER_DIR/releases.json\" \"$SERVER_DIR/install.sh\" \"$SERVER_DIR/install.ps1\" 2>/dev/null; chmod -R 644 \"$remote_version_dir\"/*.gz 2>/dev/null"
-
-    # 清理旧版本
-    cleanup_old_versions_remote "$server_str" "$channel"
-
-    log_success "$SERVER_NAME: 部署完成"
-}
-
-# ========================================
-# 部署到所有服务器
-# ========================================
-deploy_to_all() {
-    local version="$1"
-    local channel="$2"
-    local target_server="$3"
-
-    local success=0
-    local failed=0
-
-    for server in "${SERVERS[@]}"; do
-        parse_server "$server"
-
-        # 如果指定了服务器，只部署到该服务器
-        if [ -n "$target_server" ] && [ "$SERVER_NAME" != "$target_server" ]; then
-            continue
-        fi
-
-        if upload_to_server "$server" "$version" "$channel"; then
-            success=$((success + 1))
-        else
-            failed=$((failed + 1))
-            log_error "$SERVER_NAME: 部署失败"
-        fi
-    done
-
-    echo ""
-    log_step "部署结果汇总"
-    log_info "成功: $success 个服务器"
-    [ $failed -gt 0 ] && log_error "失败: $failed 个服务器"
-
-    return $failed
-}
-
-
-# ========================================
-# 显示帮助
-# ========================================
-show_help() {
-    cat << EOF
-用法: $0 [选项] [版本号]
-
-选项:
-  --test            测试所有服务器 SSH 连接
-  --server NAME     只部署到指定服务器
-  --upload-only     只上传，跳过构建
-  -h, --help        显示帮助
-
-示例:
-  $0 0.0.10-beta        发布指定版本
-  $0 --server cn        只发布到 cn 服务器
-  $0 --test             测试连接
+DRY_RUN=false
+MODE=""
+VERSION=""
+BUNDLE=""
+
+log() { printf '[release] %s\n' "$*"; }
+die() { printf '[release] 错误: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+    cat <<'EOF'
+用法: build/release.sh [--dry-run] <mode> <version> [--bundle <absolute-path>]
+
+mode:
+  prepare       构建、签名并持久化唯一 bundle
+  publish-dev   将现有 dev bundle 暂存、提升并全节点验收
+  verify-dev    验收现有 dev bundle
+  stage-main    将现有 main bundle 暂存到所有节点，不改公开索引
+  promote-main  tag 存在后从 staging 提升 main 并全节点验收
+  verify-main   验收现有 main bundle
+  resume-main   tag 后仅用现有 bundle 幂等恢复，禁止构建
+  check-nodes   检查全部发布节点连通性
+
+真实发布必须遵循 skills/remote-release.md；--dry-run 不联网、不构建、不修改 Git。
 EOF
 }
 
-# ========================================
-# 主流程
-# ========================================
-main() {
-    local version=""
-    local target_server=""
-    local upload_only=false
-    local test_only=false
+while (($#)); do
+    case "$1" in
+        --dry-run) DRY_RUN=true; shift ;;
+        --bundle) BUNDLE="${2:-}"; shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        -*) die "未知选项: $1" ;;
+        *)
+            if [[ -z "$MODE" ]]; then MODE="$1"; elif [[ -z "$VERSION" ]]; then VERSION="${1#v}"; else die "多余参数: $1"; fi
+            shift
+            ;;
+    esac
+done
 
-    # 解析参数
-    while [ $# -gt 0 ]; do
-        case "$1" in
-            --test)
-                test_only=true
-                shift
-                ;;
-            --server)
-                target_server="$2"
-                shift 2
-                ;;
-            --upload-only)
-                upload_only=true
-                shift
-                ;;
-            -h|--help)
-                show_help
-                exit 0
-                ;;
-            -*)
-                log_error "未知选项: $1"
-                show_help
-                exit 1
-                ;;
-            *)
-                version="$1"
-                shift
-                ;;
-        esac
+case "$MODE" in
+    prepare|publish-dev|verify-dev|stage-main|promote-main|verify-main|resume-main) ;;
+    check-nodes) ;;
+    "") usage; exit 2 ;;
+    *) die "未知 mode: $MODE" ;;
+esac
+
+if [[ "$MODE" != "check-nodes" ]]; then
+    [[ -n "$VERSION" ]] || die "必须指定版本"
+    CHANNEL="$(python3 "$HELPER" channel "$VERSION")"
+    [[ -n "$BUNDLE" ]] || die "必须通过 --bundle 指定持久 bundle 路径"
+    [[ "$BUNDLE" == /* && "$BUNDLE" != "/" ]] || die "bundle 必须是非根绝对路径"
+    case "$MODE" in
+        publish-dev|verify-dev) [[ "$CHANNEL" == "dev" ]] || die "$MODE 只接受预发布 SemVer" ;;
+        stage-main|promote-main|verify-main|resume-main) [[ "$CHANNEL" == "main" ]] || die "$MODE 只接受稳定 SemVer" ;;
+    esac
+fi
+
+if [[ "$DRY_RUN" == true ]]; then
+    log "DRY-RUN mode=$MODE version=${VERSION:-n/a} channel=${CHANNEL:-n/a} bundle=${BUNDLE:-n/a}"
+    case "$MODE" in
+        prepare) log "将校验分支/工作区，构建一次三项资产，签名并写入 manifest；不执行任何动作" ;;
+        publish-dev) log "将从现有 bundle 暂存全部节点，核对后原子推进 dev 索引；不执行任何动作" ;;
+        stage-main) log "将只读现有 bundle 并暂存全部节点，正式目录与索引保持不变；不执行任何动作" ;;
+        promote-main|resume-main) log "将校验不可变 tag 与 manifest commit，只读 bundle 并从 staging 恢复；不执行任何动作" ;;
+        verify-dev|verify-main) log "将验收全部节点和统一公网入口；不执行任何动作" ;;
+        check-nodes) log "将检查配置中的全部节点；不执行任何动作" ;;
+    esac
+    exit 0
+fi
+
+load_config() {
+    [[ -f "$CONFIG_FILE" ]] || die "配置不存在: $CONFIG_FILE"
+    # shellcheck source=/dev/null
+    source "$CONFIG_FILE"
+    KEEP_VERSIONS=5
+    declare -p SERVERS >/dev/null 2>&1 || die "SERVERS 未配置"
+    ((${#SERVERS[@]} >= 2)) || die "本仓发布要求至少两个节点，禁止退化为单节点"
+    [[ -n "${SSH_USER:-}" && -n "${SSH_KEY:-}" ]] || die "SSH_USER/SSH_KEY 未配置"
+    [[ "$SSH_USER" =~ ^[0-9A-Za-z._-]+$ ]] || die "SSH_USER 格式无效"
+    [[ -n "${PUBLIC_RELEASE_URL:-}" ]] || die "PUBLIC_RELEASE_URL 未配置"
+    [[ "$PUBLIC_RELEASE_URL" == https://* ]] || die "PUBLIC_RELEASE_URL 必须使用 HTTPS"
+    PUBLIC_RELEASE_URL="${PUBLIC_RELEASE_URL%/}"
+    SSH_KEY="${SSH_KEY/#\~/${HOME}}"
+    [[ -f "$SSH_KEY" ]] || die "SSH 密钥不存在: $SSH_KEY"
+    if [[ -n "${SIGN_KEY:-}" && "$SIGN_KEY" != /* ]]; then SIGN_KEY="$PROJECT_ROOT/$SIGN_KEY"; fi
+    names=""
+    for server in "${SERVERS[@]}"; do
+        IFS=',' read -r name host port directory <<<"$server"
+        [[ -n "$name" && -n "$host" && -n "$directory" ]] || die "无效服务器配置: $server"
+        [[ "$name" =~ ^[0-9A-Za-z._-]+$ && "$host" =~ ^[0-9A-Za-z.:-]+$ ]] || die "服务器名称或主机格式无效: $name"
+        [[ "${port:-22}" =~ ^[0-9]+$ ]] || die "SSH 端口格式无效: $name"
+        [[ "$directory" =~ ^/[0-9A-Za-z._/-]+$ && "$directory" != *".."* ]] || die "发布目录格式无效: $name"
+        [[ ",$names," != *",$name,"* ]] || die "服务器名称重复: $name"
+        names="${names:+$names,}$name"
     done
-
-    echo ""
-    echo "========================================"
-    echo "  sslctl 远程发布脚本"
-    echo "========================================"
-    echo ""
-
-    # 加载配置
-    load_config
-
-    # 测试模式
-    if [ "$test_only" = true ]; then
-        test_all_connections
-        exit $?
-    fi
-
-    # 版本号必须通过命令行参数传入
-    if [ -z "$version" ]; then
-        log_error "必须指定版本号"
-        log_info "用法: $0 <版本号>"
-        exit 1
-    fi
-
-    # 确定通道
-    local channel=$(get_channel "$version")
-
-    # 确保 tag 存在
-    if [ "$channel" = "main" ]; then
-        ensure_tag "v${version#v}"
-    fi
-
-    # 确保版本号带 v 前缀
-    if [[ "$version" != v* ]]; then
-        version="v$version"
-    fi
-
-    log_info "版本号: $version"
-    log_info "发布通道: $channel"
-    log_info "目标服务器: ${target_server:-全部}"
-
-    # 测试连接
-    if ! test_all_connections; then
-        log_error "请先解决连接问题"
-        exit 1
-    fi
-
-    # 构建
-    if [ "$upload_only" = false ]; then
-        log_step "运行构建..."
-        "$SCRIPT_DIR/build.sh" "$version"
-    else
-        log_info "跳过构建，使用已有包"
-    fi
-
-    # 检查构建产物
-    if [ ! -d "$DIST_DIR" ] || [ -z "$(ls -A $DIST_DIR/*.gz 2>/dev/null)" ]; then
-        log_error "构建产物不存在: $DIST_DIR"
-        exit 1
-    fi
-
-    # 本地计算校验和和签名
-    log_step "计算校验和和签名..."
-    compute_checksums_and_sign_local "$version"
-
-    # 部署
-    local result=0
-    deploy_to_all "$version" "$channel" "$target_server" || result=$?
-
-    echo ""
-    if [ $result -eq 0 ]; then
-        log_success "发布完成！"
-        echo ""
-        log_info "验证: curl https://release.cnssl.com/sslctl/releases.json | jq ."
-    else
-        log_error "部分服务器发布失败"
-    fi
-
-    return $result
 }
 
-main "$@"
+parse_server() {
+    IFS=',' read -r SERVER_NAME SERVER_HOST SERVER_PORT SERVER_DIR <<<"$1"
+    SERVER_PORT="${SERVER_PORT:-22}"
+}
+
+ssh_run() {
+    local host="$1" port="$2"; shift 2
+    ssh -i "$SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o "ConnectTimeout=$SSH_TIMEOUT" \
+        -p "$port" "$SSH_USER@$host" "$@"
+}
+
+rsync_file() {
+    local source="$1" host="$2" port="$3" destination="$4"
+    rsync -az -e "ssh -i $SSH_KEY -o BatchMode=yes -o StrictHostKeyChecking=accept-new -p $port" \
+        "$source" "$SSH_USER@$host:$destination"
+}
+
+verify_local_bundle() {
+    python3 "$HELPER" verify-manifest --bundle "$BUNDLE" --version "$VERSION" >/dev/null
+    local signatures_file signature_key_id
+    signatures_file="$(mktemp "${TMPDIR:-/tmp}/sslctl-signatures.XXXXXX")"
+    signature_key_id="$(python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); print(next(iter(m["assets"].values()))["signature"].split(":",2)[1])' "$BUNDLE/manifest.json")"
+    python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); json.dump({k:v["signature"] for k,v in m["assets"].items()}, open(sys.argv[2], "w"))' \
+        "$BUNDLE/manifest.json" "$signatures_file"
+    if ! bash "$SCRIPT_DIR/sign-release.sh" --key-id "$signature_key_id" --assets-dir "$BUNDLE/assets" \
+        --verify-signatures "$signatures_file" >/dev/null; then
+        rm -f "$signatures_file"
+        return 1
+    fi
+    rm -f "$signatures_file"
+}
+
+manifest_value() {
+    python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))[sys.argv[2]])' "$BUNDLE/manifest.json" "$1"
+}
+
+prepare_bundle() {
+    load_config
+    [[ ! -e "$BUNDLE" ]] || die "bundle 路径已存在；禁止覆盖: $BUNDLE"
+    [[ -n "${SIGN_KEY:-}" && -n "${SIGN_KEY_ID:-}" ]] || die "SIGN_KEY/SIGN_KEY_ID 未配置"
+    [[ -f "$SIGN_KEY" ]] || die "签名私钥不存在: $SIGN_KEY"
+
+    local source_commit dirty source_epoch created_at build_time go_version work_dir signatures preflight_index
+    source_commit="$(git -C "$PROJECT_ROOT" rev-parse HEAD)"
+    dirty=false
+    [[ -z "$(git -C "$PROJECT_ROOT" status --porcelain --untracked-files=normal)" ]] || dirty=true
+
+    if [[ "$CHANNEL" == "main" ]]; then
+        [[ "$(git -C "$PROJECT_ROOT" branch --show-current)" == "main" ]] || die "main bundle 只能从 main 分支 prepare"
+        [[ "$dirty" == false ]] || die "main bundle 要求干净工作区"
+        [[ "$(git -C "$PROJECT_ROOT" rev-parse refs/remotes/origin/main)" == "$source_commit" ]] || die "本地 main 必须与 origin/main 一致"
+        ! git -C "$PROJECT_ROOT" show-ref --verify --quiet "refs/tags/v$VERSION" || die "本地 tag 已存在: v$VERSION"
+        [[ -z "$(git -C "$PROJECT_ROOT" ls-remote --tags origin "refs/tags/v$VERSION")" ]] || die "远端 tag 已存在: v$VERSION"
+        preflight_index="$(mktemp "${TMPDIR:-/tmp}/sslctl-main-index.XXXXXX")"
+        curl --fail --silent --show-error --location "$PUBLIC_RELEASE_URL/releases.json" >"$preflight_index"
+        python3 "$HELPER" check-new-main --index "$preflight_index" --version "$VERSION"
+        rm -f "$preflight_index"
+        for server in "${SERVERS[@]}"; do
+            parse_server "$server"
+            ssh_run "$SERVER_HOST" "$SERVER_PORT" "test ! -e '$SERVER_DIR/main/v$VERSION'" || die "$SERVER_NAME 已存在正式版本 v$VERSION"
+        done
+        source_epoch="$(git -C "$PROJECT_ROOT" show -s --format=%ct "$source_commit")"
+    else
+        source_epoch="$(date +%s)"
+    fi
+
+    mkdir -p "$BUNDLE/assets" "$BUNDLE/.work"
+    work_dir="$BUNDLE/.work"
+    SOURCE_DATE_EPOCH="$source_epoch" bash "$SCRIPT_DIR/build.sh" "$VERSION" "$work_dir"
+    for name in sslctl-linux-amd64.gz sslctl-linux-arm64.gz sslctl-windows-amd64.exe.gz; do
+        cp "$work_dir/$name" "$BUNDLE/assets/$name"
+    done
+    signatures="$BUNDLE/.signatures.json"
+    bash "$SCRIPT_DIR/sign-release.sh" --key "$SIGN_KEY" --key-id "$SIGN_KEY_ID" --assets-dir "$BUNDLE/assets" --output "$signatures"
+    created_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    build_time="$(python3 -c 'import datetime,sys; print(datetime.datetime.fromtimestamp(int(sys.argv[1]), datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))' "$source_epoch")"
+    go_version="$(go version)"
+    python3 "$HELPER" create-manifest --version "$VERSION" --assets-dir "$BUNDLE/assets" --signatures "$signatures" \
+        --output "$BUNDLE/manifest.json" --source-commit "$source_commit" --dirty "$dirty" \
+        --created-at "$created_at" --build-time "$build_time" --go-version "$go_version"
+    rm -rf "$work_dir"
+    rm -f "$signatures"
+    verify_local_bundle
+    log "bundle 已生成并校验: $BUNDLE"
+}
+
+stage_server() {
+    local server="$1" commit stage
+    parse_server "$server"
+    commit="$(manifest_value source_commit)"
+    stage="$SERVER_DIR/.staging/sslctl/v$VERSION-$commit"
+    log "暂存节点 $SERVER_NAME"
+    ssh_run "$SERVER_HOST" "$SERVER_PORT" "mkdir -p '$stage/assets'"
+    rsync_file "$BUNDLE/manifest.json" "$SERVER_HOST" "$SERVER_PORT" "$stage/manifest.json"
+    rsync_file "$HELPER" "$SERVER_HOST" "$SERVER_PORT" "$stage/release_helper.py"
+    for name in sslctl-linux-amd64.gz sslctl-linux-arm64.gz sslctl-windows-amd64.exe.gz; do
+        rsync_file "$BUNDLE/assets/$name" "$SERVER_HOST" "$SERVER_PORT" "$stage/assets/$name"
+    done
+    ssh_run "$SERVER_HOST" "$SERVER_PORT" \
+        "python3 '$stage/release_helper.py' verify-manifest --bundle '$stage' --version '$VERSION' >/dev/null"
+    if [[ "$CHANNEL" == "main" ]]; then
+        if ssh_run "$SERVER_HOST" "$SERVER_PORT" "test -e '$SERVER_DIR/main/v$VERSION'"; then
+            [[ "$MODE" == "resume-main" ]] || die "$SERVER_NAME 已存在正式版本 v$VERSION"
+            for name in sslctl-linux-amd64.gz sslctl-linux-arm64.gz sslctl-windows-amd64.exe.gz; do
+                expected="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["assets"][sys.argv[2]]["sha256"].removeprefix("sha256:"))' "$BUNDLE/manifest.json" "$name")"
+                actual="$(ssh_run "$SERVER_HOST" "$SERVER_PORT" "sha256sum '$SERVER_DIR/main/v$VERSION/$name' | cut -d' ' -f1")"
+                [[ "$actual" == "$expected" ]] || die "$SERVER_NAME 已有正式资产与 bundle 不一致: $name"
+            done
+        fi
+    fi
+    local -a allow_existing=()
+    [[ "$MODE" == "resume-main" ]] && allow_existing+=(--allow-existing-main)
+    ssh_run "$SERVER_HOST" "$SERVER_PORT" \
+        "python3 '$stage/release_helper.py' update-index --index '$SERVER_DIR/releases.json' --bundle '$stage' --version '$VERSION' --output '$stage/releases.json' ${allow_existing[*]}"
+    ssh_run "$SERVER_HOST" "$SERVER_PORT" \
+        "python3 '$stage/release_helper.py' verify-index --index '$stage/releases.json' --bundle '$stage' --version '$VERSION'"
+    STAGED_INDEX_SHA="$(ssh_run "$SERVER_HOST" "$SERVER_PORT" "sha256sum '$stage/releases.json' | cut -d' ' -f1")"
+}
+
+stage_all() {
+    local candidate_sha=""
+    verify_local_bundle
+    for server in "${SERVERS[@]}"; do
+        stage_server "$server"
+        if [[ -z "$candidate_sha" ]]; then candidate_sha="$STAGED_INDEX_SHA"; fi
+        [[ "$STAGED_INDEX_SHA" == "$candidate_sha" ]] || die "各节点候选 releases.json 不一致，禁止推进"
+    done
+    log "全部节点 staging 与候选索引校验完成"
+}
+
+promote_server() {
+    local server="$1" commit stage destination temp old
+    parse_server "$server"
+    commit="$(manifest_value source_commit)"
+    stage="$SERVER_DIR/.staging/sslctl/v$VERSION-$commit"
+    destination="$SERVER_DIR/$CHANNEL/v$VERSION"
+    temp="$SERVER_DIR/$CHANNEL/.v$VERSION.new-$commit"
+    old="$SERVER_DIR/$CHANNEL/.v$VERSION.old-$commit"
+    log "提升节点 $SERVER_NAME"
+    ssh_run "$SERVER_HOST" "$SERVER_PORT" "STAGE='$stage' DEST='$destination' TEMP='$temp' OLD='$old' CHANNEL='$CHANNEL' python3 - <<'PY'
+import os, shutil
+stage, dest, temp, old, channel = (os.environ[k] for k in ('STAGE','DEST','TEMP','OLD','CHANNEL'))
+if os.path.lexists(temp): shutil.rmtree(temp)
+os.makedirs(os.path.dirname(dest), exist_ok=True)
+shutil.copytree(os.path.join(stage, 'assets'), temp)
+if channel == 'main' and os.path.lexists(dest):
+    shutil.rmtree(temp)
+elif channel == 'dev' and os.path.lexists(dest):
+    if os.path.lexists(old): shutil.rmtree(old)
+    os.replace(dest, old)
+if os.path.lexists(temp): os.replace(temp, dest)
+if os.path.lexists(old): shutil.rmtree(old)
+os.replace(os.path.join(stage, 'releases.json'), os.path.join(os.path.dirname(os.path.dirname(dest)), 'releases.json'))
+PY"
+    rsync_file "$PROJECT_ROOT/deploy/install.sh" "$SERVER_HOST" "$SERVER_PORT" "$SERVER_DIR/install.sh"
+    rsync_file "$PROJECT_ROOT/deploy/install.ps1" "$SERVER_HOST" "$SERVER_PORT" "$SERVER_DIR/install.ps1"
+}
+
+verify_server() {
+    local server="$1" commit stage local_index
+    parse_server "$server"
+    commit="$(manifest_value source_commit)"
+    stage="$SERVER_DIR/.staging/sslctl/v$VERSION-$commit"
+    local_index="$(mktemp "${TMPDIR:-/tmp}/sslctl-index.XXXXXX")"
+    trap 'rm -f "$local_index"' RETURN
+    ssh_run "$SERVER_HOST" "$SERVER_PORT" "cat '$SERVER_DIR/releases.json'" >"$local_index"
+    python3 "$HELPER" verify-index --index "$local_index" --bundle "$BUNDLE" --version "$VERSION"
+    for name in sslctl-linux-amd64.gz sslctl-linux-arm64.gz sslctl-windows-amd64.exe.gz; do
+        expected="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["assets"][sys.argv[2]]["sha256"].removeprefix("sha256:"))' "$BUNDLE/manifest.json" "$name")"
+        actual="$(ssh_run "$SERVER_HOST" "$SERVER_PORT" "sha256sum '$SERVER_DIR/$CHANNEL/v$VERSION/$name' | cut -d' ' -f1")"
+        [[ "$actual" == "$expected" ]] || die "$SERVER_NAME 资产哈希不一致: $name"
+    done
+    rm -f "$local_index"
+    trap - RETURN
+    ssh_run "$SERVER_HOST" "$SERVER_PORT" "test -f '$stage/manifest.json'" >/dev/null
+    log "节点验收通过: $SERVER_NAME"
+}
+
+verify_public() {
+    local temp_index temp_asset expected actual
+    temp_index="$(mktemp "${TMPDIR:-/tmp}/sslctl-public.XXXXXX")"
+    temp_asset="$(mktemp "${TMPDIR:-/tmp}/sslctl-public-asset.XXXXXX")"
+    trap 'rm -f "$temp_index" "$temp_asset"' RETURN
+    curl --fail --silent --show-error --location "$PUBLIC_RELEASE_URL/releases.json" >"$temp_index"
+    python3 "$HELPER" verify-index --index "$temp_index" --bundle "$BUNDLE" --version "$VERSION"
+    curl --fail --silent --show-error --location \
+        "$PUBLIC_RELEASE_URL/$CHANNEL/v$VERSION/sslctl-linux-amd64.gz" >"$temp_asset"
+    expected="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["assets"]["sslctl-linux-amd64.gz"]["sha256"].removeprefix("sha256:"))' "$BUNDLE/manifest.json")"
+    actual="$(shasum -a 256 "$temp_asset" | awk '{print $1}')"
+    [[ "$actual" == "$expected" ]] || die "统一公网入口代表资产 SHA256 不一致"
+    rm -f "$temp_index" "$temp_asset"
+    trap - RETURN
+    log "统一公网入口索引验收通过"
+}
+
+verify_all() {
+    verify_local_bundle
+    for server in "${SERVERS[@]}"; do verify_server "$server"; done
+    verify_public
+}
+
+cleanup_server() {
+    local server="$1"
+    parse_server "$server"
+    ssh_run "$SERVER_HOST" "$SERVER_PORT" "ROOT='$SERVER_DIR' CHANNEL='$CHANNEL' KEEP='$KEEP_VERSIONS' python3 - <<'PY'
+import json, os, shutil
+root, channel, keep = os.environ['ROOT'], os.environ['CHANNEL'], int(os.environ['KEEP'])
+with open(os.path.join(root, 'releases.json'), encoding='utf-8') as handle:
+    index = json.load(handle)
+versions = index.get(channel, {}).get('versions', [])[:keep]
+allowed = {'v' + item['version'] for item in versions}
+channel_dir = os.path.join(root, channel)
+if os.path.isdir(channel_dir):
+    for name in os.listdir(channel_dir):
+        path = os.path.join(channel_dir, name)
+        if name.startswith('v') and name not in allowed and os.path.isdir(path) and not os.path.islink(path):
+            shutil.rmtree(path)
+PY"
+}
+
+promote_all() {
+    for server in "${SERVERS[@]}"; do promote_server "$server"; done
+    verify_all
+    for server in "${SERVERS[@]}"; do cleanup_server "$server"; done
+}
+
+require_main_tag() {
+    local commit local_tag remote_tag
+    commit="$(manifest_value source_commit)"
+    local_tag="$(git -C "$PROJECT_ROOT" rev-parse "refs/tags/v$VERSION^{commit}" 2>/dev/null || true)"
+    remote_tag="$(git -C "$PROJECT_ROOT" ls-remote origin "refs/tags/v$VERSION" "refs/tags/v$VERSION^{}" | awk '/\^\{\}$/ {peeled=$1} !/\^\{\}$/ {direct=$1} END {print peeled ? peeled : direct}')"
+    [[ "$local_tag" == "$commit" && "$remote_tag" == "$commit" ]] || die "v$VERSION 必须在本地和 origin 不可变地指向 manifest commit"
+}
+
+check_nodes() {
+    load_config
+    for server in "${SERVERS[@]}"; do
+        parse_server "$server"
+        ssh_run "$SERVER_HOST" "$SERVER_PORT" "python3 --version >/dev/null && test -d '$SERVER_DIR'"
+        log "节点可用: $SERVER_NAME"
+    done
+}
+
+case "$MODE" in
+    prepare) prepare_bundle ;;
+    check-nodes) check_nodes ;;
+    publish-dev) load_config; stage_all; promote_all ;;
+    verify-dev) load_config; verify_all ;;
+    stage-main) load_config; stage_all ;;
+    promote-main) load_config; verify_local_bundle; require_main_tag; promote_all ;;
+    verify-main) load_config; verify_all ;;
+    resume-main) load_config; verify_local_bundle; require_main_tag; stage_all; promote_all ;;
+esac

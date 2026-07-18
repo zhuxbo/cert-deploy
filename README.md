@@ -129,6 +129,8 @@ sslctl uninstall                                     # 卸载（交互确认是�
 
 CI 覆盖 linux/amd64、linux/arm64、windows/amd64 三平台交叉编译验证。
 
+开发与发布的权威入口：项目规则见 `AGENTS.md`，任务路由见 `skills/SKILL.md`；构建/签名契约见 `skills/build-release.md`，远程发布与中断恢复见 `skills/remote-release.md`，完整完成检查见 `skills/finish-check.md`。脚本参数速查见 `build/README.md`。发布规则不在 README 中重复维护。
+
 支持 Docker 容器 Nginx（挂载卷/docker cp 双模式），自动检测本地或容器环境。
 
 ## Debug 模式

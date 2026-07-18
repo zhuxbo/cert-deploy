@@ -97,12 +97,12 @@ build_binary() {
         GO_CMD="/usr/local/go/bin/go"
     fi
 
-    local version=$(cat "${PROJECT_DIR}/version.json" | grep '"version"' | sed 's/.*: "\(.*\)".*/\1/')
+    local version="linux-service-test"
     local build_time=$(date -u +%Y-%m-%d)
     local ldflags="-s -w -X 'main.version=${version}' -X 'main.buildTime=${build_time}'"
 
     mkdir -p "${PROJECT_DIR}/dist"
-    GOOS=linux GOARCH="$arch" $GO_CMD build -ldflags "$ldflags" -o "$output" ./cmd/main.go
+    GOOS=linux GOARCH="$arch" $GO_CMD build -ldflags "$ldflags" -o "$output" ./cmd/
 
     echo_info "构建完成: $output"
 }

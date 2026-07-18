@@ -12,12 +12,17 @@ sha256_file() { shasum -a 256 "$1" | awk '{print $1}'; }
 EXPECTED_CLAUDE_SHA256="5d904a04b7b6ecb89a5b9254f9afcd12803cbe140d3f9af7bc3a6cf15d5de1fa"
 EXPECTED_FINISH_COMMAND_SHA256="121bc2a3671b23555cb7e01074d2b5ac3463eb10a6287e00153e2f166d97c6ad"
 EXPECTED_RELEASE_COMMAND_SHA256="f2e26d7329c5f1c31e80f4afb2df8e3086b042a91e1978b2e6be244c2bbfc760"
-EXPECTED_CODEX_SKILL_SHA256="46451ae7b148322b22be3c98953b17fa9d7e9360513d11defe723a26f59a48bb"
+EXPECTED_CODEX_FINISH_SKILL_SHA256="329a162e0bb5861ed8283d94f5df2c042edbdc8250dd92a44b608df24700bd6f"
+EXPECTED_CODEX_RELEASE_SKILL_SHA256="966a13f89cfffbfb4e8bd7c5b31855b4b3d3b34c64db789077d2d31b78c55d62"
 
 [[ "$(sha256_file CLAUDE.md)" == "$EXPECTED_CLAUDE_SHA256" ]] || fail "CLAUDE.md 不符合固定模板"
 [[ "$(sha256_file .claude/commands/finish-check.md)" == "$EXPECTED_FINISH_COMMAND_SHA256" ]] || fail "finish-check 工具入口发生漂移"
 [[ "$(sha256_file .claude/commands/remote-release.md)" == "$EXPECTED_RELEASE_COMMAND_SHA256" ]] || fail "remote-release 工具入口发生漂移"
-[[ "$(sha256_file .agents/skills/sslctl/SKILL.md)" == "$EXPECTED_CODEX_SKILL_SHA256" ]] || fail "Codex Skill 薄入口发生漂移"
+[[ "$(sha256_file .agents/skills/finish-check/SKILL.md)" == "$EXPECTED_CODEX_FINISH_SKILL_SHA256" ]] || fail "Codex finish-check 薄入口发生漂移"
+[[ "$(sha256_file .agents/skills/remote-release/SKILL.md)" == "$EXPECTED_CODEX_RELEASE_SKILL_SHA256" ]] || fail "Codex remote-release 薄入口发生漂移"
+for native_skill in .agents/skills/finish-check/SKILL.md .agents/skills/remote-release/SKILL.md; do
+    git ls-files --error-unmatch -- "$native_skill" >/dev/null 2>&1 || fail "Codex Skill 未纳入 Git 跟踪: $native_skill"
+done
 
 actual_claude_commands=()
 while IFS= read -r path; do actual_claude_commands+=("$path"); done < <(find .claude/commands -maxdepth 1 -type f -name '*.md' | sort)
@@ -25,9 +30,12 @@ expected_claude_commands=(.claude/commands/finish-check.md .claude/commands/remo
 [[ "${actual_claude_commands[*]}" == "${expected_claude_commands[*]}" ]] || fail "Claude 工具入口集合发生漂移"
 actual_codex_skills=()
 while IFS= read -r path; do actual_codex_skills+=("$path"); done < <(find .agents/skills -mindepth 2 -maxdepth 2 -type f -name SKILL.md | sort)
-expected_codex_skills=(.agents/skills/sslctl/SKILL.md)
+expected_codex_skills=(.agents/skills/finish-check/SKILL.md .agents/skills/remote-release/SKILL.md)
 [[ "${actual_codex_skills[*]}" == "${expected_codex_skills[*]}" ]] || fail "Codex Skill 入口集合发生漂移"
-grep -Fq '`skills/SKILL.md`' .agents/skills/sslctl/SKILL.md || fail "Codex Skill 未引用统一路由"
+grep -Fq '`../../../skills/finish-check.md`' .agents/skills/finish-check/SKILL.md || fail "Codex finish-check 未引用同名叶子 Skill"
+grep -Fq '`../../../skills/remote-release.md`' .agents/skills/remote-release/SKILL.md || fail "Codex remote-release 未引用同名叶子 Skill"
+[[ -f .agents/skills/finish-check/../../../skills/finish-check.md ]] || fail "Codex finish-check 叶子 Skill 不存在"
+[[ -f .agents/skills/remote-release/../../../skills/remote-release.md ]] || fail "Codex remote-release 叶子 Skill 不存在"
 
 [[ -f AGENTS.md && -f skills/SKILL.md ]] || fail "缺少 AGENTS.md 或根 Skill"
 for phrase in "只记录长期有效" "只直接维护 \`AGENTS.md\`" "新增、删除或重命名 skill" "删除失效或重复内容"; do
@@ -66,7 +74,11 @@ with open(sys.argv[1], "w", encoding="utf-8") as output:
             text = path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             continue
-        text = text.replace(".agents/skills/sslctl/SKILL.md", "")
+        for native_skill in (
+            ".agents/skills/finish-check/SKILL.md",
+            ".agents/skills/remote-release/SKILL.md",
+        ):
+            text = text.replace(native_skill, "")
         for number, line in enumerate(text.splitlines(), 1):
             if pattern.search(line):
                 output.write(f"{path}:{number}:{line}\n")

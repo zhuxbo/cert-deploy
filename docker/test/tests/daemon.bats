@@ -74,12 +74,26 @@ teardown() {
     return 1
   fi
 
-  # 检查回调记录（部署成功后应发送回调）
-  local callbacks
-  callbacks=$(mock_get_callbacks)
-  if [[ "$callbacks" != *"1001"* ]]; then
+  # API 查询只表示续签已经开始；部署和回调仍在异步执行，需单独等待目标订单的回调。
+  local callbacks="[]"
+  local callback_seen=false
+  for i in $(seq 1 30); do
+    callbacks=$(mock_get_callbacks 2>/dev/null || echo "[]")
+    if echo "$callbacks" | jq -e 'any(.[]; .order_id == 1001)' >/dev/null 2>&1; then
+      callback_seen=true
+      break
+    fi
+    if ! kill -0 "$daemon_pid" 2>/dev/null; then
+      break
+    fi
+    sleep 1
+  done
+
+  if [ "$callback_seen" != "true" ]; then
     echo "daemon 续签后未发送回调"
     echo "Callbacks: $callbacks"
+    echo "Requests: $(mock_get_requests 2>/dev/null)"
+    cat /tmp/daemon-e2e.out 2>/dev/null || true
     kill "$daemon_pid" 2>/dev/null || true
     wait "$daemon_pid" 2>/dev/null || true
     return 1

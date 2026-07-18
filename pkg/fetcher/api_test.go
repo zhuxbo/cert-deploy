@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/zhuxbo/sslctl/pkg/config"
 )
 
 // mockResponse 模拟 API 响应
@@ -36,10 +38,10 @@ func mockCertData() map[string]interface{} {
 
 func mockPaginatedData(certData ...map[string]interface{}) map[string]interface{} {
 	return map[string]interface{}{
-		"total":       len(certData),
-		"page": 1,
-		"page_size":    100,
-		"data":        certData,
+		"total":     len(certData),
+		"page":      1,
+		"page_size": 100,
+		"data":      certData,
 	}
 }
 
@@ -288,6 +290,26 @@ func TestCallback(t *testing.T) {
 	_, err := f.Callback(ctx, server.URL, "token", req)
 	if err != nil {
 		t.Fatalf("Callback() error = %v", err)
+	}
+}
+
+func TestCallbackReadsRenewBeforeDaysFromData(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"code":1,"msg":"ok","data":{"renew_before_days":9}}`)
+	}))
+	defer server.Close()
+
+	f := New(30 * time.Second)
+	got, err := f.Callback(context.Background(), server.URL, "token", &CallbackRequest{
+		OrderID: 12345,
+		Status:  "success",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 9 {
+		t.Fatalf("renew_before_days = %d, want 9", got)
 	}
 }
 
@@ -1052,10 +1074,10 @@ func TestQueryBatch(t *testing.T) {
 		resp := mockResponse{
 			Code: 1,
 			Data: map[string]interface{}{
-				"total":       len(data),
-				"page": 1,
-				"page_size":    100,
-				"data":        data,
+				"total":     len(data),
+				"page":      1,
+				"page_size": 100,
+				"data":      data,
 			},
 		}
 		_ = json.NewEncoder(w).Encode(resp)
@@ -1116,10 +1138,10 @@ func TestQueryBatch_Pagination(t *testing.T) {
 		resp := mockResponse{
 			Code: 1,
 			Data: map[string]interface{}{
-				"total":       total,
-				"page": pageNum,
-				"page_size":    2,
-				"data":        data,
+				"total":     total,
+				"page":      pageNum,
+				"page_size": 2,
+				"data":      data,
 			},
 		}
 		_ = json.NewEncoder(w).Encode(resp)
@@ -1234,6 +1256,35 @@ func TestParsePaginatedData_RenewBeforeDays(t *testing.T) {
 	}
 }
 
+func TestParsePaginatedDataRejectsOversizedCertificateMaterial(t *testing.T) {
+	tests := []struct {
+		name string
+		data CertData
+	}{
+		{
+			name: "证书链超过 64KB",
+			data: CertData{OrderID: 1, Cert: strings.Repeat("c", config.MaxCertFileSize), IntermediateCert: "x"},
+		},
+		{
+			name: "私钥超过 16KB",
+			data: CertData{OrderID: 1, PrivateKey: strings.Repeat("k", config.MaxPrivateKeySize+1)},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			raw, err := json.Marshal(PaginatedResponse{Total: 1, Data: []CertData{tt.data}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp := APIResponse{Code: 1, Data: raw}
+			if _, _, _, err := resp.ParsePaginatedData(); err == nil {
+				t.Fatal("oversized certificate material must be rejected")
+			}
+		})
+	}
+}
+
 // TestQueryOrder_RenewBeforeDays 验证 QueryOrder 能正确传递 renew_before_days
 func TestQueryOrder_RenewBeforeDays(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1241,8 +1292,8 @@ func TestQueryOrder_RenewBeforeDays(t *testing.T) {
 			Code: 1,
 			Data: map[string]interface{}{
 				"total":             1,
-				"page":       1,
-				"page_size":          100,
+				"page":              1,
+				"page_size":         100,
 				"renew_before_days": 14,
 				"data":              []interface{}{mockCertData()},
 			},
@@ -1270,8 +1321,8 @@ func TestQuery_RenewBeforeDays(t *testing.T) {
 			Code: 1,
 			Data: map[string]interface{}{
 				"total":             1,
-				"page":       1,
-				"page_size":          100,
+				"page":              1,
+				"page_size":         100,
 				"renew_before_days": 14,
 				"data":              []interface{}{mockCertData()},
 			},
@@ -1299,8 +1350,8 @@ func TestQueryBatch_RenewBeforeDays(t *testing.T) {
 			Code: 1,
 			Data: map[string]interface{}{
 				"total":             1,
-				"page":       1,
-				"page_size":          100,
+				"page":              1,
+				"page_size":         100,
 				"renew_before_days": 14,
 				"data":              []interface{}{mockCertData()},
 			},
@@ -1366,18 +1417,20 @@ func TestToggleAutoReissue(t *testing.T) {
 					t.Errorf("auto_reissue = %v, want %v", req.AutoReissue, tt.autoReissue)
 				}
 
-				// 返回成功响应
-				resp := mockResponse{Code: 1, Message: "success"}
-				_ = json.NewEncoder(w).Encode(resp)
+				// 返回成功响应（deploy-spec §2.9：data 中携带 renew_before_days）
+				_, _ = io.WriteString(w, `{"code":1,"msg":"success","data":{"renew_before_days":11}}`)
 			}))
 			defer server.Close()
 
 			f := New(30 * time.Second)
 			ctx := context.Background()
 
-			err := f.ToggleAutoReissue(ctx, server.URL, "test-token", tt.orderID, tt.autoReissue)
+			renewBeforeDays, err := f.ToggleAutoReissue(ctx, server.URL, "test-token", tt.orderID, tt.autoReissue)
 			if err != nil {
 				t.Fatalf("ToggleAutoReissue() error = %v", err)
+			}
+			if renewBeforeDays != 11 {
+				t.Fatalf("renew_before_days = %d, want 11", renewBeforeDays)
 			}
 		})
 	}
@@ -1394,7 +1447,7 @@ func TestToggleAutoReissue_APIError(t *testing.T) {
 	f := NewWithRetry(30*time.Second, RetryConfig{MaxRetries: 0})
 	ctx := context.Background()
 
-	err := f.ToggleAutoReissue(ctx, server.URL, "token", 12345, true)
+	_, err := f.ToggleAutoReissue(ctx, server.URL, "token", 12345, true)
 	if err == nil {
 		t.Fatal("ToggleAutoReissue() should return error for API error response")
 	}
@@ -1413,7 +1466,7 @@ func TestToggleAutoReissue_HTTPError(t *testing.T) {
 	f := NewWithRetry(30*time.Second, RetryConfig{MaxRetries: 0})
 	ctx := context.Background()
 
-	err := f.ToggleAutoReissue(ctx, server.URL, "bad-token", 12345, true)
+	_, err := f.ToggleAutoReissue(ctx, server.URL, "bad-token", 12345, true)
 	if err == nil {
 		t.Fatal("ToggleAutoReissue() should return error for HTTP 401")
 	}

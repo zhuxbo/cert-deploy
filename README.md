@@ -321,7 +321,7 @@ bash build/test-linux.sh
 ### 容器端到端测试
 
 ```bash
-# 运行全部 E2E 测试（构建 + 全矩阵）
+# 运行完整 E2E 门禁（常规矩阵 + Docker-in-Docker 扫描/部署）
 bash docker/test/scripts/run-tests.sh
 
 # 指定发行版和服务器
@@ -330,16 +330,19 @@ bash docker/test/scripts/run-tests.sh --distro ubuntu --server nginx
 # 指定测试文件（不含 .bats 后缀）
 bash docker/test/scripts/run-tests.sh --test scan
 
-# Docker-in-Docker 测试
-bash docker/test/scripts/run-tests.sh --dind
+# 仅运行 Docker-in-Docker 部署测试
+bash docker/test/scripts/run-tests.sh --test docker-deploy
+
+# 调试时跳过 Docker-in-Docker（不属于完整门禁）
+bash docker/test/scripts/run-tests.sh --no-dind
 
 # 跳过构建（已构建过镜像）
 bash docker/test/scripts/run-tests.sh --no-build
 ```
 
-测试矩阵：Nginx/Apache × Ubuntu/Debian/Alpine/Rocky + DinD，使用 Mock API 离线运行。
+测试矩阵：Nginx/Apache × Ubuntu/Debian/Alpine/Rocky + DinD，使用 Mock API 离线运行。无参数命令默认同时执行常规矩阵和 DinD 测试。
 
-测试用例：setup、deploy、deploy-local、scan、status、rollback、daemon、upgrade、uninstall、docker-scan（共 10 个 bats 文件，docker-scan 在 DinD 容器中运行，uninstall 自动排最后执行）。
+测试用例：setup、deploy、deploy-local、renew-local、scan、status、rollback、daemon、upgrade、uninstall、docker-scan、docker-deploy（共 12 个 bats 文件；docker-* 在 DinD 容器中运行，uninstall 自动排最后执行）。
 
 ## License
 

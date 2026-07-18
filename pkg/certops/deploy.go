@@ -30,10 +30,11 @@ func (s *Service) DeployOne(ctx context.Context, certName string) (*DeployResult
 	}
 
 	// 从 API 获取证书
-	certData, _, err := s.fetcher.QueryOrder(ctx, api.URL, api.Token, cert.OrderID)
+	certData, renewBeforeDays, err := s.fetcher.QueryOrder(ctx, api.URL, api.Token, cert.OrderID)
 	if err != nil {
 		return nil, fmt.Errorf("获取证书失败: %w", err)
 	}
+	s.tryUpdateRenewBeforeDays(renewBeforeDays)
 
 	// 订单续费后 API 返回新订单号，同步更新
 	s.syncOrderID(cert, certData)

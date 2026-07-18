@@ -58,6 +58,25 @@ setup() {
   assert_success
 }
 
+@test "deploy: 磁盘证书私钥配对且 TLS 已加载该证书" {
+  run sslctl deploy --cert "$CERT_NAME"
+  assert_success
+
+  local cert_path key_path disk_fp live_fp
+  cert_path=$(binding_value '.paths.certificate')
+  key_path=$(binding_value '.paths.private_key')
+  assert_file_exists "$cert_path"
+  assert_file_exists "$key_path"
+  assert_cert_key_match "$cert_path" "$key_path"
+
+  disk_fp=$(cert_fingerprint "$cert_path")
+  live_fp=$(tls_fingerprint "127.0.0.1:443" "test.example.com")
+  if [ -z "$live_fp" ] || [ "$disk_fp" != "$live_fp" ]; then
+    echo "TLS certificate fingerprint mismatch: disk=$disk_fp live=$live_fp"
+    return 1
+  fi
+}
+
 @test "deploy: 备份已创建" {
   # 部署后应在 backup 目录下创建备份
   run sslctl deploy --cert "$CERT_NAME"

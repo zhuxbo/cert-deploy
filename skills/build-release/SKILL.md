@@ -153,7 +153,7 @@ bash build/release.sh --test                     # 测试 SSH 连接
 **不在 CI 自动触发**，合并前手动运行，全部通过再合并。
 
 ```bash
-# 全矩阵（8 容器 × 全量测试）
+# 完整门禁（8 容器常规矩阵 + DinD 扫描/部署）
 bash docker/test/scripts/run-tests.sh
 
 # 指定发行版/服务器
@@ -162,8 +162,11 @@ bash docker/test/scripts/run-tests.sh --distro ubuntu --server nginx
 # 指定测试文件
 bash docker/test/scripts/run-tests.sh --distro ubuntu --server nginx --test setup
 
-# Docker-in-Docker 测试
-bash docker/test/scripts/run-tests.sh --dind
+# 仅运行 Docker-in-Docker 部署测试
+bash docker/test/scripts/run-tests.sh --test docker-deploy
+
+# 调试时跳过 Docker-in-Docker（不属于完整门禁）
+bash docker/test/scripts/run-tests.sh --no-dind
 
 # 跳过构建（已有二进制时）
 bash docker/test/scripts/run-tests.sh --no-build
@@ -178,20 +181,22 @@ docker/test/
 ├── docker-compose.yml # 10 服务（mock-api + nginx×4 + apache×4 + dind）
 ├── scripts/
 │   ├── build.sh       # 编译二进制 + 构建镜像
-│   └── run-tests.sh   # 测试入口（--distro/--server/--test/--dind/--no-build）
+│   └── run-tests.sh   # 测试入口（默认含 DinD；--no-dind 仅用于调试）
 ├── tests/             # Bats 测试用例
 │   ├── helpers/
 │   │   └── common.bash  # 公共函数（Mock API/Web 服务器/断言/生命周期）
 │   ├── setup.bats       # setup 命令测试
 │   ├── deploy.bats      # deploy 命令测试
 │   ├── deploy-local.bats # deploy local 测试
+│   ├── renew-local.bats  # 本地 CSR 续签/失败恢复测试
 │   ├── scan.bats        # scan 命令测试
 │   ├── status.bats      # status/version 命令测试
 │   ├── rollback.bats    # rollback 命令测试
 │   ├── daemon.bats      # daemon 启动/续签测试
 │   ├── upgrade.bats     # upgrade 命令测试
 │   ├── uninstall.bats   # uninstall 测试（必须最后执行）
-│   └── docker-scan.bats # DinD 环境 Docker 容器扫描测试
+│   ├── docker-scan.bats # DinD 环境 Docker 容器扫描测试
+│   └── docker-deploy.bats # DinD 环境 Docker 容器部署/回滚测试
 ├── nginx/             # Nginx 测试容器（ubuntu/debian/alpine/rocky）
 ├── apache/            # Apache 测试容器（ubuntu/debian/alpine/rocky）
 ├── dind/              # Docker-in-Docker 测试容器

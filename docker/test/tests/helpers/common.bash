@@ -32,6 +32,14 @@ mock_get_callbacks() {
   curl -sf --max-time 5 "$MOCK_REMOTE_URL/admin/callbacks"
 }
 
+# 生成若干天后的 RFC3339 时间。使用 epoch 算术，兼容 GNU date 与 BusyBox date。
+future_rfc3339() {
+  local days="$1"
+  local target_epoch
+  target_epoch=$(( $(date +%s) + days * 86400 ))
+  date -u -d "@$target_epoch" "+%Y-%m-%dT%H:%M:%SZ"
+}
+
 # 获取 Mock API 的请求日志（JSON）
 mock_get_requests() {
   curl -sf --max-time 5 "$MOCK_REMOTE_URL/admin/logs"
@@ -181,6 +189,62 @@ assert_dir_exists() {
   fi
 }
 
+# 返回配置中第一个启用绑定的字段值。
+# $1 = jq 字段表达式（相对于 binding，例如 .paths.certificate）
+binding_value() {
+  local expr="$1"
+  jq -r --argjson enabled true \
+    ".certificates[].bindings[] | select(.enabled == \$enabled) | $expr" \
+    "$SSLCTL_CONFIG_DIR/config.json" | head -1
+}
+
+# 验证证书和私钥公钥一致。
+assert_cert_key_match() {
+  local cert_path="$1"
+  local key_path="$2"
+  local cert_pub key_pub
+  cert_pub=$(openssl x509 -in "$cert_path" -pubkey -noout 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | awk '{print $1}')
+  key_pub=$(openssl pkey -in "$key_path" -pubout -outform DER 2>/dev/null | sha256sum | awk '{print $1}')
+  if [ -z "$cert_pub" ] || [ "$cert_pub" != "$key_pub" ]; then
+    echo "Certificate and private key do not match: $cert_path / $key_path"
+    return 1
+  fi
+}
+
+# 返回 PEM 文件中首张证书的 SHA256 指纹（去除分隔符）。
+cert_fingerprint() {
+  openssl x509 -in "$1" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2 | tr -d ':'
+}
+
+# 返回 TLS 端点当前呈现的叶子证书 SHA256 指纹。
+tls_fingerprint() {
+  local address="$1"
+  local server_name="$2"
+  echo | openssl s_client -connect "$address" -servername "$server_name" 2>/dev/null \
+    | openssl x509 -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2 | tr -d ':'
+}
+
+# 等待 Web 服务器异步 reload 后呈现目标证书，超时仍保持强断言失败。
+wait_for_tls_fingerprint() {
+  local address="$1"
+  local server_name="$2"
+  local expected="$3"
+  local attempts="${4:-40}"
+  local delay="${5:-0.25}"
+  local live=""
+
+  for _ in $(seq 1 "$attempts"); do
+    live=$(tls_fingerprint "$address" "$server_name")
+    if [ -n "$live" ] && [ "$live" = "$expected" ]; then
+      return 0
+    fi
+    sleep "$delay"
+  done
+
+  echo "TLS certificate fingerprint mismatch after reload: expected=$expected live=$live"
+  return 1
+}
+
 # ==============================================================================
 # 测试生命周期辅助
 # ==============================================================================
@@ -197,9 +261,9 @@ ensure_mock_proxy() {
   remote_host=$(echo "$MOCK_REMOTE_URL" | sed -E 's|https?://||; s|/.*||; s|:.*||')
   remote_port=$(echo "$MOCK_REMOTE_URL" | sed -E 's|https?://||; s|/.*||; s|.*:||')
   remote_port="${remote_port:-8080}"
-  # 重定向 stdin/stdout/stderr 到 /dev/null，避免 socat 继承 exec session 的 fd
-  # 导致 docker compose exec -T 在 bats 结束后挂起
-  socat TCP-LISTEN:8080,fork,reuseaddr TCP:"$remote_host":"$remote_port" </dev/null >/dev/null 2>&1 &
+  # 除 stdin/stdout/stderr 外，还要关闭 Bats 用于 TAP 协调的 fd 3/4；否则
+  # socat 会长期持有内部管道，导致 docker compose exec -T 在用例结束后挂起。
+  socat TCP-LISTEN:8080,fork,reuseaddr TCP:"$remote_host":"$remote_port" 3>&- 4>&- </dev/null >/dev/null 2>&1 &
   # 等待端口就绪
   for i in $(seq 1 10); do
     if curl -sf --max-time 3 http://localhost:8080/health >/dev/null 2>&1; then
@@ -235,5 +299,5 @@ generate_test_cert() {
 
 # 执行初始 setup（写入配置，后续测试依赖）
 run_initial_setup() {
-  sslctl setup --url "$MOCK_URL" --token "$TOKEN" --order 1001 --yes 2>&1
+  sslctl setup --url "$MOCK_URL" --token "$TOKEN" --order 1001 --yes --no-service 2>&1
 }

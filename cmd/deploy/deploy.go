@@ -106,12 +106,15 @@ func Run(args []string, version, buildTime string, debug bool) {
 			fmt.Fprintf(os.Stderr, "获取证书列表失败: %v\n", err)
 			os.Exit(1)
 		}
-		for i := range certs {
-			cert := &certs[i]
-			if err := fetchAndDeployCert(ctx, cfgManager, cert, f, backupMgr, log); err != nil {
-				fmt.Fprintf(os.Stderr, "  失败: %v\n", err)
+		if err := deployAllCerts(certs, func(cert *config.CertConfig) error {
+			err := fetchAndDeployCert(ctx, cfgManager, cert, f, backupMgr, log)
+			if err != nil {
 				log.Error("部署证书 %s 失败: %v", cert.CertName, err)
 			}
+			return err
+		}); err != nil {
+			fmt.Fprintf(os.Stderr, "部署未全部完成: %v\n", err)
+			os.Exit(1)
 		}
 	} else {
 		// 部署指定证书
@@ -138,6 +141,21 @@ func Run(args []string, version, buildTime string, debug bool) {
 	fmt.Println("部署完成")
 }
 
+func deployAllCerts(certs []config.CertConfig, deploy func(*config.CertConfig) error) error {
+	failedCerts := make([]string, 0)
+	for i := range certs {
+		cert := &certs[i]
+		if err := deploy(cert); err != nil {
+			fmt.Fprintf(os.Stderr, "  失败: %v\n", err)
+			failedCerts = append(failedCerts, fmt.Sprintf("%s: %v", cert.CertName, err))
+		}
+	}
+	if len(failedCerts) > 0 {
+		return fmt.Errorf("%d 个证书部署失败: %s", len(failedCerts), strings.Join(failedCerts, "; "))
+	}
+	return nil
+}
+
 // fetchAndDeployCert 从 API 获取并部署单个证书到所有绑定
 func fetchAndDeployCert(ctx context.Context, cfgManager *config.ConfigManager, cert *config.CertConfig, f *fetcher.Fetcher, backupMgr *backup.Manager, log *logger.Logger) error {
 	fmt.Printf("部署证书: %s\n", cert.CertName)
@@ -148,10 +166,11 @@ func fetchAndDeployCert(ctx context.Context, cfgManager *config.ConfigManager, c
 	}
 
 	// 查询证书
-	certData, _, err := f.QueryOrder(ctx, api.URL, api.Token, cert.OrderID)
+	certData, renewBeforeDays, err := f.QueryOrder(ctx, api.URL, api.Token, cert.OrderID)
 	if err != nil {
 		return fmt.Errorf("查询证书失败: %w", err)
 	}
+	applyDeployRenewBeforeDays(cfgManager, log, renewBeforeDays)
 
 	// 订单续费后 API 返回新订单号，同步更新 order_id
 	if certData.OrderID > 0 && certData.OrderID != cert.OrderID {
@@ -210,22 +229,7 @@ func fetchAndDeployCert(ctx context.Context, cfgManager *config.ConfigManager, c
 		return cfgManager.UpdateCert(cert)
 	}
 
-	successCount := 0
-	for i := range cert.Bindings {
-		binding := &cert.Bindings[i]
-		if !binding.Enabled {
-			continue
-		}
-
-		fmt.Printf("  部署到: %s\n", binding.ServerName)
-
-		if err := deployToBinding(binding, certData, privateKey, backupMgr, log); err != nil {
-			fmt.Printf("    失败: %v\n", err)
-			continue
-		}
-		fmt.Printf("    成功\n")
-		successCount++
-	}
+	successCount, deployErr := deployToBindings(cert.Bindings, certData, privateKey, backupMgr, log)
 
 	// 仅在至少有一个绑定部署成功时才更新元数据
 	if successCount > 0 {
@@ -236,7 +240,49 @@ func fetchAndDeployCert(ctx context.Context, cfgManager *config.ConfigManager, c
 		certops.CommitPendingKeyIfMatches(cfgManager.GetWorkDir(), cert, privateKey, log)
 	}
 
-	return cfgManager.UpdateCert(cert)
+	if err := cfgManager.UpdateCert(cert); err != nil {
+		return err
+	}
+	return deployErr
+}
+
+// deployToBindings 部署全部启用绑定；只要有一个绑定失败就返回错误，
+// 便于脚本调用方通过退出码识别部分失败，同时不影响其他绑定继续部署。
+func deployToBindings(bindings []config.SiteBinding, certData *fetcher.CertData, privateKey string, backupMgr *backup.Manager, log *logger.Logger) (int, error) {
+	successCount := 0
+	failedSites := make([]string, 0)
+	for i := range bindings {
+		binding := &bindings[i]
+		if !binding.Enabled {
+			continue
+		}
+
+		fmt.Printf("  部署到: %s\n", binding.ServerName)
+		if err := deployToBinding(binding, certData, privateKey, backupMgr, log); err != nil {
+			fmt.Printf("    失败: %v\n", err)
+			failedSites = append(failedSites, fmt.Sprintf("%s: %v", binding.ServerName, err))
+			continue
+		}
+		fmt.Printf("    成功\n")
+		successCount++
+	}
+
+	if len(failedSites) > 0 {
+		return successCount, fmt.Errorf("%d 个站点部署失败: %s", len(failedSites), strings.Join(failedSites, "; "))
+	}
+	return successCount, nil
+}
+
+func applyDeployRenewBeforeDays(cm *config.ConfigManager, log *logger.Logger, value int) {
+	if value > config.MaxRenewBeforeDays {
+		if log != nil {
+			log.Warn("服务端返回的 renew_before_days=%d 超过上限 %d，保留本地配置", value, config.MaxRenewBeforeDays)
+		}
+		return
+	}
+	if _, err := cm.UpdateRenewBeforeDays(value); err != nil && log != nil {
+		log.Warn("更新 renew_before_days 失败: %v", err)
+	}
 }
 
 // deployToBinding 部署到绑定（带备份和回滚）
@@ -394,10 +440,11 @@ func installSSLForSite(ctx context.Context, site *config.ScannedSite, binding *c
 	if api.URL == "" || api.Token == "" {
 		return fmt.Errorf("证书 API 配置不完整")
 	}
-	certData, _, err := f.QueryOrder(ctx, api.URL, api.Token, cert.OrderID)
+	certData, renewBeforeDays, err := f.QueryOrder(ctx, api.URL, api.Token, cert.OrderID)
 	if err != nil {
 		return fmt.Errorf("获取证书失败: %w", err)
 	}
+	applyDeployRenewBeforeDays(cfgManager, nil, renewBeforeDays)
 	if certData.Status != "active" || certData.Cert == "" {
 		return fmt.Errorf("证书未就绪: status=%s", certData.Status)
 	}

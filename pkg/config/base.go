@@ -113,10 +113,12 @@ func ValidateValidationMethod(domain string, method string) string {
 	return ""
 }
 
-// DefaultRenewBeforeDays 默认提前续签天数（由服务端控制，每次 API 交互后更新本地配置）
-const DefaultRenewBeforeDays = 14
-
-
+const (
+	// DefaultRenewBeforeDays 默认提前续签天数（由服务端控制，每次 API 交互后更新本地配置）
+	DefaultRenewBeforeDays = 14
+	// MaxRenewBeforeDays 服务端下发值上限（deploy-spec §2.9）
+	MaxRenewBeforeDays = 30
+)
 
 // 文件大小限制常量
 const (
@@ -181,10 +183,10 @@ type DockerConfig struct {
 
 // ContainerPathsConfig 容器内路径配置
 type ContainerPathsConfig struct {
-	Certificate string `json:"certificate,omitempty"`  // 容器内证书路径
-	PrivateKey  string `json:"private_key,omitempty"`  // 容器内私钥路径
-	ConfigFile  string `json:"config_file,omitempty"`  // 容器内配置文件路径
-	Webroot     string `json:"webroot,omitempty"`      // 容器内 Web 根目录
+	Certificate string `json:"certificate,omitempty"` // 容器内证书路径
+	PrivateKey  string `json:"private_key,omitempty"` // 容器内私钥路径
+	ConfigFile  string `json:"config_file,omitempty"` // 容器内配置文件路径
+	Webroot     string `json:"webroot,omitempty"`     // 容器内 Web 根目录
 }
 
 // GetEnvWithDefault 获取环境变量，提供默认值

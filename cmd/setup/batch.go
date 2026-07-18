@@ -31,10 +31,10 @@ type certDeployPlan struct {
 
 // siteCandidate 站点的候选证书信息（用于冲突解决）
 type siteCandidate struct {
-	planIndex    int                // certDeployPlan 索引
-	matchType    config.MatchType   // 匹配类型
-	matchedCount int                // 匹配域名数
-	orderID      int                // 订单 ID（越大越新）
+	planIndex    int              // certDeployPlan 索引
+	matchType    config.MatchType // 匹配类型
+	matchedCount int              // 匹配域名数
+	orderID      int              // 订单 ID（越大越新）
 }
 
 // runBatch 批量部署
@@ -51,11 +51,12 @@ func runBatch(p *setupParams, query string) {
 	// 2/8: 查询证书
 	fmt.Println("\n步骤 2/8: 查询证书...")
 	f := fetcher.New(30 * time.Second)
-	certList, _, err := f.QueryBatch(p.ctx, p.apiURL, p.token, query)
+	certList, renewBeforeDays, err := f.QueryBatch(p.ctx, p.apiURL, p.token, query)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "查询证书失败: %v\n", err)
 		os.Exit(1)
 	}
+	applyRenewBeforeDays(p.cfgManager, p.log, renewBeforeDays)
 
 	if len(certList) == 0 {
 		fmt.Fprintln(os.Stderr, "未查询到证书")

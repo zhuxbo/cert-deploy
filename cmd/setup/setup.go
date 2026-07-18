@@ -185,11 +185,12 @@ func runSingle(p *setupParams, orderID int) {
 	// 2. 获取证书信息
 	fmt.Println("\n步骤 2/7: 获取证书信息...")
 	f := fetcher.New(30 * time.Second)
-	certData, _, err := f.QueryOrder(p.ctx, p.apiURL, p.token, orderID)
+	certData, renewBeforeDays, err := f.QueryOrder(p.ctx, p.apiURL, p.token, orderID)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "查询订单失败: %v\n", err)
 		os.Exit(1)
 	}
+	applyRenewBeforeDays(p.cfgManager, p.log, renewBeforeDays)
 
 	// 订单续费后 API 返回新订单号
 	if certData.OrderID > 0 && certData.OrderID != orderID {
@@ -967,7 +968,20 @@ func extractDomainsFromCert(cert *x509.Certificate) []string {
 // pull 模式 → autoReissue=true；local 模式 → autoReissue=false
 func notifyAutoReissue(p *setupParams, f *fetcher.Fetcher, orderID int, renewMode string) {
 	autoReissue := renewMode != config.RenewModeLocal
-	if err := f.ToggleAutoReissue(p.ctx, p.apiURL, p.token, orderID, autoReissue); err != nil {
+	renewBeforeDays, err := f.ToggleAutoReissue(p.ctx, p.apiURL, p.token, orderID, autoReissue)
+	if err != nil {
 		p.log.Warn("toggleAutoReissue 失败 (order_id=%d, auto_reissue=%v): %v", orderID, autoReissue, err)
+		return
+	}
+	applyRenewBeforeDays(p.cfgManager, p.log, renewBeforeDays)
+}
+
+func applyRenewBeforeDays(cm *config.ConfigManager, log *logger.Logger, value int) {
+	if value > config.MaxRenewBeforeDays {
+		log.Warn("服务端返回的 renew_before_days=%d 超过上限 %d，保留本地配置", value, config.MaxRenewBeforeDays)
+		return
+	}
+	if _, err := cm.UpdateRenewBeforeDays(value); err != nil {
+		log.Warn("更新 renew_before_days 失败: %v", err)
 	}
 }

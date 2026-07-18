@@ -24,9 +24,9 @@ type ConfigManager struct {
 	certsDir   string
 	logsDir    string
 	backupDir  string
-	mu       sync.RWMutex
-	config   *Config
-	cachedAt time.Time // 缓存加载时间，用于 mtime 检测
+	mu         sync.RWMutex
+	config     *Config
+	cachedAt   time.Time // 缓存加载时间，用于 mtime 检测
 }
 
 // NewConfigManager 创建统一配置管理器
@@ -64,7 +64,7 @@ func (cm *ConfigManager) ensureDirs() error {
 		path string
 		perm os.FileMode
 	}{
-		{cm.workDir, 0700},  // 工作目录收紧权限，仅 root 可访问
+		{cm.workDir, 0700}, // 工作目录收紧权限，仅 root 可访问
 		{cm.certsDir, 0700},
 		{cm.logsDir, 0700},
 		{cm.backupDir, 0700},
@@ -136,9 +136,9 @@ func (cm *ConfigManager) Load() (*Config, error) {
 // 此函数确保返回的配置对象与内部缓存完全独立，调用方可以安全修改返回值。
 //
 // 维护注意事项：
-// - 如果向 CertConfig 或 SiteBinding 添加新的引用类型字段（map、slice、指针），
-//   必须在此函数中添加对应的深拷贝逻辑，否则会破坏并发安全保证！
-// - 当前已处理的引用类型：Certificates(slice)、Bindings(slice)、Domains(slice)、Docker(*DockerInfo)、FailedBindings(slice)、ValidationFiles(slice)
+//   - 如果向 CertConfig 或 SiteBinding 添加新的引用类型字段（map、slice、指针），
+//     必须在此函数中添加对应的深拷贝逻辑，否则会破坏并发安全保证！
+//   - 当前已处理的引用类型：Certificates(slice)、Bindings(slice)、Domains(slice)、Docker(*DockerInfo)、FailedBindings(slice)、ValidationFiles(slice)
 func (cm *ConfigManager) copyConfig(src *Config) *Config {
 	if src == nil {
 		return nil
@@ -381,6 +381,20 @@ func (cm *ConfigManager) UpdateSchedule(fn func(*ScheduleConfig)) error {
 		fn(&cfg.Schedule)
 		return nil
 	})
+}
+
+// UpdateRenewBeforeDays 按 deploy-spec §2.9 校验并回写服务端下发的提前续签天数。
+// 0/负数表示响应未提供该字段；超过上限视为异常值，二者均忽略并保留现值。
+func (cm *ConfigManager) UpdateRenewBeforeDays(value int) (bool, error) {
+	if value <= 0 || value > MaxRenewBeforeDays {
+		return false, nil
+	}
+	if err := cm.UpdateSchedule(func(schedule *ScheduleConfig) {
+		schedule.RenewBeforeDays = value
+	}); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // SetUpgradeChannel 保存升级通道到配置

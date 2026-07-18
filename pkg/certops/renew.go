@@ -38,23 +38,19 @@ const (
 // MaxRenewBeforeDays renew_before_days 的合理上限（deploy-spec 2.9）。
 // 无论续费还是重签，续签动作都应发生在到期前 30 天以内；
 // 异常大值会把全部证书拉入"需要续签"状态、触发每日全量续签风暴，视为服务端异常值拒绝。
-const MaxRenewBeforeDays = 30
+const MaxRenewBeforeDays = config.MaxRenewBeforeDays
 
 // tryUpdateRenewBeforeDays 如果 API 返回了有效的 renew_before_days，更新本地配置
 // 非关键路径，失败仅记录日志；超出合理上限时拒绝并保留旧值
 func (s *Service) tryUpdateRenewBeforeDays(renewBeforeDays int) {
-	if renewBeforeDays <= 0 {
-		return
-	}
 	if renewBeforeDays > MaxRenewBeforeDays {
 		s.log.Warn("服务端返回的 renew_before_days=%d 超过上限 %d（续签应在到期前 30 天内），保留本地配置", renewBeforeDays, MaxRenewBeforeDays)
 		return
 	}
-	if err := s.cfgManager.UpdateSchedule(func(sc *config.ScheduleConfig) {
-		sc.RenewBeforeDays = renewBeforeDays
-	}); err != nil {
+	applied, err := s.cfgManager.UpdateRenewBeforeDays(renewBeforeDays)
+	if err != nil {
 		s.log.Warn("更新 renew_before_days 失败: %v", err)
-	} else {
+	} else if applied {
 		s.log.Debug("renew_before_days 已更新为 %d（来自服务端）", renewBeforeDays)
 	}
 }
@@ -373,13 +369,14 @@ func (s *Service) retryFailedBindings(ctx context.Context, cert *config.CertConf
 		return result
 	}
 
-	certData, _, err := s.fetcher.QueryOrder(ctx, api.URL, api.Token, cert.OrderID)
+	certData, renewBeforeDays, err := s.fetcher.QueryOrder(ctx, api.URL, api.Token, cert.OrderID)
 	if err != nil {
 		s.log.Warn("重试失败绑定: 查询证书 %s 失败: %v", cert.CertName, err)
 		result.Status = "failure"
 		result.Error = err
 		return result
 	}
+	s.tryUpdateRenewBeforeDays(renewBeforeDays)
 	s.syncOrderID(cert, certData)
 	if certData.Status != "active" || certData.Cert == "" || certData.IntermediateCert == "" {
 		s.log.Warn("重试失败绑定: 证书 %s 未就绪 (status=%s)", cert.CertName, certData.Status)
@@ -931,4 +928,3 @@ func cleanupPendingKey(workDir, certName string) error {
 	}
 	return firstErr
 }
-

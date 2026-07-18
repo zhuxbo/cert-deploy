@@ -103,9 +103,10 @@ go test -coverprofile=coverage.out ./...   # 测试并生成覆盖率
 bash build/test-linux.sh                   # Linux 发行版服务管理测试
 
 # 容器端到端测试（Bats + Docker Compose）
-bash docker/test/scripts/run-tests.sh                                 # 全部测试
+bash docker/test/scripts/run-tests.sh                                 # 完整门禁（常规矩阵 + DinD 扫描/部署）
 bash docker/test/scripts/run-tests.sh --distro ubuntu --server nginx  # 指定目标
-bash docker/test/scripts/run-tests.sh --dind                          # Docker-in-Docker 测试
+bash docker/test/scripts/run-tests.sh --test docker-deploy            # 仅 DinD 部署测试
+bash docker/test/scripts/run-tests.sh --no-dind                       # 调试：跳过 DinD（非完整门禁）
 bash docker/test/scripts/run-tests.sh --no-build --test scan          # 跳过构建，指定测试
 ```
 

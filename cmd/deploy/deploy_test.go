@@ -2,6 +2,7 @@
 package deploy
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +13,28 @@ import (
 	"github.com/zhuxbo/sslctl/pkg/fetcher"
 	"github.com/zhuxbo/sslctl/testdata/certs"
 )
+
+func TestDeployAllCerts_ReturnsErrorWhenAnyCertFails(t *testing.T) {
+	certs := []config.CertConfig{{CertName: "success"}, {CertName: "failure"}}
+	called := make([]string, 0, len(certs))
+
+	err := deployAllCerts(certs, func(cert *config.CertConfig) error {
+		called = append(called, cert.CertName)
+		if cert.CertName == "failure" {
+			return errors.New("deploy failed")
+		}
+		return nil
+	})
+	if err == nil {
+		t.Fatal("任一证书部署失败时应返回错误")
+	}
+	if strings.Join(called, ",") != "success,failure" {
+		t.Fatalf("应继续尝试全部证书，called = %v", called)
+	}
+	if !strings.Contains(err.Error(), "failure") {
+		t.Fatalf("错误应包含失败证书名称，got %v", err)
+	}
+}
 
 // TestDeployToBinding_Nginx 测试 Nginx 部署
 func TestDeployToBinding_Nginx(t *testing.T) {
@@ -230,6 +253,52 @@ func TestDeployToBinding_DockerApache_RejectsUnsafe(t *testing.T) {
 	}
 	if _, statErr := os.Stat(certPath); statErr == nil {
 		t.Error("被拒绝的 Docker 部署不应写出证书文件")
+	}
+}
+
+func TestDeployToBindings_ReturnsErrorWhenAnyBindingFails(t *testing.T) {
+	tmpDir := t.TempDir()
+	testCert, err := certs.GenerateValidCert("example.com", nil)
+	if err != nil {
+		t.Fatalf("生成测试证书失败: %v", err)
+	}
+
+	bindings := []config.SiteBinding{
+		{
+			ServerName: "success.example.com",
+			ServerType: config.ServerTypeNginx,
+			Enabled:    true,
+			Paths: config.BindingPaths{
+				Certificate: filepath.Join(tmpDir, "success", "cert.pem"),
+				PrivateKey:  filepath.Join(tmpDir, "success", "key.pem"),
+			},
+		},
+		{
+			ServerName: "failed.example.com",
+			ServerType: config.ServerTypeDockerNginx,
+			Enabled:    true,
+			Paths: config.BindingPaths{
+				Certificate: filepath.Join(tmpDir, "failed", "cert.pem"),
+				PrivateKey:  filepath.Join(tmpDir, "failed", "key.pem"),
+			},
+		},
+	}
+
+	successCount, err := deployToBindings(
+		bindings,
+		&fetcher.CertData{Cert: testCert.CertPEM},
+		testCert.KeyPEM,
+		backup.NewManager(t.TempDir(), 5),
+		nil,
+	)
+	if err == nil {
+		t.Fatal("部分绑定失败时应返回错误")
+	}
+	if successCount != 1 {
+		t.Fatalf("successCount = %d, want 1", successCount)
+	}
+	if !strings.Contains(err.Error(), "failed.example.com") {
+		t.Fatalf("错误应包含失败站点，got %v", err)
 	}
 }
 

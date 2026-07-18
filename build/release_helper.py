@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
 import re
 import sys
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -236,6 +238,111 @@ def check_new_main(args: argparse.Namespace) -> None:
         fail(f"main 版本必须高于当前 latest {latest}")
 
 
+def state_identity(args: argparse.Namespace) -> tuple[str, str, str]:
+    version = args.version.removeprefix("v")
+    if channel_for(version) != "main":
+        fail("release-state 只用于 main 稳定版本")
+    commit = args.source_commit
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        fail("release-state source_commit 必须是完整 Git SHA")
+    bundle = os.path.abspath(args.bundle)
+    if not os.path.isabs(args.bundle) or bundle == os.path.sep:
+        fail("release-state bundle 必须是非根绝对路径")
+    return version, commit, bundle
+
+
+def load_release_state(path: Path, args: argparse.Namespace) -> tuple[dict, str, str, str]:
+    version, commit, bundle = state_identity(args)
+    state = load_json(path)
+    required = {"schema", "version", "source_commit", "bundle", "status", "attempt", "bundle_digest"}
+    if set(state) != required or state["schema"] != 1:
+        fail("release-state schema 或字段集合无效")
+    if state["version"] != version or state["source_commit"] != commit:
+        fail("release-state 与版本或 commit 不匹配")
+    if not isinstance(state["attempt"], int) or state["attempt"] < 1:
+        fail("release-state attempt 无效")
+    return state, version, commit, bundle
+
+
+@contextmanager
+def release_state_lock(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(path.name + ".lock")
+    with lock_path.open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def state_begin(args: argparse.Namespace) -> None:
+    path = Path(args.state)
+    with release_state_lock(path):
+        version, commit, bundle = state_identity(args)
+        attempt = 1
+        if path.exists():
+            state, _, _, _ = load_release_state(path, args)
+            if state["status"] != "aborted":
+                fail(f"main prepare 已有持久状态 {state['status']}，禁止重复构建")
+            attempt = state["attempt"] + 1
+        write_json(path, {
+            "schema": 1,
+            "version": version,
+            "source_commit": commit,
+            "bundle": bundle,
+            "status": "preparing",
+            "attempt": attempt,
+            "bundle_digest": "",
+        })
+
+
+def state_complete(args: argparse.Namespace) -> None:
+    path = Path(args.state)
+    with release_state_lock(path):
+        state, _, _, bundle = load_release_state(path, args)
+        if not re.fullmatch(r"sha256:[0-9A-Za-z._-]+", args.bundle_digest):
+            fail("bundle digest 格式无效")
+        if state["status"] == "prepared" and state["bundle"] == bundle and state["bundle_digest"] == args.bundle_digest:
+            return
+        if state["status"] != "preparing" or state["bundle"] != bundle:
+            fail("只有当前 preparing bundle 可以完成")
+        state["status"] = "prepared"
+        state["bundle_digest"] = args.bundle_digest
+        write_json(path, state)
+
+
+def state_verify(args: argparse.Namespace) -> None:
+    path = Path(args.state)
+    with release_state_lock(path):
+        state, _, _, bundle = load_release_state(path, args)
+        if state["status"] != "prepared" or state["bundle"] != bundle or state["bundle_digest"] != args.bundle_digest:
+            fail("release-state 与已准备 bundle 不一致")
+
+
+def state_abort(args: argparse.Namespace) -> None:
+    path = Path(args.state)
+    with release_state_lock(path):
+        if not path.exists():
+            version, commit, bundle = state_identity(args)
+            write_json(path, {
+                "schema": 1,
+                "version": version,
+                "source_commit": commit,
+                "bundle": bundle,
+                "status": "aborted",
+                "attempt": 1,
+                "bundle_digest": "",
+            })
+            return
+        state, _, _, bundle = load_release_state(path, args)
+        if state["bundle"] != bundle or state["status"] not in {"preparing", "aborted"}:
+            fail("只有尚未完成的当前 bundle 可以显式废弃")
+        state["status"] = "aborted"
+        state["bundle_digest"] = ""
+        write_json(path, state)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
@@ -274,6 +381,15 @@ def main() -> None:
     preflight_parser.add_argument("--index", required=True)
     preflight_parser.add_argument("--version", required=True)
 
+    for command in ("state-begin", "state-complete", "state-verify", "state-abort"):
+        state_parser = sub.add_parser(command)
+        state_parser.add_argument("--state", required=True)
+        state_parser.add_argument("--version", required=True)
+        state_parser.add_argument("--source-commit", required=True)
+        state_parser.add_argument("--bundle", required=True)
+        if command in {"state-complete", "state-verify"}:
+            state_parser.add_argument("--bundle-digest", required=True)
+
     args = parser.parse_args()
     if args.command == "channel":
         print(channel_for(args.version.removeprefix("v")))
@@ -285,8 +401,16 @@ def main() -> None:
         update_index(args)
     elif args.command == "verify-index":
         verify_index(args)
-    else:
+    elif args.command == "check-new-main":
         check_new_main(args)
+    elif args.command == "state-begin":
+        state_begin(args)
+    elif args.command == "state-complete":
+        state_complete(args)
+    elif args.command == "state-verify":
+        state_verify(args)
+    else:
+        state_abort(args)
 
 
 if __name__ == "__main__":

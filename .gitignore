@@ -33,7 +33,7 @@ Thumbs.db
 /sslctl
 
 # 工作目录（运行时生成）
-sslctl/
+/sslctl/
 
 # Test artifacts
 build/test-report.md
@@ -58,3 +58,4 @@ build/keys/
 
 # 本地发布演练 bundle；正式 bundle 推荐保存在仓库外受控目录
 .release-bundles/
+.release-state/

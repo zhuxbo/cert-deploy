@@ -27,10 +27,10 @@ dev 允许当前分支和脏工作区快照，禁止提交、推送、合并、�
 1. 在干净 `dev` 确认 `dev == origin/dev`，稳定版本高于公网 `main.latest`，远端/本地 `v<version>`、GitHub Release 和所有节点 `main/v<version>` 均不存在。
 2. 创建 `dev → main` PR；等待精确 PR commit 的三个 required checks 和完整 E2E release gate 成功后合并。发布窗口开始，禁止向 dev 添加提交。
 3. fast-forward 同步本地 `main`，确认 `main == origin/main`、工作区干净；等待该精确 main commit 的三个 required checks并手动 dispatch 完整 E2E 到该 ref。
-4. 只构建一次：`bash build/release.sh prepare <version> --bundle <持久绝对路径>`。保存 manifest 和完整 bundle，记录其目录哈希；不得位于会被清理的位置。
+4. 只构建一次：按 `build/release.conf` 的 `BUNDLE_ROOT` 计算固定路径 `<BUNDLE_ROOT>/main/v<version>-<main-commit>`，执行 `bash build/release.sh prepare <version> --bundle <固定路径>`。保存 manifest、detached manifest 签名和完整 bundle，记录其目录哈希；不得位于仓库或会被清理的位置。
 5. `bash build/release.sh stage-main <version> --bundle <同一路径>`：所有节点只写 staging，验证三项资产字节和 manifest，尚不改变公开索引。
 6. 创建并推送不可变 `v<version>` tag，确认指向 manifest 的 `source_commit`；创建同 tag/commit 的 draft GitHub Release，从同一 bundle 上传三项正式资产，逐项核对 SHA256。
-7. `bash build/release.sh promote-main <version> --bundle <同一路径>`：各节点从 staging 提升不可变版本目录并原子替换预先生成的 `releases.json`；随后公开 GitHub Release并执行全节点对账。
+7. `bash build/release.sh promote-main <version> --bundle <同一路径>`：脚本取得全部节点发布锁，在锁内基于最新公开索引重新生成并对齐候选，再从 staging 提升不可变版本目录和原子替换索引；随后公开 GitHub Release并执行全节点对账。
 8. 验收通过后把唯一可移动的 `latest` tag 更新到 `v<version>`。将 main fast-forward 回 dev 并推送，等待该精确 dev commit 的三个 required checks和完整 E2E gate。
 9. `bash build/release.sh verify-main <version> --bundle <同一路径>`，再完成下方最终验收；全部通过前不清理 bundle、不宣布完成。
 
@@ -74,7 +74,7 @@ git push origin dev
 
 ## 中断恢复
 
-- tag 前失败：若 bundle 已生成，可继续使用或在确认未产生任何不可变对象后废弃并重新 prepare。
+- tag 前失败：以全部发布节点的权威 release-state 为准；若已为 `prepared`，只能继续使用摘要一致的原 bundle。若停在 `preparing` 且确认本地/远端版本 tag 和所有节点正式目录均不存在，可执行 `bash build/release.sh abort-main <version> --bundle <原路径>`；脚本在全节点锁内把远端 state 和本地镜像转为 `aborted` 后删除残留 bundle。禁止直接删除 state、换 clone、改 `BUNDLE_ROOT` 或移走 bundle 绕过。
 - tag 后失败：只运行 `bash build/release.sh resume-main <version> --bundle <原路径>`；脚本校验 tag/commit/manifest 后，从 staging、提升、索引或验收失败点幂等继续，绝不构建。
 - GitHub draft/公开状态、节点索引或 dev 回同步失败时，保留 tag、Release 和 bundle；修复失败点后使用同 commit、同 bundle 继续。
 - 任一节点失败不得报告成功；若出现部分节点 latest 已更新，立即修复失败节点并重跑全节点 `verify-main`，不得用同版本重建或覆盖修复。

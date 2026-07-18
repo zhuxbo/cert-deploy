@@ -10,6 +10,8 @@ ASSETS_DIR=""
 OUTPUT=""
 VERIFY_SIGNATURES=""
 TRUSTED_PUBLIC_KEY=""
+MANIFEST=""
+VERIFY_MANIFEST_SIGNATURE=""
 
 while (($#)); do
     case "$1" in
@@ -18,17 +20,32 @@ while (($#)); do
         --assets-dir) ASSETS_DIR="${2:-}"; shift 2 ;;
         --output) OUTPUT="${2:-}"; shift 2 ;;
         --verify-signatures) VERIFY_SIGNATURES="${2:-}"; shift 2 ;;
+        --manifest) MANIFEST="${2:-}"; shift 2 ;;
+        --verify-manifest-signature) VERIFY_MANIFEST_SIGNATURE="${2:-}"; shift 2 ;;
         --trusted-public-key) TRUSTED_PUBLIC_KEY="${2:-}"; shift 2 ;;
         -h|--help)
-            echo "用法: $0 --key <seed-file> --key-id <id> [--trusted-public-key <file>] --assets-dir <dir> (--output <json> | --verify-signatures <json>)"
+            echo "用法: $0 --key-id <id> [--key <seed-file>] [--trusted-public-key <file>] (--assets-dir <dir> (--output <json> | --verify-signatures <json>) | --manifest <json> (--output <sig> | --verify-manifest-signature <sig>))"
             exit 0
             ;;
         *) echo "未知参数: $1" >&2; exit 2 ;;
     esac
 done
 
-if [[ -z "$KEY_ID" || -z "$ASSETS_DIR" || ( -z "$OUTPUT" && -z "$VERIFY_SIGNATURES" ) || ( -n "$OUTPUT" && -z "$KEY_FILE" ) ]]; then
+if [[ -z "$KEY_ID" ]]; then
     echo "错误: 缺少签名参数" >&2
+    exit 2
+fi
+if [[ -n "$MANIFEST" ]]; then
+    [[ -z "$ASSETS_DIR" && -z "$VERIFY_SIGNATURES" ]] || { echo "错误: manifest 与资产签名模式不能混用" >&2; exit 2; }
+    [[ -f "$MANIFEST" ]] || { echo "错误: manifest 不存在: $MANIFEST" >&2; exit 1; }
+    [[ -n "$OUTPUT" || -n "$VERIFY_MANIFEST_SIGNATURE" ]] || { echo "错误: 缺少 manifest 签名输出或校验参数" >&2; exit 2; }
+    [[ -z "$OUTPUT" || -z "$VERIFY_MANIFEST_SIGNATURE" ]] || { echo "错误: manifest 签名与校验不能同时执行" >&2; exit 2; }
+else
+    [[ -n "$ASSETS_DIR" && ( -n "$OUTPUT" || -n "$VERIFY_SIGNATURES" ) ]] || { echo "错误: 缺少资产签名参数" >&2; exit 2; }
+    [[ -z "$OUTPUT" || -z "$VERIFY_SIGNATURES" ]] || { echo "错误: 资产签名与校验不能同时执行" >&2; exit 2; }
+fi
+if [[ -n "$OUTPUT" && -z "$KEY_FILE" ]]; then
+    echo "错误: 签名操作缺少私钥" >&2
     exit 2
 fi
 if [[ ! "$KEY_ID" =~ ^[0-9A-Za-z._-]+$ ]]; then
@@ -81,8 +98,9 @@ import (
 )
 
 func main() {
-	verifyMode := os.Args[4] == "verify"
-	trustedText, err := os.ReadFile(os.Args[6])
+	mode, keyFile, keyID, trustedFile, input, output := os.Args[1], os.Args[2], os.Args[3], os.Args[4], os.Args[5], os.Args[6]
+	verifyMode := strings.HasSuffix(mode, "verify")
+	trustedText, err := os.ReadFile(trustedFile)
 	if err != nil { panic(err) }
 	trustedKey, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(trustedText)))
 	if err != nil || len(trustedKey) != ed25519.PublicKeySize {
@@ -92,7 +110,7 @@ func main() {
 	publicKey := ed25519.PublicKey(trustedKey)
 	var privateKey ed25519.PrivateKey
 	if !verifyMode {
-		seedText, err := os.ReadFile(os.Args[1])
+		seedText, err := os.ReadFile(keyFile)
 		if err != nil { panic(err) }
 		seed, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(seedText)))
 		if err != nil || len(seed) != ed25519.SeedSize {
@@ -105,42 +123,70 @@ func main() {
 			os.Exit(1)
 		}
 	}
+	sign := func(data []byte) string {
+		signature := ed25519.Sign(privateKey, data)
+		if !ed25519.Verify(publicKey, data, signature) { fmt.Fprintln(os.Stderr, "签名自校验失败"); os.Exit(1) }
+		return "ed25519:" + keyID + ":" + base64.StdEncoding.EncodeToString(signature)
+	}
+	verify := func(data []byte, text string) {
+		prefix := "ed25519:" + keyID + ":"
+		if !strings.HasPrefix(text, prefix) { fmt.Fprintln(os.Stderr, "签名 key ID 不匹配"); os.Exit(1) }
+		signature, err := base64.StdEncoding.DecodeString(strings.TrimSpace(strings.TrimPrefix(text, prefix)))
+		if err != nil || !ed25519.Verify(publicKey, data, signature) { fmt.Fprintln(os.Stderr, "签名验证失败"); os.Exit(1) }
+	}
+	if strings.HasPrefix(mode, "manifest-") {
+		data, err := os.ReadFile(input)
+		if err != nil { panic(err) }
+		if verifyMode {
+			encoded, err := os.ReadFile(output)
+			if err != nil { panic(err) }
+			verify(data, string(encoded))
+			return
+		}
+		if err := os.WriteFile(output+".tmp", []byte(sign(data)+"\n"), 0600); err != nil { panic(err) }
+		if err := os.Rename(output+".tmp", output); err != nil { panic(err) }
+		return
+	}
 	names := []string{"sslctl-linux-amd64.gz", "sslctl-linux-arm64.gz", "sslctl-windows-amd64.exe.gz"}
 	result := make(map[string]string, len(names))
 	if verifyMode {
-		encoded, err := os.ReadFile(os.Args[5])
+		encoded, err := os.ReadFile(output)
 		if err != nil { panic(err) }
 		if err := json.Unmarshal(encoded, &result); err != nil { panic(err) }
 		if len(result) != len(names) { fmt.Fprintln(os.Stderr, "签名集合数量无效"); os.Exit(1) }
 	}
 	for _, name := range names {
-		data, err := os.ReadFile(filepath.Join(os.Args[2], name))
+		data, err := os.ReadFile(filepath.Join(input, name))
 		if err != nil { fmt.Fprintf(os.Stderr, "读取正式资产失败 %s: %v\n", name, err); os.Exit(1) }
 		if verifyMode {
-			prefix := "ed25519:" + os.Args[3] + ":"
 			text, ok := result[name]
-			if !ok || !strings.HasPrefix(text, prefix) { fmt.Fprintf(os.Stderr, "签名 key ID 不匹配: %s\n", name); os.Exit(1) }
-			signature, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(text, prefix))
-			if err != nil || !ed25519.Verify(publicKey, data, signature) { fmt.Fprintf(os.Stderr, "签名验证失败: %s\n", name); os.Exit(1) }
+			if !ok { fmt.Fprintf(os.Stderr, "缺少签名: %s\n", name); os.Exit(1) }
+			verify(data, text)
 		} else {
-			signature := ed25519.Sign(privateKey, data)
-			if !ed25519.Verify(publicKey, data, signature) { fmt.Fprintln(os.Stderr, "签名自校验失败"); os.Exit(1) }
-			result[name] = "ed25519:" + os.Args[3] + ":" + base64.StdEncoding.EncodeToString(signature)
+			result[name] = sign(data)
 		}
 	}
 	if verifyMode { return }
 	data, err := json.MarshalIndent(result, "", "  ")
 	if err != nil { panic(err) }
-	temp := os.Args[5] + ".tmp"
+	temp := output + ".tmp"
 	if err := os.WriteFile(temp, append(data, '\n'), 0600); err != nil { panic(err) }
-	if err := os.Rename(temp, os.Args[5]); err != nil { panic(err) }
+	if err := os.Rename(temp, output); err != nil { panic(err) }
 }
 GOEOF
 
-if [[ -n "$VERIFY_SIGNATURES" ]]; then
-    go run "$SIGN_PROGRAM" "$KEY_FILE" "$ASSETS_DIR" "$KEY_ID" verify "$VERIFY_SIGNATURES" "$TRUSTED_PUBLIC_KEY"
+if [[ -n "$MANIFEST" ]]; then
+    if [[ -n "$VERIFY_MANIFEST_SIGNATURE" ]]; then
+        go run "$SIGN_PROGRAM" manifest-verify "$KEY_FILE" "$KEY_ID" "$TRUSTED_PUBLIC_KEY" "$MANIFEST" "$VERIFY_MANIFEST_SIGNATURE"
+        echo "manifest 签名验证完成"
+    else
+        go run "$SIGN_PROGRAM" manifest-sign "$KEY_FILE" "$KEY_ID" "$TRUSTED_PUBLIC_KEY" "$MANIFEST" "$OUTPUT"
+        echo "manifest 签名完成: $OUTPUT"
+    fi
+elif [[ -n "$VERIFY_SIGNATURES" ]]; then
+    go run "$SIGN_PROGRAM" assets-verify "$KEY_FILE" "$KEY_ID" "$TRUSTED_PUBLIC_KEY" "$ASSETS_DIR" "$VERIFY_SIGNATURES"
     echo "签名验证完成"
 else
-    go run "$SIGN_PROGRAM" "$KEY_FILE" "$ASSETS_DIR" "$KEY_ID" sign "$OUTPUT" "$TRUSTED_PUBLIC_KEY"
+    go run "$SIGN_PROGRAM" assets-sign "$KEY_FILE" "$KEY_ID" "$TRUSTED_PUBLIC_KEY" "$ASSETS_DIR" "$OUTPUT"
     echo "签名完成: $OUTPUT"
 fi

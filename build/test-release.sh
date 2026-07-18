@@ -19,6 +19,10 @@ key_dir="$TEST_DIR/keys"
 bash "$SCRIPT_DIR/generate-keys.sh" "$key_dir" test-key >/dev/null
 key="$key_dir/release-key.pem"
 [[ "$(stat -f '%Lp' "$key" 2>/dev/null || stat -c '%a' "$key")" == "600" ]]
+if bash "$SCRIPT_DIR/generate-keys.sh" "$key_dir" replacement-key >/dev/null 2>&1; then
+    echo "密钥生成脚本覆盖了已有密钥" >&2
+    exit 1
+fi
 signatures="$TEST_DIR/signatures.json"
 bash "$SCRIPT_DIR/sign-release.sh" --key "$key" --key-id test-key --trusted-public-key "$key_dir/release-key.pub" \
     --assets-dir "$assets" --output "$signatures" >/dev/null
@@ -51,6 +55,22 @@ cp -R "$assets" "$main_bundle/assets"
 python3 "$HELPER" create-manifest --version 1.2.3 --assets-dir "$main_bundle/assets" \
     --signatures "$signatures" --output "$main_bundle/manifest.json" --source-commit "$commit" --dirty false \
     --created-at 2026-07-19T00:00:00Z --build-time 2026-07-19T00:00:00Z --go-version test
+bash "$SCRIPT_DIR/sign-release.sh" --key "$key" --key-id test-key --trusted-public-key "$key_dir/release-key.pub" \
+    --manifest "$main_bundle/manifest.json" --output "$main_bundle/manifest.sig" >/dev/null
+bash "$SCRIPT_DIR/sign-release.sh" --key-id test-key --trusted-public-key "$key_dir/release-key.pub" \
+    --manifest "$main_bundle/manifest.json" --verify-manifest-signature "$main_bundle/manifest.sig" >/dev/null
+tampered_manifest="$TEST_DIR/tampered-manifest.json"
+python3 - "$main_bundle/manifest.json" "$tampered_manifest" <<'PY'
+import json, sys
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+value["version"] = "9.9.9"
+json.dump(value, open(sys.argv[2], "w", encoding="utf-8"), sort_keys=True)
+PY
+if bash "$SCRIPT_DIR/sign-release.sh" --key-id test-key --trusted-public-key "$key_dir/release-key.pub" \
+    --manifest "$tampered_manifest" --verify-manifest-signature "$main_bundle/manifest.sig" >/dev/null 2>&1; then
+    echo "manifest 签名未绑定版本和 commit 元数据" >&2
+    exit 1
+fi
 python3 "$HELPER" update-index --index "$TEST_DIR/dev-index.json" --bundle "$main_bundle" --version 1.2.3 --output "$TEST_DIR/main-index.json"
 python3 "$HELPER" verify-index --index "$TEST_DIR/main-index.json" --bundle "$main_bundle" --version 1.2.3
 if python3 "$HELPER" check-new-main --index "$TEST_DIR/main-index.json" --version 1.2.3 >/dev/null 2>&1; then
@@ -77,6 +97,40 @@ if python3 "$HELPER" create-manifest --version 2.0.0 --assets-dir "$assets" \
     echo "main dirty bundle 未被拒绝" >&2
     exit 1
 fi
+
+state_file="$TEST_DIR/release-state.json"
+python3 "$HELPER" state-begin --state "$state_file" --version 1.2.3 --source-commit "$commit" --bundle /persistent/a
+if python3 "$HELPER" state-begin --state "$state_file" --version 1.2.3 --source-commit "$commit" --bundle /persistent/b >/dev/null 2>&1; then
+    echo "重复 main prepare 未被 release-state 拒绝" >&2
+    exit 1
+fi
+python3 "$HELPER" state-complete --state "$state_file" --version 1.2.3 --source-commit "$commit" --bundle /persistent/a --bundle-digest sha256:test
+python3 "$HELPER" state-verify --state "$state_file" --version 1.2.3 --source-commit "$commit" --bundle /persistent/a --bundle-digest sha256:test
+if python3 "$HELPER" state-begin --state "$state_file" --version 1.2.3 --source-commit "$commit" --bundle /persistent/a >/dev/null 2>&1; then
+    echo "已完成 main bundle 被再次 prepare" >&2
+    exit 1
+fi
+aborted_state="$TEST_DIR/aborted-state.json"
+python3 "$HELPER" state-begin --state "$aborted_state" --version 2.0.0 --source-commit "$commit" --bundle /persistent/first
+python3 "$HELPER" state-abort --state "$aborted_state" --version 2.0.0 --source-commit "$commit" --bundle /persistent/first
+python3 "$HELPER" state-begin --state "$aborted_state" --version 2.0.0 --source-commit "$commit" --bundle /persistent/second
+
+concurrent_state="$TEST_DIR/concurrent-state.json"
+set +e
+python3 "$HELPER" state-begin --state "$concurrent_state" --version 3.0.0 --source-commit "$commit" --bundle /persistent/concurrent-a >/dev/null 2>&1 &
+first_pid=$!
+python3 "$HELPER" state-begin --state "$concurrent_state" --version 3.0.0 --source-commit "$commit" --bundle /persistent/concurrent-b >/dev/null 2>&1 &
+second_pid=$!
+wait "$first_pid"; first_status=$?
+wait "$second_pid"; second_status=$?
+set -e
+if (( (first_status == 0) + (second_status == 0) != 1 )); then
+    echo "并发 state-begin 未保证只有一个成功" >&2
+    exit 1
+fi
+missing_abort_state="$TEST_DIR/missing-abort-state.json"
+python3 "$HELPER" state-abort --state "$missing_abort_state" --version 4.0.0 --source-commit "$commit" --bundle /persistent/missing
+python3 "$HELPER" state-begin --state "$missing_abort_state" --version 4.0.0 --source-commit "$commit" --bundle /persistent/retry
 extra_bundle="$TEST_DIR/extra-bundle"
 cp -R "$main_bundle" "$extra_bundle"
 printf 'extra\n' >"$extra_bundle/assets/unexpected.gz"
@@ -93,5 +147,19 @@ fi
 dry_output="$(bash "$SCRIPT_DIR/release.sh" --dry-run resume-main 1.2.3 --bundle "$main_bundle")"
 grep -Fq '只读 bundle' <<<"$dry_output"
 grep -Fq '不执行任何动作' <<<"$dry_output"
+
+grep -Fq 'workspace_fingerprint' "$SCRIPT_DIR/release.sh"
+grep -Fq 'snapshot_worktree' "$SCRIPT_DIR/release.sh"
+grep -Fq 'SSLCTL_SOURCE_DIR' "$SCRIPT_DIR/build.sh"
+grep -Fq 'canonical_main_bundle' "$SCRIPT_DIR/release.sh"
+grep -Fq 'acquire_release_locks' "$SCRIPT_DIR/release.sh"
+grep -Fq 'begin_remote_release_state' "$SCRIPT_DIR/release.sh"
+grep -Fq 'verify_remote_release_state' "$SCRIPT_DIR/release.sh"
+grep -Eq 'prepare\).*with_release_locks prepare_bundle' "$SCRIPT_DIR/release.sh"
+grep -Eq 'promote-main\).*stage_all' "$SCRIPT_DIR/release.sh"
+grep -Fq 'manifest.sig' "$SCRIPT_DIR/release.sh"
+grep -Fq 'verify_bundle_versions' "$SCRIPT_DIR/release.sh"
+grep -Fq 'verify_remote_asset_set' "$SCRIPT_DIR/release.sh"
+grep -Fq 'GOTOOLCHAIN=' "$SCRIPT_DIR/build.sh"
 
 echo "发布离线回归测试通过"

@@ -37,6 +37,12 @@ if ! command -v go &> /dev/null; then
 fi
 
 mkdir -p "$OUTPUT_DIR"
+for target in release-key.pem release-key.pub public_key.go; do
+    if [[ -e "$OUTPUT_DIR/$target" ]]; then
+        log_error "目标已存在，拒绝覆盖: $OUTPUT_DIR/$target"
+        exit 1
+    fi
+done
 
 # 使用 Go 生成 Ed25519 密钥对
 log_info "生成 Ed25519 密钥对（Key ID: $KEY_ID）..."
@@ -70,19 +76,27 @@ func main() {
 	privB64 := base64.StdEncoding.EncodeToString(priv.Seed())
 	pubB64 := base64.StdEncoding.EncodeToString(pub)
 
+	created := make([]string, 0, 3)
+	writeExclusive := func(path string, data []byte, mode os.FileMode) {
+		file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
+		if err != nil {
+			for _, item := range created { _ = os.Remove(item) }
+			fmt.Fprintf(os.Stderr, "拒绝覆盖密钥输出 %s: %v\n", path, err)
+			os.Exit(1)
+		}
+		created = append(created, path)
+		if _, err := file.Write(data); err != nil { _ = file.Close(); for _, item := range created { _ = os.Remove(item) }; panic(err) }
+		if err := file.Chmod(mode); err != nil { _ = file.Close(); for _, item := range created { _ = os.Remove(item) }; panic(err) }
+		if err := file.Close(); err != nil { for _, item := range created { _ = os.Remove(item) }; panic(err) }
+	}
+
 	// 写入私钥
 	privPath := filepath.Join(outputDir, "release-key.pem")
-	if err := os.WriteFile(privPath, []byte(privB64+"\n"), 0600); err != nil {
-		fmt.Fprintf(os.Stderr, "写入私钥失败: %v\n", err)
-		os.Exit(1)
-	}
+	writeExclusive(privPath, []byte(privB64+"\n"), 0600)
 
 	// 写入公钥
 	pubPath := filepath.Join(outputDir, "release-key.pub")
-	if err := os.WriteFile(pubPath, []byte(pubB64+"\n"), 0644); err != nil {
-		fmt.Fprintf(os.Stderr, "写入公钥失败: %v\n", err)
-		os.Exit(1)
-	}
+	writeExclusive(pubPath, []byte(pubB64+"\n"), 0644)
 
 	// 生成 Go 源码片段
 	pubBytes := make([]string, 0, len(pub))
@@ -99,10 +113,7 @@ func init() {
 `, keyID, keyID, strings.Join(pubBytes, ", "))
 
 	goPath := filepath.Join(outputDir, "public_key.go")
-	if err := os.WriteFile(goPath, []byte(goCode), 0644); err != nil {
-		fmt.Fprintf(os.Stderr, "写入 Go 源码失败: %v\n", err)
-		os.Exit(1)
-	}
+	writeExclusive(goPath, []byte(goCode), 0644)
 
 	fmt.Printf("Key ID:       %s\n", keyID)
 	fmt.Printf("公钥 (base64): %s\n", pubB64)

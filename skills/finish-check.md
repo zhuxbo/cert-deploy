@@ -9,9 +9,21 @@ git status --short --branch
 git diff --stat
 git diff
 git diff --cached
+if [[ -n "${FINISH_CHECK_BASE:-}" ]]; then
+  base_ref="$FINISH_CHECK_BASE"
+else
+  upstream_base="$(git merge-base HEAD '@{upstream}' 2>/dev/null || true)"
+  [[ -n "$upstream_base" && "$upstream_base" != "$(git rev-parse HEAD)" ]] && base_ref="$upstream_base" || base_ref="$(git rev-parse HEAD^)"
+fi
+git log --oneline "$base_ref"..HEAD
+git log --format=full "$base_ref"..HEAD
+git diff --stat "$base_ref"...HEAD
+git diff "$base_ref"...HEAD
+while IFS= read -r commit; do git show --check --stat --oneline "$commit"; done < <(git rev-list --reverse "$base_ref"..HEAD)
 ```
 
-- 确认没有密钥、凭据、构建产物、调试代码、意外删除或无关改动。
+- `FINISH_CHECK_BASE` 可显式指定审查基线；默认使用当前分支 upstream 的 merge-base；若已与 upstream 同步或无 upstream，至少回退审查 `HEAD^..HEAD`，不得产生空范围。工作区干净也必须审查该提交范围。
+- 确认没有密钥、凭据、构建产物、调试代码、意外删除、无关改动、异常提交主题或 AI 署名。
 - 检查 `deploy-spec.md` 是否被修改；若修改，必须走统一多仓同步/审计流程，单仓 CI 不拉取其他仓库移动分支比较。
 - 真实发布、上传节点、Git tag、GitHub Release/PR 不属于 finish-check，除非用户另行明确授权。
 
@@ -87,6 +99,9 @@ git diff --check
 git status --short --branch
 git diff --stat
 git diff
+git diff --stat "$base_ref"...HEAD
+git log --oneline "$base_ref"..HEAD
+git log --format=full "$base_ref"..HEAD
 git log -8 --oneline
 ```
 

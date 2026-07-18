@@ -16,6 +16,7 @@ sslctl 是 Go 实现的跨平台 SSL 证书部署工具，支持 Linux/Windows�
 
 - 统一部署规范：`deploy-spec.md`
 - Skill 路由：`skills/SKILL.md`
+- Codex 薄入口：`.agents/skills/sslctl/SKILL.md`（只引用 Skill 路由）
 - 构建与签名契约：`skills/build-release.md`
 - 发布编排与恢复：`skills/remote-release.md`
 - 完成检查：`skills/finish-check.md`

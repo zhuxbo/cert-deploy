@@ -35,6 +35,10 @@ SIGN_KEY_ID="key-1"
 # 统一公网入口，必须为 HTTPS；末尾不带 /releases.json
 PUBLIC_RELEASE_URL="https://release.example.com/sslctl"
 
+# 仓库外的持久 bundle 根目录。main bundle 路径由脚本固定为：
+# $BUNDLE_ROOT/main/v<version>-<source_commit>
+BUNDLE_ROOT="/srv/sslctl-release-bundles"
+
 # ========================================
 # 可选配置
 # ========================================

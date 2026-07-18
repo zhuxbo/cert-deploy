@@ -4,7 +4,24 @@ on:
   push:
     branches: [dev]
     paths:
+      - 'cmd/**'
+      - 'internal/**'
+      - 'pkg/**'
+      - 'deploy/**'
       - 'docker/test/**'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/e2e.yml'
+  pull_request:
+    branches: [main, dev]
+    paths:
+      - 'cmd/**'
+      - 'internal/**'
+      - 'pkg/**'
+      - 'deploy/**'
+      - 'docker/test/**'
+      - 'go.mod'
+      - 'go.sum'
       - '.github/workflows/e2e.yml'
   workflow_dispatch:
     inputs:
@@ -92,7 +109,7 @@ jobs:
     name: E2E (Docker-in-Docker)
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    if: ${{ github.event_name == 'push' || startsWith(github.event.inputs.test || '', 'docker-') || ((github.event.inputs.test == 'all' || github.event.inputs.test == '') && github.event.inputs.dind == 'true') }}
+    if: ${{ github.event_name == 'push' || github.event_name == 'pull_request' || startsWith(github.event.inputs.test || '', 'docker-') || ((github.event.inputs.test == 'all' || github.event.inputs.test == '') && github.event.inputs.dind == 'true') }}
 
     env:
       E2E_TEST: ${{ github.event.inputs.test || '' }}

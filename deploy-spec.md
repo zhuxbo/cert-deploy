@@ -214,6 +214,11 @@ GET /api/deploy?order={id1,id2,domain1,...}  （批量，逗号分隔，上限 1
 
 `certificate`、`ca_certificate`、`private_key`、`issued_at`、`expires_at` 仅在 `status=active` 时返回。
 
+状态语义：提交 CSR 的成功响应只会是 `pending` / `processing`（均表示服务端已收到 CSR）；查询订单在
+`processing` 与 `active` 之间可能出现短暂中间态 `approving`。客户端将 `pending` / `processing` /
+`approving` 统一归一为 `processing` 继续等待；`active` 之后的状态均为订单终态，客户端持久化后停止
+自动动作，等待人工处理。
+
 ### 2.5 file 结构
 
 | 字段      | 类型   | 说明             |
@@ -246,6 +251,9 @@ Content-Type: application/json
 服务端对重复提交的幂等由现有 Order/Action 状态机保证（订单已进入处理则不再创建新证书、不重复扣费）。客户端收到
 `pending` 或"已在处理"类响应时，统一归一为 `processing` 查询路径：只 GET 查询，不重复 POST，不增加计数，不重新生成
 CSR。
+
+服务端未接收提交（校验失败、订单状态不允许等）时返回错误信息而非状态：客户端按明确业务拒绝处理，清理在途
+pending 后停止。因此提交结果不确定（超时/断连/解析失败）后的恢复只需查询订单状态，无需重复 POST。
 
 ### 2.7 切换自动重签
 
@@ -357,7 +365,7 @@ effective_mode = cert.renew_mode || schedule.renew_mode
   │   ├─ 生成 CSR（仅 CN，不含 SAN）
   │   ├─ 网络请求前：原子持久化 pending key 与 CSR 哈希，并递增 issue_retry_count（计数 = 持久化一个新的逻辑尝试意图）
   │   ├─ POST /api/deploy 提交 CSR
-  │   │   └─ 超时 / 断连 / 响应解析失败属"不确定结果"：保留 pending key，下轮以同一 CSR 重试或查询订单状态，不重新生成 CSR
+  │   │   └─ 超时 / 断连 / 响应解析失败属"不确定结果"：保留 pending key 作为在途标记，下轮查询订单状态恢复，不重复 POST、不重新生成 CSR
   │   └─ 响应 status=processing 或 pending → 归一为 processing，放置验证文件，标记 processing
   └─ 剩余有效期 > renew_before_days → 跳过
 
@@ -365,8 +373,8 @@ effective_mode = cert.renew_mode || schedule.renew_mode
   ├─ 证书已过期或剩余不足安全余量 → 停止（EXPIRED / 等待人工处理），不再动作
   └─ 查询订单状态（只 GET，不重复 POST，不增加计数）
       ├─ status=active → 读取 pending key，部署，清理
-      ├─ status=processing / pending → 更新验证文件（如有新的），继续等待
-      └─ 其他异常状态 → 持久化实际状态到 `last_issue_state`，停止，等待人工处理
+      ├─ status=processing / pending / approving → 归一为 processing，更新验证文件（如有新的），继续等待
+      └─ 其他状态（订单终态）→ 持久化实际状态到 `last_issue_state`，停止，等待人工处理；后续轮次仍可查询自愈，但状态未变化时不重复记录/落盘
 ```
 
 ### 3.6 文件验证流程（local 模式）
@@ -811,7 +819,7 @@ dev 发布完成至少验证所有发布节点的版本目录可读、产物数�
 
 - **证书验证**：部署前验证证书格式、有效性、证书与私钥匹配
 - **中间证书必需**：API 部署时必须包含中间证书，缺失则拒绝部署
-- **私钥保护**：私钥写入使用原子操作，local 模式下新私钥先存 pending-keys/，证书私钥配对校验通过且部署成功后再移到正式位置（与 3.8 一致；配对校验失败时保留 pending key，线上私钥不受影响）。POST 超时 / 断连 / 响应解析失败等不确定结果保留 pending key，下轮以同一 CSR 重试或查询订单状态；仅在明确业务拒绝且确认未创建新证书、或签发部署完成后才清理 pending key
+- **私钥保护**：私钥写入使用原子操作，local 模式下新私钥先存 pending-keys/，证书私钥配对校验通过且部署成功后再移到正式位置（与 3.8 一致；配对校验失败时保留 pending key，线上私钥不受影响）。POST 超时 / 断连 / 响应解析失败等不确定结果保留 pending key 作为在途标记，下轮查询订单状态恢复（不重复 POST）；仅在明确业务拒绝且确认未创建新证书、或签发部署完成后才清理 pending key
 - **大小限制**：私钥 ≤ 16 KB，证书链 ≤ 64 KB，超过则拒绝
 
 ### 10.4 日志与敏感信息
@@ -962,6 +970,6 @@ skills/*.md             由根 Skill 路由的领域知识和可执行工作流�
 - `skills/SKILL.md` 中列出的叶子文件全部存在
 - 项目文档不再引用旧的 `skills/<name>/SKILL.md` 路径
 - 固定模板的工具自定义指令与预期模板哈希一致，并引用存在的对应叶子资源
-- 统一多仓流程检查四仓 `deploy-spec.md` 字节一致；单仓 CI 不拉取其他仓库的移动分支进行比较
+- 统一多仓流程检查四仓（`ssl-manager`、`sslctl`、`sslctlw`、`sslbt`）`deploy-spec.md` 字节一致；单仓 CI 不拉取其他仓库的移动分支进行比较
 
 第 12 节描述四仓完成智能体配置同步后的目标状态。规范可先行同步；在单仓完成结构迁移前，不启用引用尚不存在文件的结构门禁。某仓完成迁移后，本节即成为该仓必须持续满足的现行约束。

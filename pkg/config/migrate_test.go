@@ -354,7 +354,7 @@ func TestMigrateConfig_Integration(t *testing.T) {
 }
 
 // TestMigrateConfig_LifecycleTable 表驱动验证证书生命周期状态迁移（deploy-spec §3.4）：
-// 计数 0/1/5/10/11 × 状态 空/pending/processing/active，以及非法 IP 配置与终止态保留。
+// 计数 0/1/5/10/11 × 状态 空/pending/approving/processing/active，以及非法 IP 配置与终止态保留。
 func TestMigrateConfig_LifecycleTable(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -377,6 +377,10 @@ func TestMigrateConfig_LifecycleTable(t *testing.T) {
 		{"c5-pending", 5, "pending", "", []string{"a.com"}, "", "", "", "processing", ""},
 		{"c5-processing", 5, "processing", "", []string{"a.com"}, "", "", "", "processing", ""},
 		{"c5-active", 5, "active", "", []string{"a.com"}, "", "", "", "active", ""},
+		// approving 中间态归一 processing（spec 2.4）
+		{"c0-approving", 0, "approving", "", []string{"a.com"}, "", "", "", "processing", ""},
+		{"c5-approving", 5, "approving", "", []string{"a.com"}, "", "", "", "processing", ""},
+		{"c10-approving", 10, "approving", "", []string{"a.com"}, "", "", "", "CAPPED", "legacy"},
 		// 计数 10/11：升级即 CAPPED(legacy)（非终止态才归一）
 		{"c10-empty", 10, "", "", []string{"a.com"}, "", "", "", "CAPPED", "legacy"},
 		{"c11-empty", 11, "", "", []string{"a.com"}, "", "", "", "CAPPED", "legacy"},

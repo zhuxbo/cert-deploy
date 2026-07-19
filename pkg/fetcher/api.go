@@ -590,7 +590,9 @@ func (f *Fetcher) Update(ctx context.Context, baseURL, token string, orderID int
 		return nil, 0, errors.NewNetworkError("failed to parse JSON response", err)
 	}
 	if apiResp.Code != APICodeSuccess {
-		return nil, 0, errors.NewNetworkError(fmt.Sprintf("API error: %s", apiResp.Message), nil)
+		// 服务端已成功响应但明确拒绝提交（校验失败、订单状态不允许等）：
+		// 属确定结果而非传输失败，调用方据此清理在途 pending 后停止（spec 2.6）
+		return nil, 0, errors.NewBusinessError(fmt.Sprintf("API error: %s", apiResp.Message), nil)
 	}
 	// update 响应 data 字段为单条，同层包含 renew_before_days
 	var updateResp UpdateResponse

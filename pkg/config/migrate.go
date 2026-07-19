@@ -189,7 +189,7 @@ func applySpread(root map[string]interface{}, sourceKey, targetPath string) bool
 // normalizeCertLifecycle 迁移证书生命周期状态（deploy-spec §3.4，均幂等）：
 //   - 旧非法 IP 配置（IP+pull 或 IP+delegation）→ policy_blocked_needs_setup（不自动改配置、不计数、不回调）
 //   - 旧计数 >= 10 → CAPPED(legacy)，升级即静默，不补发历史事件
-//   - 旧 pending 状态 → processing（保留私钥与订单信息）
+//   - 旧 pending / approving 状态 → processing（保留私钥与订单信息，spec 2.4）
 //
 // 部署计数为新字段，默认 0，不从旧混合计数推断。三类判定优先级：非法 IP > 旧计数触顶 > pending 归一。
 func normalizeCertLifecycle(root map[string]interface{}) bool {
@@ -231,7 +231,7 @@ func normalizeCertLifecycle(root map[string]interface{}) bool {
 		case rawNumField(meta, "issue_retry_count") >= AttemptCap:
 			targetState = IssueStateCapped
 			targetPhase = CappedPhaseLegacy
-		case curState == "pending":
+		case curState == "pending" || curState == "approving":
 			targetState = IssueStateProcessing
 		}
 

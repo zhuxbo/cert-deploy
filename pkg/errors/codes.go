@@ -1,7 +1,10 @@
 // Package errors 定义应用错误码
 package errors
 
-import "fmt"
+import (
+	stderrors "errors"
+	"fmt"
+)
 
 // 错误码常量
 const (
@@ -13,6 +16,7 @@ const (
 	CodeReloadError   = 41 // Reload 失败
 	CodeDeployError   = 42 // 部署错误
 	CodeNetworkError  = 50 // 网络错误
+	CodeBusinessError = 51 // 业务拒绝（服务端明确拒绝请求，非传输失败）
 	CodeUnknownError  = 99 // 未知错误
 )
 
@@ -62,6 +66,16 @@ func NewNetworkError(msg string, err error) *AppError {
 	return &AppError{Code: CodeNetworkError, Message: msg, Err: err}
 }
 
+func NewBusinessError(msg string, err error) *AppError {
+	return &AppError{Code: CodeBusinessError, Message: msg, Err: err}
+}
+
+// IsBusinessError 判断是否为服务端明确业务拒绝（区别于超时/断连/解析失败等不确定结果）
+func IsBusinessError(err error) bool {
+	var appErr *AppError
+	return stderrors.As(err, &appErr) && appErr.Code == CodeBusinessError
+}
+
 func NewDeployError(msg string, err error) *AppError {
 	return &AppError{Code: CodeDeployError, Message: msg, Err: err}
 }
@@ -99,14 +113,14 @@ func (t DeployErrorType) String() string {
 type DeployPhase string
 
 const (
-	PhaseValidate   DeployPhase = "validate"     // 证书验证阶段
-	PhaseBackup     DeployPhase = "backup"       // 备份阶段
-	PhaseWriteCert  DeployPhase = "write_cert"   // 写入证书阶段
-	PhaseWriteKey   DeployPhase = "write_key"    // 写入私钥阶段
-	PhaseWriteChain DeployPhase = "write_chain"  // 写入证书链阶段
-	PhaseTest       DeployPhase = "test_config"  // 测试配置阶段
-	PhaseReload     DeployPhase = "reload"       // 重载服务阶段
-	PhaseRollback   DeployPhase = "rollback"     // 回滚阶段
+	PhaseValidate   DeployPhase = "validate"    // 证书验证阶段
+	PhaseBackup     DeployPhase = "backup"      // 备份阶段
+	PhaseWriteCert  DeployPhase = "write_cert"  // 写入证书阶段
+	PhaseWriteKey   DeployPhase = "write_key"   // 写入私钥阶段
+	PhaseWriteChain DeployPhase = "write_chain" // 写入证书链阶段
+	PhaseTest       DeployPhase = "test_config" // 测试配置阶段
+	PhaseReload     DeployPhase = "reload"      // 重载服务阶段
+	PhaseRollback   DeployPhase = "rollback"    // 回滚阶段
 )
 
 // StructuredDeployError 结构化部署错误

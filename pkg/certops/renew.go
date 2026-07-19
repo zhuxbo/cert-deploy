@@ -13,6 +13,7 @@ import (
 
 	"github.com/zhuxbo/sslctl/pkg/config"
 	"github.com/zhuxbo/sslctl/pkg/csr"
+	"github.com/zhuxbo/sslctl/pkg/errors"
 	"github.com/zhuxbo/sslctl/pkg/fetcher"
 	"github.com/zhuxbo/sslctl/pkg/logger"
 	"github.com/zhuxbo/sslctl/pkg/util"
@@ -172,10 +173,12 @@ func isTerminalIssueState(state string) bool {
 	return false
 }
 
-// normalizeIssueState 将服务端 / 本地 pending 状态归一为 processing（spec 2.6/3.5）：
-// "已在处理"与 pending 响应统一走查询路径——只 GET、不重复 POST、不增计数、不重新生成 CSR。
+// normalizeIssueState 将服务端 pending / approving 状态归一为 processing（spec 2.4/2.6/3.5）：
+// pending 表示已提交仍在处理，approving 是 processing 与 active 之间的短暂中间态，
+// 统一走查询路径——只 GET、不重复 POST、不增计数、不重新生成 CSR。
 func normalizeIssueState(state string) string {
-	if state == "pending" {
+	switch state {
+	case "pending", "approving":
 		return config.IssueStateProcessing
 	}
 	return state
@@ -630,12 +633,13 @@ func (s *Service) prepareLocalRenew(ctx context.Context, cert *config.CertConfig
 		return nil, "", fmt.Errorf("missing local private key path")
 	}
 
-	// 上次提交仍在处理中（processing / pending 归一），或已秒签为 active 但尚未部署成功：
-	// 两者都先查询当前订单状态，据结果读取 pending 私钥复用部署路径，
-	// 避免重新生成 CSR 覆盖与已签发证书配对的 pending 私钥（秒签全失败续跑关键分支）。
-	// pending 归一为 processing：只查询、不重复 POST、不增计数、不重生 CSR（spec 2.6/3.5）。
+	// 本地已有签发状态（非空）时一律先查询当前订单状态（只 GET，不重复 POST、不增计数、不重生 CSR）：
+	//   - 在途态（processing / pending / approving 归一）或已秒签 active 尚未部署成功：据结果读取
+	//     pending 私钥复用部署路径，避免重新生成 CSR 覆盖与已签发证书配对的 pending 私钥；
+	//   - 订单终态（cancelled 等异常状态）：只查询自愈（spec 3.5），状态未变化时不重复记录/落盘，
+	//     绝不重新提交 CSR——新提交仅在状态为空（初始/已完成/显式重置）时发起。
 	entryState := normalizeIssueState(cert.Metadata.LastIssueState)
-	if entryState == config.IssueStateProcessing || entryState == config.IssueStateActive {
+	if entryState != "" {
 		// 规范 3.5：证书已过期则停止，等待人工处理
 		// 按时间点判定，避免整数天截断使过期不足 24 小时的证书仍被继续处理
 		if cert.IsExpired() {
@@ -692,8 +696,8 @@ func (s *Service) prepareLocalRenew(ctx context.Context, cert *config.CertConfig
 			// "证书已签发但全部绑定部署失败"的续跑循环受 MaxDeployAttemptCount 约束并最终触顶停机。
 			return certData, privateKey, nil
 
-		case "processing", "pending":
-			// pending 归一 processing：只查询等待，不重复 POST、不增计数、不重生 CSR（spec 2.6/3.5）。
+		case "processing", "pending", "approving":
+			// pending / approving 归一 processing：只查询等待，不重复 POST、不增计数、不重生 CSR（spec 2.4/3.5）。
 			// 放置验证文件（如果有新的；全部放置失败按失败处理，避免静默永远 pending）
 			if err := s.applyValidationFiles(cert, certData.File, true); err != nil {
 				return nil, "", err
@@ -702,8 +706,13 @@ func (s *Service) prepareLocalRenew(ctx context.Context, cert *config.CertConfig
 			return nil, "", nil
 
 		default:
-			// 其他状态（包括证书已过期或异常）：更新状态后停止，等待人工处理
-			// 持久化实际状态，避免下次仍进入 processing 分支反复触发回调
+			// 其他状态（订单终态）：持久化实际状态后停止，等待人工处理（spec 3.5）。
+			// 后续轮次仍会查询自愈（若状态回到在途/active 则恢复推进）；
+			// 状态未变化时不重复记录/落盘，避免每日 Error 噪声与无效写盘。
+			if certData.Status == cert.Metadata.LastIssueState {
+				s.log.Debug("证书 %s 订单终态 %s 未变化，继续等待人工处理", cert.CertName, certData.Status)
+				return nil, "", nil
+			}
 			cert.Metadata.LastIssueState = certData.Status
 			_ = s.cfgManager.UpdateCert(cert)
 			s.log.Error("证书 %s 订单状态异常: %s，等待人工处理", cert.CertName, certData.Status)
@@ -752,6 +761,14 @@ func (s *Service) prepareLocalRenew(ctx context.Context, cert *config.CertConfig
 
 	certData, renewBeforeDaysFromUpdate, err := s.fetcher.Update(ctx, api.URL, api.Token, cert.OrderID, csrPEM, strings.Join(cert.Domains, ","), cert.ValidationMethod)
 	if err != nil {
+		// 明确业务拒绝（spec 2.6）：服务端未接收提交、未创建新证书，
+		// 属确定结果——清理在途 pending key 后停止（计数已递增，受签发上限约束）。
+		if errors.IsBusinessError(err) {
+			if cleanupErr := cleanupPendingKey(workDir, cert.CertName); cleanupErr != nil {
+				s.log.Warn("清理待确认私钥失败: %v", cleanupErr)
+			}
+			return nil, "", fmt.Errorf("提交 CSR 被服务端拒绝: %w", err)
+		}
 		// POST 超时 / 断连 / 响应解析失败属"不确定结果"（spec 1.3.1）：保留 pending key，
 		// 归一为 processing——下轮只查询订单状态（不重复 POST、不重新生成 CSR），
 		// 依赖服务端 Order/Action 现有幂等避免重复扣费。计数已在提交前递增，不再重复递增。

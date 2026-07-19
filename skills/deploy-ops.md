@@ -238,7 +238,8 @@ sudo journalctl -u sslctl -f
 |------|------|-----------------|
 | `active` | 证书就绪 | 直接部署 |
 | `processing` | 验证中 | 放置验证文件，轮询等待 |
-| `pending` | 待提交 | POST 提交 CSR |
+| `pending` | 已提交但仍在处理 | 归一为 `processing`，后续只 GET 查询，不重复 POST |
+| `approving` | 审批中（processing 与 active 之间的短暂中间态） | 归一为 `processing`，继续查询等待 |
 | `unpaid` | 待支付 | POST 触发支付 |
 
 ### 部署流程
@@ -280,7 +281,8 @@ sslctl                    Manager API                    CA
 - 请求体固定三字段 `order_id` / `status` / `deployed_at`，外加**可选** `message`（`omitempty`，仅 `status=failure` 携带）。
 - `status` 仅 `success` / `failure`（`pending` 不上报回调）。
 - `message` 为失败原因摘要：客户端复用 `logger.Sanitize` 脱敏后按 rune 截断 ≤256（`callbackMessageMaxLen=256`，服务端上限 500，超限整条被拒）。
-- 失败路径全覆盖：prepare 失败、失败绑定重试、重试触顶、panic、过期触顶均发送 failure 回调；触顶证书同时记 Error 日志并计入本轮统计，不再静默。
+- 客户端只上报明确的部署结果：每次部署成功或失败由编排层在结果落盘后尽力回调一次；签发失败不回调，触顶、过期和 policy 阻断均静默终止且不回调。
+- 底层部署函数只返回结构化结果，不自行发送回调；传输失败仅由既有退避重试兜底，最终失败只记日志，不持久排队或补发。
 
 ### 部署链语义（setup/deploy/续签）
 
@@ -404,12 +406,13 @@ sslctl                    Manager API                    CA
 - **单证书 panic 隔离**：续签循环中单证书处理 panic 记为该证书 failure（Error 日志 + 计入统计），不拖垮整轮。
 - **多证书续签间隔**：每个证书处理后随机延迟 30~90 秒，分散 API 请求压力。
 - **证书过期告警**（守护进程 `CheckExpiry` 周期检查）：剩余不足 7 天输出 Error，不足 13 天输出 Warn，已过期输出 Error（阈值来自 `pkg/certops/service.go` 的 `7*24h`/`13*24h`）。
-- **重试次数超限**：CSR 提交重试超过 10 次自动停止，等待人工处理（不自动重置）。
+- **尝试次数上限**：签发与部署分别计数，各自达到 10 次即进入 `CAPPED`，静默停止并等待人工处理（不自动重置、不发送回调）。
 
 ### processing / active 状态处理
 
-- `processing`：保持查询等待，不自动重提交；返回 `file` 字段时放置验证文件后等待下次检查。
-- 异常状态：停止等待，交人工处理。
+- `processing`（含 `pending` / `approving` 归一）：保持查询等待，不自动重提交；返回 `file` 字段时放置验证文件后等待下次检查。
+- 异常状态（订单终态）：持久化后停止，交人工处理；后续轮次仍只 GET 查询自愈，状态未变化不重复记录/落盘，绝不重新提交 CSR。
+- 提交 CSR 遇明确业务拒绝（API code != 1）：属确定结果，清理在途 pending 私钥后停止；超时/断连/解析失败等不确定结果保留 pending 私钥并归一 `processing`，下轮只查询恢复。
 - `active` 时若 pending 私钥缺失且正式私钥与服务端证书不配对（历史改名残留 / 误删）：重置签发状态走重新提交 CSR（递增 retry，受 10 次上限约束），避免永久卡死。
 
 ### order_id 变更（订单续费）改名迁移

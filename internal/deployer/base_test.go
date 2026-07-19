@@ -118,10 +118,10 @@ func TestReloadService_WinSvcOldFormatCompat(t *testing.T) {
 // TestParseWinSvcSentinel 验证哨兵串解析。
 func TestParseWinSvcSentinel(t *testing.T) {
 	cases := []struct {
-		name        string
-		input       string
-		wantSvc     string
-		wantFB      string
+		name    string
+		input   string
+		wantSvc string
+		wantFB  string
 	}{
 		{"old format", "winsvc:nginx", "nginx", ""},
 		{"new format", "winsvc:nginx|nginx -s reload", "nginx", "nginx -s reload"},
@@ -171,5 +171,25 @@ func TestReloadFallbackTriggers(t *testing.T) {
 		if got != c.shouldRetry {
 			t.Errorf("msg=%q got=%v want=%v", c.msg, got, c.shouldRetry)
 		}
+	}
+}
+
+func TestHasNewPID(t *testing.T) {
+	tests := []struct {
+		name   string
+		before map[int]struct{}
+		after  map[int]struct{}
+		want   bool
+	}{
+		{"新 worker", map[int]struct{}{10: {}}, map[int]struct{}{10: {}, 11: {}}, true},
+		{"原 generation 未变", map[int]struct{}{10: {}, 11: {}}, map[int]struct{}{10: {}, 11: {}}, false},
+		{"旧 worker 退出但无新 worker", map[int]struct{}{10: {}, 11: {}}, map[int]struct{}{}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := hasNewPID(tt.before, tt.after); got != tt.want {
+				t.Fatalf("hasNewPID() = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }

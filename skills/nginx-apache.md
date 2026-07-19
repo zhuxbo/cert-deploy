@@ -143,6 +143,8 @@ executor.Run("systemctl reload apache2")
 - `service apache2/httpd reload/restart`
 - `rc-service apache2/httpd reload/restart`
 
+Linux 容器中通过 SIGUSR1 触发 Apache graceful reload 时，发送信号后必须等待 master 创建新一代 worker 才能返回；多绑定部署不得在上一轮仍读取配置时继续改写下一组证书/私钥，避免 Apache 读到瞬时错配后退出。
+
 ---
 
 ## 证书文件

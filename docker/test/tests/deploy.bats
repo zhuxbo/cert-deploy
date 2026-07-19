@@ -62,7 +62,7 @@ setup() {
   run sslctl deploy --cert "$CERT_NAME"
   assert_success
 
-  local cert_path key_path disk_fp live_fp
+  local cert_path key_path disk_fp
   cert_path=$(binding_value '.paths.certificate')
   key_path=$(binding_value '.paths.private_key')
   assert_file_exists "$cert_path"
@@ -70,11 +70,7 @@ setup() {
   assert_cert_key_match "$cert_path" "$key_path"
 
   disk_fp=$(cert_fingerprint "$cert_path")
-  live_fp=$(tls_fingerprint "127.0.0.1:443" "test.example.com")
-  if [ -z "$live_fp" ] || [ "$disk_fp" != "$live_fp" ]; then
-    echo "TLS certificate fingerprint mismatch: disk=$disk_fp live=$live_fp"
-    return 1
-  fi
+  wait_for_tls_fingerprint "127.0.0.1:443" "test.example.com" "$disk_fp"
 }
 
 @test "deploy: 备份已创建" {

@@ -353,6 +353,127 @@ func TestMigrateConfig_Integration(t *testing.T) {
 	}
 }
 
+// TestMigrateConfig_LifecycleTable 表驱动验证证书生命周期状态迁移（deploy-spec §3.4）：
+// 计数 0/1/5/10/11 × 状态 空/pending/processing/active，以及非法 IP 配置与终止态保留。
+func TestMigrateConfig_LifecycleTable(t *testing.T) {
+	tests := []struct {
+		name       string
+		count      int
+		state      string
+		phaseIn    string
+		domains    []string
+		renewMode  string
+		validation string
+		global     string
+		wantState  string
+		wantPhase  string
+	}{
+		// 计数 0/1/5：非触顶；pending 归一 processing，其余状态保持
+		{"c0-empty", 0, "", "", []string{"a.com"}, "", "", "", "", ""},
+		{"c1-empty", 1, "", "", []string{"a.com"}, "", "", "", "", ""},
+		{"c5-empty", 5, "", "", []string{"a.com"}, "", "", "", "", ""},
+		{"c0-pending", 0, "pending", "", []string{"a.com"}, "", "", "", "processing", ""},
+		{"c1-pending", 1, "pending", "", []string{"a.com"}, "", "", "", "processing", ""},
+		{"c5-pending", 5, "pending", "", []string{"a.com"}, "", "", "", "processing", ""},
+		{"c5-processing", 5, "processing", "", []string{"a.com"}, "", "", "", "processing", ""},
+		{"c5-active", 5, "active", "", []string{"a.com"}, "", "", "", "active", ""},
+		// 计数 10/11：升级即 CAPPED(legacy)（非终止态才归一）
+		{"c10-empty", 10, "", "", []string{"a.com"}, "", "", "", "CAPPED", "legacy"},
+		{"c11-empty", 11, "", "", []string{"a.com"}, "", "", "", "CAPPED", "legacy"},
+		{"c10-pending", 10, "pending", "", []string{"a.com"}, "", "", "", "CAPPED", "legacy"},
+		{"c11-processing", 11, "processing", "", []string{"a.com"}, "", "", "", "CAPPED", "legacy"},
+		{"c10-active", 10, "active", "", []string{"a.com"}, "", "", "", "CAPPED", "legacy"},
+		// 已是终止态：迁移不重复归一，保留运行时记录的触顶阶段
+		{"capped-issue-preserved", 10, "CAPPED", "issue", []string{"a.com"}, "", "", "", "CAPPED", "issue"},
+		{"capped-deploy-preserved", 10, "CAPPED", "deploy", []string{"a.com"}, "", "", "", "CAPPED", "deploy"},
+		{"expired-preserved", 11, "EXPIRED", "", []string{"a.com"}, "", "", "", "EXPIRED", ""},
+		// 非法 IP 配置：IP+pull 或 IP+delegation → policy_blocked（优先级最高）
+		{"ip-pull-cert", 0, "", "", []string{"1.2.3.4"}, "pull", "", "", "policy_blocked_needs_setup", ""},
+		{"ip-pull-global", 0, "", "", []string{"1.2.3.4"}, "", "", "pull", "policy_blocked_needs_setup", ""},
+		{"ip-delegation", 0, "", "", []string{"1.2.3.4"}, "local", "delegation", "", "policy_blocked_needs_setup", ""},
+		{"ipv6-pull", 0, "", "", []string{"2001:db8::1"}, "pull", "", "", "policy_blocked_needs_setup", ""},
+		{"ip-count10-pull", 10, "processing", "", []string{"1.2.3.4"}, "pull", "", "", "policy_blocked_needs_setup", ""},
+		// 合法 IP 配置：IP+local+file 不阻断
+		{"ip-local-file-legal", 0, "", "", []string{"1.2.3.4"}, "local", "file", "", "", ""},
+		{"ip-local-empty-legal", 0, "", "", []string{"1.2.3.4"}, "local", "", "", "", ""},
+		// DNS + pull：合法，不阻断
+		{"dns-pull-legal", 0, "", "", []string{"a.com"}, "pull", "", "", "", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			meta := map[string]interface{}{}
+			if tt.count != 0 {
+				meta["issue_retry_count"] = tt.count
+			}
+			if tt.state != "" {
+				meta["last_issue_state"] = tt.state
+			}
+			if tt.phaseIn != "" {
+				meta["capped_phase"] = tt.phaseIn
+			}
+			cert := map[string]interface{}{
+				"cert_name": "t-1",
+				"order_id":  1,
+				"domains":   tt.domains,
+				"api":       map[string]interface{}{"url": "https://x.example.com", "token": "tok"},
+			}
+			if tt.renewMode != "" {
+				cert["renew_mode"] = tt.renewMode
+			}
+			if tt.validation != "" {
+				cert["validation_method"] = tt.validation
+			}
+			if len(meta) > 0 {
+				cert["metadata"] = meta
+			}
+			schedule := map[string]interface{}{}
+			if tt.global != "" {
+				schedule["renew_mode"] = tt.global
+			}
+			root := map[string]interface{}{
+				"schedule":     schedule,
+				"certificates": []interface{}{cert},
+			}
+			data, err := json.Marshal(root)
+			if err != nil {
+				t.Fatalf("构造配置失败: %v", err)
+			}
+
+			out, _, err := migrateConfig(data)
+			if err != nil {
+				t.Fatalf("migrateConfig 失败: %v", err)
+			}
+
+			var raw map[string]interface{}
+			if err := json.Unmarshal(out, &raw); err != nil {
+				t.Fatalf("解析迁移结果失败: %v", err)
+			}
+			outCert := raw["certificates"].([]interface{})[0].(map[string]interface{})
+			var gotState, gotPhase string
+			if m, ok := outCert["metadata"].(map[string]interface{}); ok {
+				gotState, _ = m["last_issue_state"].(string)
+				gotPhase, _ = m["capped_phase"].(string)
+			}
+			if gotState != tt.wantState {
+				t.Errorf("last_issue_state = %q, 期望 %q", gotState, tt.wantState)
+			}
+			if gotPhase != tt.wantPhase {
+				t.Errorf("capped_phase = %q, 期望 %q", gotPhase, tt.wantPhase)
+			}
+
+			// 幂等性：迁移后再迁移不再变化
+			out2, changed2, err := migrateConfig(out)
+			if err != nil {
+				t.Fatalf("二次迁移失败: %v", err)
+			}
+			if changed2 {
+				t.Errorf("二次迁移不应产生变化（幂等性），diff:\n%s\n%s", string(out), string(out2))
+			}
+		})
+	}
+}
+
 // TestResolvePath 测试路径解析引擎
 func TestResolvePath(t *testing.T) {
 	raw := map[string]interface{}{
@@ -378,12 +499,12 @@ func TestResolvePath(t *testing.T) {
 		path      string
 		wantCount int
 	}{
-		{".", 1},                              // 根节点
-		{"certificates[]", 2},                 // 2 个证书
-		{"certificates[].bindings[]", 3},      // 3 个绑定
-		{"schedule", 1},                       // 子 map
-		{"nonexistent[]", 0},                  // 不存在的路径
-		{"certificates[].nonexistent[]", 0},   // 嵌套不存在
+		{".", 1},                            // 根节点
+		{"certificates[]", 2},               // 2 个证书
+		{"certificates[].bindings[]", 3},    // 3 个绑定
+		{"schedule", 1},                     // 子 map
+		{"nonexistent[]", 0},                // 不存在的路径
+		{"certificates[].nonexistent[]", 0}, // 嵌套不存在
 	}
 
 	for _, tt := range tests {
@@ -478,8 +599,8 @@ func TestApplySpread_Generic(t *testing.T) {
 	raw := map[string]interface{}{
 		"defaults": map[string]interface{}{"a": "1", "b": "2"},
 		"items": []interface{}{
-			map[string]interface{}{"name": "x"},                                         // 无 cfg，完整继承
-			map[string]interface{}{"name": "y", "cfg": map[string]interface{}{"a": "override"}}, // 部分，补全 b
+			map[string]interface{}{"name": "x"},                                                    // 无 cfg，完整继承
+			map[string]interface{}{"name": "y", "cfg": map[string]interface{}{"a": "override"}},    // 部分，补全 b
 			map[string]interface{}{"name": "z", "cfg": map[string]interface{}{"a": "1", "b": "2"}}, // 完整，不变
 		},
 	}

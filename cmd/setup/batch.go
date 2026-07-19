@@ -234,11 +234,18 @@ func runBatch(p *setupParams, query string) {
 		certConfig.Metadata.CertSerial = fmt.Sprintf("%X", plan.ParsedCert.SerialNumber)
 		certConfig.Metadata.LastDeployAt = time.Now()
 
-		if p.localKey {
+		// 逐证书派生续签模式：SAN 含 IP 的证书强制 local + file（deploy-spec §5.2），
+		// DNS 证书按命令行参数派生，混合批次下 DNS 证书不受 IP 证书影响。
+		useLocalKey, useFileValidation := deriveRenewPolicy(plan.CertDomains, p.localKey, p.fileValidation)
+		if config.ContainsIPDomain(plan.CertDomains) {
+			fmt.Printf("  证书 %s 含 IP，自动启用 local/file\n", certConfig.CertName)
+		}
+
+		if useLocalKey {
 			certConfig.RenewMode = config.RenewModeLocal
 		}
 
-		if p.fileValidation {
+		if useFileValidation {
 			// 校验：通配符域名不支持文件验证
 			skipCert := false
 			for _, domain := range plan.CertDomains {
@@ -270,7 +277,7 @@ func runBatch(p *setupParams, query string) {
 					continue
 				}
 			}
-		} else if p.localKey {
+		} else if useLocalKey {
 			certConfig.ValidationMethod = config.ValidationMethodDelegation
 		}
 

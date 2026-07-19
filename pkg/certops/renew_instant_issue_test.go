@@ -232,35 +232,33 @@ func TestPrepareLocalRenew_InstantIssue_AllDeployFail_ContinuesWithoutResign(t *
 	if pendingAfter2 != pendingAfter1 {
 		t.Error("round2 不应覆盖 pending 私钥（未重新生成 CSR）")
 	}
-	if cert.Metadata.IssueRetryCount != 2 {
-		t.Errorf("round2 自愈应递增 retry 至 2，实际 %d", cert.Metadata.IssueRetryCount)
+	// 计数分离（计划 3.1）：active 自愈只走部署，不再递增签发计数，
+	// 签发计数仅在提交 CSR 时递增（round1 一次），故此处仍为 1。
+	// 部署尝试计数（DeployAttemptCount）由编排层 runDeployAttempt 管理，见 TestCheckAndRenewAll_DeployCapStopsAfterTenAttempts。
+	if cert.Metadata.IssueRetryCount != 1 {
+		t.Errorf("round2 active 自愈不应递增签发计数（仍为 1），实际 %d", cert.Metadata.IssueRetryCount)
 	}
 	dc2, _, derr2 := svc.deployCertToBindings(t.Context(), cert, cd2, pk2)
 	if dc2 != 0 || derr2 == nil {
 		t.Fatalf("round2 部署应仍失败: count=%d", dc2)
 	}
 
-	// === 继续自愈直到触顶：retry 递增最终触发上限停机 ===
-	sawCap := false
-	for round := 3; round <= MaxIssueRetryCount+3; round++ {
+	// === 继续自愈若干轮：全程不重新提交 CSR，签发计数恒为 1（不污染） ===
+	for round := 3; round <= 6; round++ {
 		cd, pk, perr := svc.prepareLocalRenew(t.Context(), cert, cert.API)
 		if perr != nil {
-			if cert.Metadata.IssueRetryCount >= MaxIssueRetryCount {
-				sawCap = true
-				break
-			}
 			t.Fatalf("round %d prepare 非预期失败: %v", round, perr)
 		}
 		if api.posts() != 1 {
 			t.Fatalf("round %d 不应提交新 CSR: posts=%d", round, api.posts())
 		}
+		if cert.Metadata.IssueRetryCount != 1 {
+			t.Errorf("round %d 自愈不应污染签发计数（应恒为 1），实际 %d", round, cert.Metadata.IssueRetryCount)
+		}
 		dc, _, _ := svc.deployCertToBindings(t.Context(), cert, cd, pk)
 		if dc != 0 {
 			t.Fatalf("round %d 部署应失败", round)
 		}
-	}
-	if !sawCap {
-		t.Errorf("retry 递增应最终触顶 MaxIssueRetryCount 并停机，最终 retry=%d", cert.Metadata.IssueRetryCount)
 	}
 	// 全程只提交过一次 CSR（秒签当轮），后续全部走查询+读 pending
 	if api.posts() != 1 {

@@ -89,6 +89,36 @@ const (
 	ValidationMethodDelegation = "delegation" // 委托验证 (DNS-01)
 )
 
+// 签发/生命周期状态常量（metadata.last_issue_state 取值，deploy-spec §1.5/§3.2）
+const (
+	IssueStateProcessing    = "processing"                 // 等待签发（只查询，不重复提交）
+	IssueStateActive        = "active"                     // 秒签已签发、等待部署
+	IssueStateCapped        = "CAPPED"                     // 触顶静默（阶段见 CappedPhase）
+	IssueStateExpired       = "EXPIRED"                    // 已过期静默
+	IssueStatePolicyBlocked = "policy_blocked_needs_setup" // 非法 IP 配置，等待重新 setup
+)
+
+// 触顶阶段常量（metadata.capped_phase 取值）
+const (
+	CappedPhaseIssue  = "issue"  // 签发计数触顶
+	CappedPhaseDeploy = "deploy" // 部署计数触顶
+	CappedPhaseLegacy = "legacy" // 旧混合计数升级即触顶
+)
+
+// AttemptCap 签发/部署尝试上限（deploy-spec §3.2/§11）：分别计数，各自 >= 10 触顶。
+const AttemptCap = 10
+
+// ContainsIPDomain 判断域名列表是否包含 IP 地址（SAN 含 IP）。
+// 复用 net.ParseIP 精确判断，IPv4/IPv6 均识别。
+func ContainsIPDomain(domains []string) bool {
+	for _, d := range domains {
+		if net.ParseIP(d) != nil {
+			return true
+		}
+	}
+	return false
+}
+
 // ValidateValidationMethod 校验域名与验证方法的兼容性
 // 返回错误信息，如果兼容则返回空字符串
 func ValidateValidationMethod(domain string, method string) string {

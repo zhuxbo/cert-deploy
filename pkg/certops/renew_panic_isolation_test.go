@@ -107,10 +107,9 @@ func TestProcessCertRenewal_PanicIsolated(t *testing.T) {
 	if !madeAPICall {
 		t.Error("panic 前已发起 API 请求，应返回 madeAPICall=true")
 	}
-	// panic 恢复路径应上报 failure 回调（失败可见性与其他失败路径一致）
-	cbs := rec.recorded()
-	if len(cbs) != 1 || cbs[0].Status != "failure" || cbs[0].OrderID != 1000 {
-		t.Errorf("panic 恢复后应上报 1 次 failure 回调，实际 %+v", cbs)
+	// panic 无干净部署结果：不上报回调（计划 1.2/spec 2.8），仅记 Error 日志与失败结果供统计
+	if cbs := rec.recorded(); len(cbs) != 0 {
+		t.Errorf("panic 恢复路径不应上报回调，实际 %+v", cbs)
 	}
 
 	// 证书 2：panic 之后继续正常处理（模拟外层循环的下一个证书）

@@ -60,9 +60,9 @@ func (r *callbackRecorder) raw() []string {
 	return out
 }
 
-// TestCheckAndRenewAll_PrepareFailureSendsCallback 验证 prepare 阶段失败也上报 failure 回调
-// （原实现 prepare 失败 continue 跳过了回调块，服务端无法感知失败）。
-func TestCheckAndRenewAll_PrepareFailureSendsCallback(t *testing.T) {
+// TestCheckAndRenewAll_PrepareFailureNoCallback 验证签发阶段失败不上报回调（计划 1.2/spec 2.8）：
+// 客户端只上报部署结果，签发失败仅记本地日志与本地计数、计入本轮统计，服务端自行记录签发失败。
+func TestCheckAndRenewAll_PrepareFailureNoCallback(t *testing.T) {
 	tmpDir := t.TempDir()
 	cm, err := config.NewConfigManagerWithDir(tmpDir)
 	if err != nil {
@@ -93,26 +93,13 @@ func TestCheckAndRenewAll_PrepareFailureSendsCallback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CheckAndRenewAll 失败: %v", err)
 	}
+	// 计入本轮统计（本地可见），但不上报回调
 	if len(results) != 1 || results[0].Status != "failure" {
-		t.Fatalf("应产生 1 个 failure 结果: %+v", results)
+		t.Fatalf("签发阶段失败应产生 1 个 failure 结果（本地统计）: %+v", results)
 	}
 
-	cbs := rec.recorded()
-	if len(cbs) != 1 {
-		t.Fatalf("prepare 失败应发送 1 次回调，实际 %d", len(cbs))
-	}
-	if cbs[0].Status != "failure" || cbs[0].OrderID != 400 {
-		t.Errorf("回调内容不正确: %+v", cbs[0])
-	}
-	// 契约（spec 2.8）：failure 回调携带 message 原因摘要，且 ≤256 rune
-	if cbs[0].Message == "" {
-		t.Error("failure 回调应携带 message 原因摘要")
-	}
-	if n := len([]rune(cbs[0].Message)); n > callbackMessageMaxLen {
-		t.Errorf("message 超过 %d rune 上限: %d", callbackMessageMaxLen, n)
-	}
-	if raw := rec.raw(); !strings.Contains(raw[0], `"message"`) {
-		t.Errorf("failure 回调请求体应包含 message 字段: %s", raw[0])
+	if cbs := rec.recorded(); len(cbs) != 0 {
+		t.Fatalf("签发阶段失败不应上报回调，实际 %d 次: %+v", len(cbs), cbs)
 	}
 }
 
@@ -167,9 +154,9 @@ func TestCheckAndRenewAll_RetryFailedBindingsSendsCallback(t *testing.T) {
 	}
 }
 
-// TestCheckAndRenewAll_RetryCapVisible 验证重试触顶证书不再静默：
-// Error 结果计入统计 + 上报 failure 带"重试超限"原因（原实现仅一条 Warn 且不产生结果）。
-func TestCheckAndRenewAll_RetryCapVisible(t *testing.T) {
+// TestCheckAndRenewAll_IssueCapSilent 验证签发触顶证书静默进入 CAPPED（计划 1.1/spec 3.2）：
+// 不发起 API 请求、不上报回调、不产生续签结果，仅落盘 CAPPED(issue) 状态等待人工处理。
+func TestCheckAndRenewAll_IssueCapSilent(t *testing.T) {
 	tmpDir := t.TempDir()
 	cm, err := config.NewConfigManagerWithDir(tmpDir)
 	if err != nil {
@@ -201,24 +188,24 @@ func TestCheckAndRenewAll_RetryCapVisible(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CheckAndRenewAll 失败: %v", err)
 	}
-	// 触顶证书应计入本轮统计（failure），而非静默消失
-	if len(results) != 1 || results[0].Status != "failure" {
-		t.Fatalf("触顶证书应产生 failure 结果: %+v", results)
+	// 触顶静默：不产生续签结果
+	if len(results) != 0 {
+		t.Fatalf("触顶证书应静默跳过，不产生结果: %+v", results)
 	}
-	if results[0].Error == nil || !strings.Contains(results[0].Error.Error(), "上限") {
-		t.Errorf("结果错误应说明重试超限: %v", results[0].Error)
+	// 触顶不发回调
+	if cbs := rec.recorded(); len(cbs) != 0 {
+		t.Fatalf("触顶证书不应上报回调，实际 %d 次: %+v", len(cbs), cbs)
 	}
-
-	cbs := rec.recorded()
-	if len(cbs) != 1 {
-		t.Fatalf("触顶证书应上报 1 次 failure 回调，实际 %d", len(cbs))
+	// 落盘 CAPPED(issue) 状态
+	updated, err := cm.GetCert("capped.example.com-600")
+	if err != nil {
+		t.Fatalf("获取证书失败: %v", err)
 	}
-	if cbs[0].Status != "failure" || cbs[0].OrderID != 600 {
-		t.Errorf("回调应为 failure: %+v", cbs[0])
+	if updated.Metadata.LastIssueState != config.IssueStateCapped {
+		t.Errorf("应进入 CAPPED 状态，实际 %q", updated.Metadata.LastIssueState)
 	}
-	// 契约（spec 2.8）：failure 回调 message 携带重试超限原因
-	if !strings.Contains(cbs[0].Message, "上限") {
-		t.Errorf("回调 message 应含重试超限原因: %q", cbs[0].Message)
+	if updated.Metadata.CappedPhase != config.CappedPhaseIssue {
+		t.Errorf("触顶阶段应为 issue，实际 %q", updated.Metadata.CappedPhase)
 	}
 }
 

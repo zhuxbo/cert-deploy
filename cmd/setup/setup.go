@@ -218,6 +218,12 @@ func runSingle(p *setupParams, orderID int) {
 		os.Exit(1)
 	}
 
+	// SAN 含 IP 的证书强制 local + file（deploy-spec §5.2）；DNS 证书按命令行参数派生
+	useLocalKey, useFileValidation := deriveRenewPolicy(certDomains, p.localKey, p.fileValidation)
+	if config.ContainsIPDomain(certDomains) {
+		fmt.Println("  检测到 IP 证书，自动启用本机提交 + 文件验证（local/file）")
+	}
+
 	// 如果 API 返回了私钥，立即验证匹配
 	if certData.PrivateKey != "" {
 		if err := certValidator.ValidateCertKeyPair(certData.Cert, certData.PrivateKey); err != nil {
@@ -300,14 +306,14 @@ func runSingle(p *setupParams, orderID int) {
 	}
 
 	// 校验验证方式与域名兼容性（在部署前检查，避免部署后配置保存失败导致状态不一致）
-	if p.fileValidation {
+	if useFileValidation {
 		for _, domain := range certDomains {
 			if errMsg := config.ValidateValidationMethod(domain, config.ValidationMethodFile); errMsg != "" {
 				fmt.Fprintf(os.Stderr, "域名 %s: %s\n", domain, errMsg)
 				os.Exit(1)
 			}
 		}
-		// --file-validation 无 --webroot 时，检查至少一个绑定有扫描到的 webroot
+		// 文件验证无 --webroot 时，检查至少一个绑定有扫描到的 webroot
 		if p.webroot == "" {
 			hasWebroot := false
 			for _, b := range bindings {
@@ -438,19 +444,19 @@ func runSingle(p *setupParams, orderID int) {
 	certConfig.Metadata.CertSerial = fmt.Sprintf("%X", parsedCert.SerialNumber)
 	certConfig.Metadata.LastDeployAt = time.Now()
 
-	if p.localKey {
+	if useLocalKey {
 		certConfig.RenewMode = config.RenewModeLocal
 	}
 
-	// 验证方式和 webroot（域名兼容性已在部署前校验）
-	if p.fileValidation {
+	// 验证方式和 webroot（域名兼容性已在部署前校验；IP 证书已强制 file）
+	if useFileValidation {
 		certConfig.ValidationMethod = config.ValidationMethodFile
 		if p.webroot != "" {
 			for i := range certConfig.Bindings {
 				certConfig.Bindings[i].Paths.Webroot = p.webroot
 			}
 		}
-	} else if p.localKey {
+	} else if useLocalKey {
 		certConfig.ValidationMethod = config.ValidationMethodDelegation
 	}
 
@@ -507,6 +513,17 @@ func runSingle(p *setupParams, orderID int) {
 	if hasDeployFailures(failCount, 0, 0) {
 		os.Exit(1)
 	}
+}
+
+// deriveRenewPolicy 按证书域名与命令行参数逐证书派生续签策略（deploy-spec §5.2）。
+// SAN 含 IP 的证书强制 local + file；DNS 证书按命令行参数透传。
+// 逐证书独立派生，混合批次下 IP 证书不影响 DNS 证书。
+// 返回 (useLocalKey, useFileValidation)。
+func deriveRenewPolicy(certDomains []string, localKey, fileValidation bool) (useLocalKey, useFileValidation bool) {
+	if config.ContainsIPDomain(certDomains) {
+		return true, true
+	}
+	return localKey, fileValidation
 }
 
 // scanSites 扫描站点（使用 webserver 抽象层）

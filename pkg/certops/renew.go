@@ -22,8 +22,15 @@ import (
 // pendingKeyDir 待确认私钥目录
 const pendingKeyDir = "pending-keys"
 
-// MaxIssueRetryCount 最大重试次数
-const MaxIssueRetryCount = 10
+// MaxIssueRetryCount 签发尝试上限（CSR 提交），>= 10 触顶
+const MaxIssueRetryCount = config.AttemptCap
+
+// MaxDeployAttemptCount 部署尝试上限，>= 10 触顶；与签发计数分离
+const MaxDeployAttemptCount = config.AttemptCap
+
+// AutoActionSafetyMargin 自动动作安全余量（deploy-spec §3.2/§11）：
+// 证书剩余有效期小于该值时不再启动新的签发/部署动作，避免临门失败与噪声。
+const AutoActionSafetyMargin = 24 * time.Hour
 
 // MaxRenewBatch 单次续签批量上限（借鉴 sslbt）
 const MaxRenewBatch = 100
@@ -85,28 +92,12 @@ func (s *Service) CheckAndRenewAll(ctx context.Context) ([]*RenewResult, error) 
 	var results []*RenewResult
 	var needsDelay bool // 上一轮是否发起了 API 请求，需要延迟
 
-	// 收集需要处理的证书（续签 + 失败重试 + 触顶上报），计算动态延迟
+	// 收集会发起 API 请求的证书（续签 + 失败重试 + 零值回填），计算动态延迟。
+	// 触顶 / 过期 / policy 阻断静默跳过、不发起请求，不计入延迟（规范 3.2）。
 	pendingCount := 0
 	for i := range cfg.Certificates {
 		cert := cfg.Certificates[i]
-		if !cert.Enabled {
-			continue
-		}
-		// 到期时间未知的证书会发起一次 API 查询回填，计入延迟统计
-		if cert.Metadata.CertExpiresAt.IsZero() {
-			pendingCount++
-			continue
-		}
-		// 规范 3.2：local 模式 retry_count 超限时前置过滤
-		// 临期触顶或已过期触顶都会发一次 failure 回调（可见性），计入延迟统计
-		if cert.GetRenewMode(&cfg.Schedule) == config.RenewModeLocal &&
-			cert.Metadata.IssueRetryCount >= MaxIssueRetryCount {
-			if cert.NeedsRenewal(&cfg.Schedule) || cert.IsExpired() {
-				pendingCount++
-			}
-			continue
-		}
-		if cert.NeedsRenewal(&cfg.Schedule) || len(cert.Metadata.FailedBindings) > 0 {
+		if s.willMakeAPICall(&cert, &cfg.Schedule) {
 			pendingCount++
 		}
 	}
@@ -147,21 +138,63 @@ func (s *Service) CheckAndRenewAll(ctx context.Context) ([]*RenewResult, error) 
 	return results, nil
 }
 
+// willMakeAPICall 判断证书本轮是否会发起 API 请求（用于分散延迟预估）。
+// 触顶 / 过期 / policy 阻断静默跳过、不发请求，返回 false。
+func (s *Service) willMakeAPICall(cert *config.CertConfig, schedule *config.ScheduleConfig) bool {
+	if !cert.Enabled {
+		return false
+	}
+	if isTerminalIssueState(cert.Metadata.LastIssueState) || cert.IsIllegalIPConfig(schedule) {
+		return false
+	}
+	// 到期时间未知：会发起一次 API 查询回填
+	if cert.Metadata.CertExpiresAt.IsZero() {
+		return true
+	}
+	// 已过期或剩余不足安全余量：静默，不启动新动作
+	if cert.IsExpired() || time.Until(cert.Metadata.CertExpiresAt) < AutoActionSafetyMargin {
+		return false
+	}
+	// 计数触顶：静默
+	if (cert.GetRenewMode(schedule) == config.RenewModeLocal && cert.Metadata.IssueRetryCount >= MaxIssueRetryCount) ||
+		cert.Metadata.DeployAttemptCount >= MaxDeployAttemptCount {
+		return false
+	}
+	return cert.NeedsRenewal(schedule) || len(cert.Metadata.FailedBindings) > 0
+}
+
+// isTerminalIssueState 判断是否为终止态（静默跳过，等待人工处理）
+func isTerminalIssueState(state string) bool {
+	switch state {
+	case config.IssueStateCapped, config.IssueStateExpired, config.IssueStatePolicyBlocked:
+		return true
+	}
+	return false
+}
+
+// normalizeIssueState 将服务端 / 本地 pending 状态归一为 processing（spec 2.6/3.5）：
+// "已在处理"与 pending 响应统一走查询路径——只 GET、不重复 POST、不增计数、不重新生成 CSR。
+func normalizeIssueState(state string) string {
+	if state == "pending" {
+		return config.IssueStateProcessing
+	}
+	return state
+}
+
 // processCertRenewal 处理单个证书的续签检查。
-// 含 panic 隔离：单证书处理 panic 记为该证书失败并计入统计，不拖垮整轮续签。
+// 含 panic 隔离：单证书处理 panic 记为该证书失败并计入统计，不拖垮整轮续签（panic 无干净部署结果，不发回调）。
 // 返回 result（nil 表示本证书无需处理）与是否发起过 API 请求（用于证书间分散延迟）。
 func (s *Service) processCertRenewal(ctx context.Context, cfg *config.Config, cert config.CertConfig, processedCount *int) (result *RenewResult, madeAPICall bool) {
 	defer func() {
 		if r := recover(); r != nil {
 			s.log.Error("证书 %s 续签处理 panic（已隔离，继续处理其余证书）: %v", cert.CertName, r)
+			// panic 无干净部署结果：仅记 Error 日志与失败结果供统计，不上报回调（spec 1.2/2.8）
 			result = &RenewResult{
 				CertName: cert.CertName,
 				Mode:     cert.GetRenewMode(&cfg.Schedule),
 				Status:   "failure",
 				Error:    fmt.Errorf("续签处理 panic: %v", r),
 			}
-			// panic 恢复路径同样上报 failure 回调（与其他失败路径的可见性一致）
-			s.sendRenewCallback(ctx, &cert, result)
 		}
 	}()
 
@@ -176,9 +209,27 @@ func (s *Service) processCertRenewal(ctx context.Context, cfg *config.Config, ce
 		return nil, false
 	}
 
+	// policy 阻断：非法 IP 配置（IP+pull 或 IP+delegation）等待重新 setup，不动作、不计数、不回调
+	if cert.Metadata.LastIssueState == config.IssueStatePolicyBlocked || cert.IsIllegalIPConfig(&cfg.Schedule) {
+		if cert.Metadata.LastIssueState != config.IssueStatePolicyBlocked {
+			s.persistTerminalState(&cert, config.IssueStatePolicyBlocked, "")
+		}
+		s.log.Warn("证书 %s 为非法 IP 配置（IP 证书须 local+file），已阻断自动续签，请重新 setup", cert.CertName)
+		return nil, false
+	}
+
+	// 已触顶 / 已过期：静默跳过，等待人工处理（不发回调）
+	if cert.Metadata.LastIssueState == config.IssueStateCapped {
+		s.log.Debug("证书 %s 已触顶（阶段：%s），静默跳过", cert.CertName, cert.Metadata.CappedPhase)
+		return nil, false
+	}
+	if cert.Metadata.LastIssueState == config.IssueStateExpired {
+		s.log.Debug("证书 %s 已过期静默，跳过", cert.CertName)
+		return nil, false
+	}
+
 	// 到期时间未知（部署成功但元数据保存失败、带外换证等）：
-	// 语义为"未知需处理"，先查询 API 回填元数据再按正常逻辑判定，
-	// 避免"永不续签 + 告警盲区"双盲
+	// 语义为"未知需处理"，先查询 API 回填元数据再按正常逻辑判定，避免"永不续签 + 告警盲区"双盲
 	if cert.Metadata.CertExpiresAt.IsZero() {
 		madeAPICall = true
 		if !s.refreshExpiryFromAPI(ctx, &cert, api) {
@@ -186,38 +237,31 @@ func (s *Service) processCertRenewal(ctx context.Context, cfg *config.Config, ce
 		}
 	}
 
-	// 前置过滤：local 模式重试超限（规范 3.2 停止自动操作）
-	// 但需保证可见性：Error 日志 + 计入本轮统计 + 上报 failure 带原因，避免静默永久死锁
-	if cert.GetRenewMode(&cfg.Schedule) == config.RenewModeLocal &&
-		cert.Metadata.IssueRetryCount >= MaxIssueRetryCount {
-		if !cert.NeedsRenewal(&cfg.Schedule) {
-			// 既过期又触顶：证书已死且自动续签已停，与下方"临期触顶"路径对齐上报可见性，
-			// 不再静默（否则 Error 日志 / failure 回调 / 统计三缺，运维无从感知需人工处理）。
-			// 未过期、只是尚未进入续签窗口的触顶证书仍静默跳过（无需处理，避免每日噪声）。
-			if cert.IsExpired() {
-				s.log.Error("证书 %s 已过期且重试次数达上限 (%d)，已停止自动续签，需人工处理", cert.CertName, MaxIssueRetryCount)
-				madeAPICall = true
-				result = &RenewResult{
-					CertName: cert.CertName,
-					Mode:     config.RenewModeLocal,
-					Status:   "failure",
-					Error:    fmt.Errorf("证书已过期且重试超限，需人工处理"),
-				}
-				s.sendRenewCallback(ctx, &cert, result)
-				return result, madeAPICall
-			}
-			return nil, madeAPICall
-		}
-		s.log.Error("证书 %s 重试次数已达上限 (%d)，已停止自动续签，需人工处理", cert.CertName, MaxIssueRetryCount)
-		madeAPICall = true
-		result = &RenewResult{
-			CertName: cert.CertName,
-			Mode:     config.RenewModeLocal,
-			Status:   "failure",
-			Error:    fmt.Errorf("重试次数已达上限 (%d)，已停止自动续签，需人工处理", MaxIssueRetryCount),
-		}
-		s.sendRenewCallback(ctx, &cert, result)
-		return result, madeAPICall
+	// 已过期：静默终止并转 EXPIRED，仅留本地日志与人工入口（不发回调）
+	if cert.IsExpired() {
+		s.markExpired(&cert)
+		return nil, madeAPICall
+	}
+
+	// 剩余有效期不足安全余量（默认 24h）：不启动新的签发/部署动作
+	if time.Until(cert.Metadata.CertExpiresAt) < AutoActionSafetyMargin {
+		s.log.Warn("证书 %s 剩余有效期不足安全余量（%s），本轮不启动新动作", cert.CertName, AutoActionSafetyMargin)
+		return nil, madeAPICall
+	}
+
+	// 计数触顶：签发与部署分别判断，静默进入 CAPPED（不发回调）
+	mode := cert.GetRenewMode(&cfg.Schedule)
+	entryState := normalizeIssueState(cert.Metadata.LastIssueState)
+	// 签发触顶仅拦截"即将提交新 CSR"的情形；已在途（processing）或已秒签待部署（active）的证书
+	// 不受签发触顶影响——其继续推进由部署触顶（DeployAttemptCount）约束，避免已签发证书被误判停机而白白过期。
+	if mode == config.RenewModeLocal && cert.Metadata.IssueRetryCount >= MaxIssueRetryCount &&
+		entryState != config.IssueStateProcessing && entryState != config.IssueStateActive {
+		s.markCapped(&cert, config.CappedPhaseIssue)
+		return nil, madeAPICall
+	}
+	if cert.Metadata.DeployAttemptCount >= MaxDeployAttemptCount {
+		s.markCapped(&cert, config.CappedPhaseDeploy)
+		return nil, madeAPICall
 	}
 
 	// 重试失败的绑定（证书有效但部分绑定上次部署失败）
@@ -229,7 +273,7 @@ func (s *Service) processCertRenewal(ctx context.Context, cfg *config.Config, ce
 		madeAPICall = true
 		s.log.Info("证书 %s 重试 %d 个失败绑定...", cert.CertName, len(cert.Metadata.FailedBindings))
 		result = s.retryFailedBindings(ctx, &cert, api)
-		// 与主路径一致：有明确结果时发送回调（pending 不发）
+		// 部署结果回调（pending 不发）
 		if result.Status == "success" || result.Status == "failure" {
 			s.sendRenewCallback(ctx, &cert, result)
 		}
@@ -252,11 +296,7 @@ func (s *Service) processCertRenewal(ctx context.Context, cfg *config.Config, ce
 
 	s.log.Info("证书 %s 需要续期，开始处理...", cert.CertName)
 
-	mode := cert.GetRenewMode(&cfg.Schedule)
-	result = &RenewResult{
-		CertName: cert.CertName,
-		Mode:     mode,
-	}
+	result = &RenewResult{CertName: cert.CertName, Mode: mode}
 
 	var (
 		certData   *fetcher.CertData
@@ -271,11 +311,10 @@ func (s *Service) processCertRenewal(ctx context.Context, cfg *config.Config, ce
 	}
 
 	if err != nil {
+		// 签发阶段失败：只记本地日志与本地计数，不上报回调（spec 1.2/2.8：客户端只上报部署结果）
 		result.Status = "failure"
 		result.Error = err
-		s.log.Warn("证书 %s 续签失败: %v", cert.CertName, err)
-		// prepare 阶段失败同样上报回调（原实现跳过了后面的回调块，服务端无法感知失败）
-		s.sendRenewCallback(ctx, &cert, result)
+		s.log.Warn("证书 %s 续签失败（签发阶段，不上报）: %v", cert.CertName, err)
 		return result, madeAPICall
 	}
 
@@ -284,27 +323,92 @@ func (s *Service) processCertRenewal(ctx context.Context, cfg *config.Config, ce
 		return result, madeAPICall
 	}
 
-	// 部署证书
-	deployCount, _, deployErr := s.deployCertToBindings(ctx, &cert, certData, privateKey)
+	// 部署阶段：崩溃安全地递增部署计数、部署、落盘结果后统一回调
+	s.runDeployAttempt(ctx, &cert, certData, privateKey, result)
+	return result, madeAPICall
+}
+
+// runDeployAttempt 执行一次部署尝试（deploy-spec §5.1）。
+// 计数纪律：新部署意图在部署前原子落盘（DeployStartedAt 置位 + DeployAttemptCount 递增）；
+// 崩溃重启复验时据 DeployStartedAt 复位重放同一意图、不再递增（不盲增）。
+// 回调纪律：底层部署函数不发回调，仅由本编排层在结果原子落盘后统一上报（成功/明确失败各尽力一次）。
+func (s *Service) runDeployAttempt(ctx context.Context, cert *config.CertConfig, certData *fetcher.CertData, privateKey string, result *RenewResult) {
+	if cert.Metadata.DeployStartedAt.IsZero() {
+		// 新部署意图：部署前原子落盘"已开始"标记与计数递增（崩溃可复位重放）
+		cert.Metadata.DeployAttemptCount++
+		cert.Metadata.DeployStartedAt = time.Now()
+		if err := s.cfgManager.UpdateCert(cert); err != nil {
+			s.log.Warn("持久化部署意图失败: %v", err)
+		}
+	} else {
+		// 复验后重放同一尝试，不再递增计数
+		s.log.Info("证书 %s 检测到未落盘结果的部署意图，复验后重放同一尝试（不增计数）", cert.CertName)
+	}
+
+	deployCount, _, deployErr := s.deployCertToBindings(ctx, cert, certData, privateKey)
 	result.DeployCount = deployCount
+
+	// 结果落盘：清除"已开始"标记（本次尝试已产生明确结果）；
+	// deployCertToBindings 成功时已清零全部计数与状态，失败时保留计数递增值。
+	cert.Metadata.DeployStartedAt = time.Time{}
 	if deployErr != nil {
 		result.Status = "failure"
-		result.Error = deployErr
+		if cert.Metadata.DeployAttemptCount >= MaxDeployAttemptCount {
+			// 第 10 次（最后一次）部署失败：message 前置标注已达重试上限（自由文本，零协议变化）
+			result.Error = fmt.Errorf("已达重试上限（已停止自动重试，需人工介入）: %w", deployErr)
+		} else {
+			result.Error = deployErr
+		}
 	} else {
 		result.Status = "success"
 	}
-
-	// 始终持久化元数据（deployCertToBindings 内部已更新 CertExpiresAt、FailedBindings 等）
-	if err := s.cfgManager.UpdateCert(&cert); err != nil {
+	if err := s.cfgManager.UpdateCert(cert); err != nil {
 		s.log.Warn("更新证书元数据失败: %v", err)
 	}
 
-	// 发送续签回调（仅在有明确结果时）
-	if result.Status == "success" || result.Status == "failure" {
-		s.sendRenewCallback(ctx, &cert, result)
-	}
+	// 编排层统一发送部署结果回调（成功/明确失败各尽力一次）
+	s.sendRenewCallback(ctx, cert, result)
+}
 
-	return result, madeAPICall
+// persistTerminalState 落盘终止态（CAPPED / EXPIRED / policy_blocked），并清除部署"已开始"标记。
+// 触顶 / 过期 / policy 阻断一律不发回调（spec 1.2）。
+func (s *Service) persistTerminalState(cert *config.CertConfig, state, phase string) {
+	cert.Metadata.LastIssueState = state
+	cert.Metadata.CappedPhase = phase
+	cert.Metadata.DeployStartedAt = time.Time{}
+	if err := s.cfgManager.UpdateCert(cert); err != nil {
+		s.log.Warn("持久化证书 %s 状态 %s 失败: %v", cert.CertName, state, err)
+	}
+}
+
+// markCapped 触顶进入 CAPPED 静默并记录触顶阶段
+func (s *Service) markCapped(cert *config.CertConfig, phase string) {
+	if cert.Metadata.LastIssueState != config.IssueStateCapped || cert.Metadata.CappedPhase != phase {
+		s.log.Error("证书 %s 已达%s尝试上限 (%d)，进入 CAPPED 静默，等待人工处理", cert.CertName, cappedPhaseLabel(phase), config.AttemptCap)
+	}
+	s.persistTerminalState(cert, config.IssueStateCapped, phase)
+}
+
+// markExpired 过期静默进入 EXPIRED
+func (s *Service) markExpired(cert *config.CertConfig) {
+	if cert.Metadata.LastIssueState != config.IssueStateExpired {
+		s.log.Error("证书 %s 已过期，静默终止自动续签，仅保留本地日志与人工入口", cert.CertName)
+	}
+	s.persistTerminalState(cert, config.IssueStateExpired, "")
+}
+
+// cappedPhaseLabel 触顶阶段的中文标签
+func cappedPhaseLabel(phase string) string {
+	switch phase {
+	case config.CappedPhaseIssue:
+		return "签发"
+	case config.CappedPhaseDeploy:
+		return "部署"
+	case config.CappedPhaseLegacy:
+		return "旧计数"
+	default:
+		return phase
+	}
 }
 
 // resetIssueStateForResubmit 本轮 local 签发流程失效（pending 私钥丢失等）时重置签发状态，
@@ -520,23 +624,18 @@ func (s *Service) preparePullRenew(ctx context.Context, cert *config.CertConfig,
 
 // prepareLocalRenew 本机提交：生成 CSR 并通过 API 触发续签
 func (s *Service) prepareLocalRenew(ctx context.Context, cert *config.CertConfig, api config.APIConfig) (*fetcher.CertData, string, error) {
-	// 检查重试次数是否超限
-	if cert.Metadata.IssueRetryCount >= MaxIssueRetryCount {
-		s.log.Error("证书 %s 重试次数已达上限 (%d)，等待人工处理", cert.CertName, MaxIssueRetryCount)
-		return nil, "", fmt.Errorf("exceeded max retry count (%d)", MaxIssueRetryCount)
-	}
-
 	workDir := s.cfgManager.GetWorkDir()
 	keyPath := pickKeyPath(cert)
 	if keyPath == "" {
 		return nil, "", fmt.Errorf("missing local private key path")
 	}
 
-	// 上次提交仍在处理中（processing），或已秒签为 active 但尚未部署成功：
+	// 上次提交仍在处理中（processing / pending 归一），或已秒签为 active 但尚未部署成功：
 	// 两者都先查询当前订单状态，据结果读取 pending 私钥复用部署路径，
 	// 避免重新生成 CSR 覆盖与已签发证书配对的 pending 私钥（秒签全失败续跑关键分支）。
-	entryState := cert.Metadata.LastIssueState
-	if entryState == "processing" || entryState == "active" {
+	// pending 归一为 processing：只查询、不重复 POST、不增计数、不重生 CSR（spec 2.6/3.5）。
+	entryState := normalizeIssueState(cert.Metadata.LastIssueState)
+	if entryState == config.IssueStateProcessing || entryState == config.IssueStateActive {
 		// 规范 3.5：证书已过期则停止，等待人工处理
 		// 按时间点判定，避免整数天截断使过期不足 24 小时的证书仍被继续处理
 		if cert.IsExpired() {
@@ -587,22 +686,19 @@ func (s *Service) prepareLocalRenew(ctx context.Context, cert *config.CertConfig
 				}
 				return nil, "", fmt.Errorf("服务端返回的证书与本地私钥不配对（pending 私钥已保留，线上私钥未改动）: %w", err)
 			}
-			// active 自愈（秒签已签发、等待部署）：每次进入即一次部署尝试，递增 issue_retry_count，
-			// 使"证书已签发但全部绑定部署失败"的续跑循环受 MaxIssueRetryCount 约束并最终触顶停机上报，
-			// 而非无限次重试部署已签发证书。计数持久化交由上层 deployCertToBindings 后的 UpdateCert
-			// （部署成功复位为 0、失败保留递增值，与既有路径一致）。
-			// processing 首签路径不在此计数，保持既有语义（其计数在提交 CSR 时已递增）。
-			if entryState == "active" {
-				cert.Metadata.IssueRetryCount++
-			}
+			// active 自愈（秒签已签发、等待部署）：仅返回待部署证书数据，不在此计数。
+			// 部署尝试计数（DeployAttemptCount）由编排层 runDeployAttempt 统一管理，
+			// 与签发计数（IssueRetryCount）分离、互不污染（计划 3.1）；
+			// "证书已签发但全部绑定部署失败"的续跑循环受 MaxDeployAttemptCount 约束并最终触顶停机。
 			return certData, privateKey, nil
 
-		case "processing":
+		case "processing", "pending":
+			// pending 归一 processing：只查询等待，不重复 POST、不增计数、不重生 CSR（spec 2.6/3.5）。
 			// 放置验证文件（如果有新的；全部放置失败按失败处理，避免静默永远 pending）
 			if err := s.applyValidationFiles(cert, certData.File, true); err != nil {
 				return nil, "", err
 			}
-			s.log.Debug("证书 %s CSR 正在处理，跳过", cert.CertName)
+			s.log.Debug("证书 %s 签发处理中 (status=%s)，等待", cert.CertName, certData.Status)
 			return nil, "", nil
 
 		default:
@@ -613,6 +709,13 @@ func (s *Service) prepareLocalRenew(ctx context.Context, cert *config.CertConfig
 			s.log.Error("证书 %s 订单状态异常: %s，等待人工处理", cert.CertName, certData.Status)
 			return nil, "", fmt.Errorf("订单状态异常: %s，等待人工处理", certData.Status)
 		}
+	}
+
+	// 即将提交新 CSR：签发触顶防御检查（编排层前置过滤后仍二次校验，绝无第 11 次提交）。
+	// active/processing 在途分支已在上方处理，不会走到这里。
+	if cert.Metadata.IssueRetryCount >= MaxIssueRetryCount {
+		s.log.Error("证书 %s 签发尝试已达上限 (%d)，不再提交新 CSR，等待人工处理", cert.CertName, MaxIssueRetryCount)
+		return nil, "", fmt.Errorf("exceeded max issue retry count (%d)", MaxIssueRetryCount)
 	}
 
 	// 生成新的私钥与 CSR
@@ -649,11 +752,17 @@ func (s *Service) prepareLocalRenew(ctx context.Context, cert *config.CertConfig
 
 	certData, renewBeforeDaysFromUpdate, err := s.fetcher.Update(ctx, api.URL, api.Token, cert.OrderID, csrPEM, strings.Join(cert.Domains, ","), cert.ValidationMethod)
 	if err != nil {
-		// 提交失败，清理待确认私钥（重试计数已持久化，下次重试会使用）
-		if cleanupErr := cleanupPendingKey(workDir, cert.CertName); cleanupErr != nil {
-			s.log.Warn("清理待确认私钥失败: %v", cleanupErr)
+		// POST 超时 / 断连 / 响应解析失败属"不确定结果"（spec 1.3.1）：保留 pending key，
+		// 归一为 processing——下轮只查询订单状态（不重复 POST、不重新生成 CSR），
+		// 依赖服务端 Order/Action 现有幂等避免重复扣费。计数已在提交前递增，不再重复递增。
+		cert.Metadata.CSRSubmittedAt = time.Now()
+		cert.Metadata.LastCSRHash = csrHash
+		cert.Metadata.LastIssueState = config.IssueStateProcessing
+		if updateErr := s.cfgManager.UpdateCert(cert); updateErr != nil {
+			s.log.Warn("保存证书 %s 提交状态失败: %v", cert.CertName, updateErr)
 		}
-		return nil, "", fmt.Errorf("提交 CSR 失败: %w", err)
+		s.log.Warn("证书 %s 提交 CSR 结果不确定（保留 pending key，下轮查询归一 processing）: %v", cert.CertName, err)
+		return nil, "", nil
 	}
 	s.tryUpdateRenewBeforeDays(renewBeforeDaysFromUpdate)
 
@@ -661,7 +770,8 @@ func (s *Service) prepareLocalRenew(ctx context.Context, cert *config.CertConfig
 
 	cert.Metadata.CSRSubmittedAt = time.Now()
 	cert.Metadata.LastCSRHash = csrHash
-	cert.Metadata.LastIssueState = certData.Status
+	// pending 归一 processing（spec 2.6）
+	cert.Metadata.LastIssueState = normalizeIssueState(certData.Status)
 
 	if certData.Status != "active" || certData.Cert == "" {
 		// 放置验证文件（如果有；全部放置失败按失败处理，但先保存元数据，
@@ -761,11 +871,14 @@ func (s *Service) deployCertToBindings(ctx context.Context, cert *config.CertCon
 		// 部署成功后才将 pending 私钥转正（规范 3.8：部署成功后清理 pending key）。
 		// 部署路径（deployToBinding）已在覆盖前备份各绑定的旧证书与私钥。
 		s.commitPendingKeyAfterDeploy(cert, privateKey)
-		// 成功后清理本地续签状态
+		// 成功后清理本地续签与部署状态（签发计数与部署计数一并清零）
 		cert.Metadata.CSRSubmittedAt = time.Time{}
 		cert.Metadata.LastCSRHash = ""
 		cert.Metadata.LastIssueState = ""
+		cert.Metadata.CappedPhase = ""
 		cert.Metadata.IssueRetryCount = 0
+		cert.Metadata.DeployAttemptCount = 0
+		cert.Metadata.DeployStartedAt = time.Time{}
 	}
 
 	// 清理验证文件：签发已完成（拿到证书）后验证文件用途已尽，

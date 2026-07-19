@@ -12,11 +12,11 @@ import (
 
 // Config 统一配置结构（config.json）
 type Config struct {
-	ReleaseURL    string         `json:"release_url,omitempty"`
-	UpgradeChannel string        `json:"upgrade_channel,omitempty"` // 升级通道: main/dev，空值跟随当前版本号自动判断
-	Schedule      ScheduleConfig `json:"schedule"`
-	Certificates  []CertConfig   `json:"certificates"`
-	Metadata      ConfigMetadata `json:"metadata,omitempty"`
+	ReleaseURL     string         `json:"release_url,omitempty"`
+	UpgradeChannel string         `json:"upgrade_channel,omitempty"` // 升级通道: main/dev，空值跟随当前版本号自动判断
+	Schedule       ScheduleConfig `json:"schedule"`
+	Certificates   []CertConfig   `json:"certificates"`
+	Metadata       ConfigMetadata `json:"metadata,omitempty"`
 }
 
 // ConfigMetadata 配置元数据
@@ -28,14 +28,14 @@ type ConfigMetadata struct {
 
 // CertConfig 证书配置
 type CertConfig struct {
-	CertName         string        `json:"cert_name"`                    // 证书名称（如 example.com-12345）
-	OrderID          int           `json:"order_id"`                     // 订单 ID
-	Enabled          bool          `json:"enabled"`                      // 是否启用
-	Domains          []string      `json:"domains"`                      // 证书域名列表
-	RenewMode        string        `json:"renew_mode,omitempty"`         // 续签模式: local | pull（优先于全局配置）
-	ValidationMethod string        `json:"validation_method,omitempty"`  // 验证方法: file | delegation
-	API              APIConfig     `json:"api"`                          // 证书级别的 API 配置
-	Bindings         []SiteBinding `json:"bindings"`                     // 站点绑定
+	CertName         string        `json:"cert_name"`                   // 证书名称（如 example.com-12345）
+	OrderID          int           `json:"order_id"`                    // 订单 ID
+	Enabled          bool          `json:"enabled"`                     // 是否启用
+	Domains          []string      `json:"domains"`                     // 证书域名列表
+	RenewMode        string        `json:"renew_mode,omitempty"`        // 续签模式: local | pull（优先于全局配置）
+	ValidationMethod string        `json:"validation_method,omitempty"` // 验证方法: file | delegation
+	API              APIConfig     `json:"api"`                         // 证书级别的 API 配置
+	Bindings         []SiteBinding `json:"bindings"`                    // 站点绑定
 	Metadata         CertMetadata  `json:"metadata,omitempty"`
 }
 
@@ -72,10 +72,20 @@ type CertMetadata struct {
 	CertExpiresAt time.Time `json:"cert_expires_at,omitempty"`
 	CertSerial    string    `json:"cert_serial,omitempty"`
 	// 本地私钥续签的状态信息
-	CSRSubmittedAt  time.Time `json:"csr_submitted_at,omitempty"`
-	LastCSRHash     string    `json:"last_csr_hash,omitempty"`
-	LastIssueState  string    `json:"last_issue_state,omitempty"`
-	IssueRetryCount int       `json:"issue_retry_count,omitempty"`
+	CSRSubmittedAt time.Time `json:"csr_submitted_at,omitempty"`
+	LastCSRHash    string    `json:"last_csr_hash,omitempty"`
+	// LastIssueState 签发/生命周期状态：
+	// "" / processing / CAPPED（触顶静默）/ EXPIRED（已过期静默）/ policy_blocked_needs_setup（非法 IP 配置）/ active（秒签待部署）/ 其他异常
+	LastIssueState string `json:"last_issue_state,omitempty"`
+	// IssueRetryCount 签发尝试计数（CSR 提交），>= 10 触顶
+	IssueRetryCount int `json:"issue_retry_count,omitempty"`
+	// DeployAttemptCount 部署尝试计数，>= 10 触顶；与签发计数分离，不从旧混合计数推断
+	DeployAttemptCount int `json:"deploy_attempt_count,omitempty"`
+	// DeployStartedAt 部署尝试崩溃安全标记：置位表示已持久化一个部署意图但结果未落盘，
+	// 重启时据此复验并重放同一尝试，不再重复递增 DeployAttemptCount（deploy-spec §5.1）
+	DeployStartedAt time.Time `json:"deploy_started_at,omitempty"`
+	// CappedPhase 触顶阶段：issue / deploy / legacy（仅 LastIssueState==CAPPED 时有意义）
+	CappedPhase string `json:"capped_phase,omitempty"`
 	// 部署失败的绑定列表（ServerName），下次检查时重试
 	FailedBindings   []string  `json:"failed_bindings,omitempty"`
 	FailedBindingsAt time.Time `json:"failed_bindings_at,omitempty"` // 首次记录失败绑定的时间
@@ -128,6 +138,7 @@ func IsDockerType(serverType string) bool {
 //   - 存在容器重载命令（能确定容器名），否则部署后无法在容器内生效；
 //   - 待写的证书与私钥路径均非空（卷模式下应为扫描解析出的宿主机路径）。
 //     路径为空意味着宿主机映射解析失败，写入会落到错误位置或失败，须计为失败而非静默"成功"。
+//
 // 不满足时返回错误，调用方应中止并如实计为失败，而非静默"部署成功"。
 // 非 Docker 类型返回 nil。
 func ValidateDockerBinding(binding *SiteBinding) error {
@@ -194,6 +205,22 @@ func (c *CertConfig) GetRenewMode(schedule *ScheduleConfig) string {
 		return schedule.RenewMode
 	}
 	return RenewModePull
+}
+
+// IsIllegalIPConfig 判断是否为非法 IP 证书配置（deploy-spec §5.2）。
+// SAN 含 IP 的证书必须 local + file；若为 pull 模式或 delegation 验证即非法，
+// 应进入 policy_blocked_needs_setup 等待重新 setup（不自动改配置、不计数、不回调）。
+func (c *CertConfig) IsIllegalIPConfig(schedule *ScheduleConfig) bool {
+	if !ContainsIPDomain(c.Domains) {
+		return false
+	}
+	if c.GetRenewMode(schedule) != RenewModeLocal {
+		return true // IP + pull
+	}
+	if c.ValidationMethod == ValidationMethodDelegation {
+		return true // IP + delegation
+	}
+	return false
 }
 
 // NeedsRenewal 判断是否需要续期

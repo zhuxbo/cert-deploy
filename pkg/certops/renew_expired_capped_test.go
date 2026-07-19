@@ -1,4 +1,4 @@
-// Package certops 过期且触顶证书可见性测试
+// Package certops 过期/触顶证书静默测试
 package certops
 
 import (
@@ -13,10 +13,10 @@ import (
 	"github.com/zhuxbo/sslctl/pkg/logger"
 )
 
-// TestCheckAndRenewAll_ExpiredAndCappedVisible 验证"既过期又触顶"的证书不再静默跳过：
-// 应记 Error 日志、上报 failure 回调（message 说明过期+超限）、并计入本轮统计，
-// 与"临期触顶"路径的可见性对齐（原实现对该证书静默 return，三者皆缺）。
-func TestCheckAndRenewAll_ExpiredAndCappedVisible(t *testing.T) {
+// TestCheckAndRenewAll_ExpiredSilentNoCallback 验证已过期证书静默终止（计划 1.1/spec 3.2）：
+// 转 EXPIRED、仅留本地日志、不发起查询、不上报任何回调、不产生续签结果。
+// "既过期又触顶"时过期优先（转 EXPIRED 而非 CAPPED），语义与单纯过期一致。
+func TestCheckAndRenewAll_ExpiredSilentNoCallback(t *testing.T) {
 	logDir := t.TempDir()
 	log, err := logger.New(logDir, "test")
 	if err != nil {
@@ -43,7 +43,7 @@ func TestCheckAndRenewAll_ExpiredAndCappedVisible(t *testing.T) {
 		API:       config.APIConfig{URL: server.URL, Token: "test-token"},
 		Metadata: config.CertMetadata{
 			CertExpiresAt:   time.Now().Add(-48 * time.Hour), // 已过期
-			IssueRetryCount: MaxIssueRetryCount,              // 已触顶
+			IssueRetryCount: MaxIssueRetryCount,              // 已触顶（过期优先转 EXPIRED）
 		},
 	}
 	if err := cm.AddCert(cert); err != nil {
@@ -56,29 +56,31 @@ func TestCheckAndRenewAll_ExpiredAndCappedVisible(t *testing.T) {
 	}
 	_ = log.Close()
 
-	// 1. 计入本轮统计（failure），而非静默消失
-	if len(results) != 1 || results[0].Status != "failure" {
-		t.Fatalf("过期且触顶证书应产生 failure 结果: %+v", results)
+	// 1. 静默：不产生续签结果
+	if len(results) != 0 {
+		t.Fatalf("过期证书应静默跳过，不产生结果: %+v", results)
 	}
 
-	// 2. failure 回调（mock）：仅一次，携带过期原因 message
-	cbs := rec.recorded()
-	if len(cbs) != 1 {
-		t.Fatalf("应上报 1 次 failure 回调，实际 %d", len(cbs))
-	}
-	if cbs[0].Status != "failure" || cbs[0].OrderID != 800 {
-		t.Errorf("回调应为 failure: %+v", cbs[0])
-	}
-	if !strings.Contains(cbs[0].Message, "过期") {
-		t.Errorf("回调 message 应说明证书已过期: %q", cbs[0].Message)
+	// 2. 不上报任何回调
+	if cbs := rec.recorded(); len(cbs) != 0 {
+		t.Fatalf("过期证书不应上报回调，实际 %d 次: %+v", len(cbs), cbs)
 	}
 
-	// 3. Error 日志：包含证书名与"已过期"字样
+	// 3. 落盘 EXPIRED 状态（过期优先于触顶）
+	updated, gerr := cm.GetCert("dead.example.com-800")
+	if gerr != nil {
+		t.Fatalf("获取证书失败: %v", gerr)
+	}
+	if updated.Metadata.LastIssueState != config.IssueStateExpired {
+		t.Errorf("应转 EXPIRED，实际 %q", updated.Metadata.LastIssueState)
+	}
+
+	// 4. 本地 Error 日志可见（管理端/日志可见性，替代回调）
 	logData, rerr := os.ReadFile(filepath.Join(logDir, "test-"+time.Now().Format("2006-01-02")+".log"))
 	if rerr != nil {
 		t.Fatalf("读取日志失败: %v", rerr)
 	}
 	if !strings.Contains(string(logData), "已过期") || !strings.Contains(string(logData), "dead.example.com-800") {
-		t.Errorf("应记录过期且触顶的 Error 日志，实际日志:\n%s", string(logData))
+		t.Errorf("应记录过期 Error 日志，实际日志:\n%s", string(logData))
 	}
 }

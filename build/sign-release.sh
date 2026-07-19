@@ -54,7 +54,7 @@ if [[ ! "$KEY_ID" =~ ^[0-9A-Za-z._-]+$ ]]; then
 fi
 if [[ -n "$OUTPUT" ]]; then
     [[ -f "$KEY_FILE" ]] || { echo "错误: 签名私钥不存在: $KEY_FILE" >&2; exit 1; }
-    perms="$(stat -f '%Lp' "$KEY_FILE" 2>/dev/null || stat -c '%a' "$KEY_FILE" 2>/dev/null || true)"
+    perms="$(stat -c '%a' "$KEY_FILE" 2>/dev/null || stat -f '%Lp' "$KEY_FILE" 2>/dev/null || true)"
     if [[ "$perms" != "600" ]]; then
         echo "错误: 签名私钥权限必须是 600，当前为 ${perms:-未知}" >&2
         exit 1

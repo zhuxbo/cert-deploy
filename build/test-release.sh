@@ -18,7 +18,7 @@ printf 'windows-amd64\n' >"$assets/sslctl-windows-amd64.exe.gz"
 key_dir="$TEST_DIR/keys"
 bash "$SCRIPT_DIR/generate-keys.sh" "$key_dir" test-key >/dev/null
 key="$key_dir/release-key.pem"
-[[ "$(stat -f '%Lp' "$key" 2>/dev/null || stat -c '%a' "$key")" == "600" ]]
+[[ "$(stat -c '%a' "$key" 2>/dev/null || stat -f '%Lp' "$key")" == "600" ]]
 if bash "$SCRIPT_DIR/generate-keys.sh" "$key_dir" replacement-key >/dev/null 2>&1; then
     echo "密钥生成脚本覆盖了已有密钥" >&2
     exit 1

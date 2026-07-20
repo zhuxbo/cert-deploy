@@ -2,8 +2,10 @@
 package deploy
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/zhuxbo/sslctl/pkg/backup"
@@ -11,6 +13,28 @@ import (
 	"github.com/zhuxbo/sslctl/pkg/fetcher"
 	"github.com/zhuxbo/sslctl/testdata/certs"
 )
+
+func TestDeployAllCerts_ReturnsErrorWhenAnyCertFails(t *testing.T) {
+	certs := []config.CertConfig{{CertName: "success"}, {CertName: "failure"}}
+	called := make([]string, 0, len(certs))
+
+	err := deployAllCerts(certs, func(cert *config.CertConfig) error {
+		called = append(called, cert.CertName)
+		if cert.CertName == "failure" {
+			return errors.New("deploy failed")
+		}
+		return nil
+	})
+	if err == nil {
+		t.Fatal("任一证书部署失败时应返回错误")
+	}
+	if strings.Join(called, ",") != "success,failure" {
+		t.Fatalf("应继续尝试全部证书，called = %v", called)
+	}
+	if !strings.Contains(err.Error(), "failure") {
+		t.Fatalf("错误应包含失败证书名称，got %v", err)
+	}
+}
 
 // TestDeployToBinding_Nginx 测试 Nginx 部署
 func TestDeployToBinding_Nginx(t *testing.T) {
@@ -173,8 +197,9 @@ func TestDeployToBinding_CreateDirectory(t *testing.T) {
 	}
 }
 
-// TestDeployToBinding_DockerNginx 测试 Docker Nginx 部署
-func TestDeployToBinding_DockerNginx(t *testing.T) {
+// TestDeployToBinding_DockerNginx_RejectsUnsafe 验证非挂载卷 Docker Nginx 绑定被拒绝，
+// 不再静默写到宿主机错误位置并"报成功"。
+func TestDeployToBinding_DockerNginx_RejectsUnsafe(t *testing.T) {
 	tmpDir := t.TempDir()
 	certPath := filepath.Join(tmpDir, "cert.pem")
 	keyPath := filepath.Join(tmpDir, "key.pem")
@@ -191,23 +216,19 @@ func TestDeployToBinding_DockerNginx(t *testing.T) {
 		},
 	}
 
-	certData := &fetcher.CertData{
-		Cert: testCert.CertPEM,
-	}
+	certData := &fetcher.CertData{Cert: testCert.CertPEM}
 
 	err := deployToBinding(binding, certData, testCert.KeyPEM, backup.NewManager(t.TempDir(), 5), nil)
-	if err != nil {
-		t.Fatalf("deployToBinding() error = %v", err)
+	if err == nil {
+		t.Fatal("非挂载卷 Docker 绑定应被拒绝部署")
 	}
-
-	// 验证文件已创建
-	if _, err := os.Stat(certPath); os.IsNotExist(err) {
-		t.Error("证书文件未创建")
+	if _, statErr := os.Stat(certPath); statErr == nil {
+		t.Error("被拒绝的 Docker 部署不应写出证书文件")
 	}
 }
 
-// TestDeployToBinding_DockerApache 测试 Docker Apache 部署
-func TestDeployToBinding_DockerApache(t *testing.T) {
+// TestDeployToBinding_DockerApache_RejectsUnsafe 同上，针对 Docker Apache。
+func TestDeployToBinding_DockerApache_RejectsUnsafe(t *testing.T) {
 	tmpDir := t.TempDir()
 	certPath := filepath.Join(tmpDir, "cert.pem")
 	keyPath := filepath.Join(tmpDir, "key.pem")
@@ -224,17 +245,60 @@ func TestDeployToBinding_DockerApache(t *testing.T) {
 		},
 	}
 
-	certData := &fetcher.CertData{
-		Cert: testCert.CertPEM,
-	}
+	certData := &fetcher.CertData{Cert: testCert.CertPEM}
 
 	err := deployToBinding(binding, certData, testCert.KeyPEM, backup.NewManager(t.TempDir(), 5), nil)
+	if err == nil {
+		t.Fatal("非挂载卷 Docker 绑定应被拒绝部署")
+	}
+	if _, statErr := os.Stat(certPath); statErr == nil {
+		t.Error("被拒绝的 Docker 部署不应写出证书文件")
+	}
+}
+
+func TestDeployToBindings_ReturnsErrorWhenAnyBindingFails(t *testing.T) {
+	tmpDir := t.TempDir()
+	testCert, err := certs.GenerateValidCert("example.com", nil)
 	if err != nil {
-		t.Fatalf("deployToBinding() error = %v", err)
+		t.Fatalf("生成测试证书失败: %v", err)
 	}
 
-	if _, err := os.Stat(certPath); os.IsNotExist(err) {
-		t.Error("证书文件未创建")
+	bindings := []config.SiteBinding{
+		{
+			ServerName: "success.example.com",
+			ServerType: config.ServerTypeNginx,
+			Enabled:    true,
+			Paths: config.BindingPaths{
+				Certificate: filepath.Join(tmpDir, "success", "cert.pem"),
+				PrivateKey:  filepath.Join(tmpDir, "success", "key.pem"),
+			},
+		},
+		{
+			ServerName: "failed.example.com",
+			ServerType: config.ServerTypeDockerNginx,
+			Enabled:    true,
+			Paths: config.BindingPaths{
+				Certificate: filepath.Join(tmpDir, "failed", "cert.pem"),
+				PrivateKey:  filepath.Join(tmpDir, "failed", "key.pem"),
+			},
+		},
+	}
+
+	successCount, err := deployToBindings(
+		bindings,
+		&fetcher.CertData{Cert: testCert.CertPEM},
+		testCert.KeyPEM,
+		backup.NewManager(t.TempDir(), 5),
+		nil,
+	)
+	if err == nil {
+		t.Fatal("部分绑定失败时应返回错误")
+	}
+	if successCount != 1 {
+		t.Fatalf("successCount = %d, want 1", successCount)
+	}
+	if !strings.Contains(err.Error(), "failed.example.com") {
+		t.Fatalf("错误应包含失败站点，got %v", err)
 	}
 }
 
@@ -367,11 +431,22 @@ func TestBuildBindingFromScanResult(t *testing.T) {
 				t.Error("Docker info should be nil for local site")
 			}
 
-			// Docker 站点不应设置 Reload 命令（由 Docker deployer 内部处理）
+			// Docker 站点应设置容器化 test/reload 命令（docker exec <容器> ...）
 			if tt.wantDocker {
-				if binding.Reload.TestCommand != "" || binding.Reload.ReloadCommand != "" {
-					t.Errorf("Docker 站点不应设置 Reload 命令, got test=%s reload=%s",
-						binding.Reload.TestCommand, binding.Reload.ReloadCommand)
+				wantPrefix := "docker exec " + tt.site.ContainerName + " "
+				if !strings.HasPrefix(binding.Reload.TestCommand, wantPrefix) {
+					t.Errorf("Docker 站点应设置容器化 test 命令, got %q", binding.Reload.TestCommand)
+				}
+				if !strings.HasPrefix(binding.Reload.ReloadCommand, wantPrefix) {
+					t.Errorf("Docker 站点应设置容器化 reload 命令, got %q", binding.Reload.ReloadCommand)
+				}
+				// 挂载卷且已解析宿主机路径 → volume；否则 copy
+				wantMode := "copy"
+				if tt.site.VolumeMode && tt.site.HostCertPath != "" {
+					wantMode = "volume"
+				}
+				if binding.Docker.DeployMode != wantMode {
+					t.Errorf("DeployMode = %s, want %s", binding.Docker.DeployMode, wantMode)
 				}
 			}
 

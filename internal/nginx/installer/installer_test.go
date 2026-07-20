@@ -240,6 +240,269 @@ server {
 	}
 }
 
+// TestAddSSLConfig_RootInLocation 验证 root 写在 location 块内时（SPA / 前后端分离 / 反代的常见配置），
+// SSL 证书指令必须插入 server 块顶层，而非 location 块内。
+// 回归：root 在 location 内会让 ssl_certificate 被插进 location 块，nginx 报 "ssl_certificate directive is not allowed here"。
+func TestAddSSLConfig_RootInLocation(t *testing.T) {
+	content := `map $http_upgrade $connection_upgrade {
+    default upgrade;
+    '' close;
+}
+
+server {
+    listen 80;
+    server_name 1.14.125.7;
+
+    client_max_body_size 50m;
+
+    location / {
+        root /opt/jixun-im/frontend/dist;
+        index index.html;
+        try_files $uri $uri/ /index.html;
+    }
+
+    location /api/ {
+        proxy_pass http://127.0.0.1:8080;
+    }
+}`
+
+	installer := NewNginxInstaller(
+		"",
+		"/opt/sslctl/certs/cert.pem",
+		"/opt/sslctl/certs/key.pem",
+		"1.14.125.7",
+		"",
+	)
+
+	result, err := installer.addSSLConfig(content)
+	if err != nil {
+		t.Fatalf("addSSLConfig() error = %v", err)
+	}
+
+	// 必须确实插入了 SSL（存在 listen 80）
+	if !strings.Contains(result, "ssl_certificate ") {
+		t.Fatalf("结果应包含 ssl_certificate 指令\n%s", result)
+	}
+
+	// ssl_certificate 必须位于 server 块顶层（花括号深度 1），不能落入 location 块（深度 ≥ 2）
+	if depth := sslCertBraceDepth(result); depth != 1 {
+		t.Errorf("ssl_certificate 应在 server 顶层（深度 1），实际深度 %d，会触发 nginx \"not allowed here\"\n%s", depth, result)
+	}
+}
+
+// sslCertBraceDepth 返回首个 ssl_certificate 指令所在的花括号嵌套深度（server 顶层为 1，location 内为 2）
+func sslCertBraceDepth(config string) int {
+	depth := 0
+	for _, line := range strings.Split(config, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "ssl_certificate ") {
+			return depth
+		}
+		depth += strings.Count(line, "{") - strings.Count(line, "}")
+	}
+	return -1
+}
+
+// TestAddSSLConfig_CommentWithUnbalancedBrace 验证配置注释中含未配对花括号时，
+// 不影响 server 块边界判断，SSL 指令仍正确插入 server 块顶层。
+// 回归：addSSLConfig 曾把注释里的 { / } 计入 braceCount，导致 server 块边界错乱
+// （注释多一个 { 会让块结束永不触发，SSL 完全插不进去）。
+func TestAddSSLConfig_CommentWithUnbalancedBrace(t *testing.T) {
+	content := `server {
+    listen 80;
+    server_name example.com;
+    root /var/www/html;
+    # 旧配置 location /old {
+    location / {
+        try_files $uri $uri/ =404;
+    }
+}`
+
+	installer := NewNginxInstaller(
+		"",
+		"/etc/ssl/cert.crt",
+		"/etc/ssl/key.key",
+		"example.com",
+		"",
+	)
+
+	result, err := installer.addSSLConfig(content)
+	if err != nil {
+		t.Fatalf("addSSLConfig() error = %v", err)
+	}
+
+	// 注释中的未配对花括号不应阻止 SSL 安装
+	if !strings.Contains(result, "ssl_certificate ") {
+		t.Fatalf("结果应包含 ssl_certificate 指令（注释中的花括号不应影响块解析）\n%s", result)
+	}
+	// 注释行必须被原样保留（不能因跳过解析而丢失输出）
+	if !strings.Contains(result, "# 旧配置 location /old {") {
+		t.Errorf("注释行应被保留\n%s", result)
+	}
+	// ssl_certificate 必须在 server 块顶层（深度 1）
+	if depth := sslCertBraceDepth(result); depth != 1 {
+		t.Errorf("ssl_certificate 应在 server 顶层（深度 1），实际深度 %d\n%s", depth, result)
+	}
+}
+
+// TestAddSSLConfig_MultipleServerBlocksOnlyTargetInjected 验证同文件多个 :80 server 块
+// （不同域名共存一个 conf）时，仅目标 server_name 的块被注入证书，其余块保持不变。
+func TestAddSSLConfig_MultipleServerBlocksOnlyTargetInjected(t *testing.T) {
+	content := `server {
+    listen 80;
+    server_name a.com www.a.com;
+    root /var/www/a;
+}
+
+server {
+    listen 80;
+    server_name b.com;
+    root /var/www/b;
+}`
+
+	installer := NewNginxInstaller(
+		"",
+		"/opt/sslctl/certs/a.com/cert.pem",
+		"/opt/sslctl/certs/a.com/key.pem",
+		"a.com",
+		"",
+	)
+
+	result, err := installer.addSSLConfig(content)
+	if err != nil {
+		t.Fatalf("addSSLConfig() error = %v", err)
+	}
+
+	// 目标块（a.com）应被注入证书
+	if !strings.Contains(result, "ssl_certificate /opt/sslctl/certs/a.com/cert.pem;") {
+		t.Fatalf("目标块 a.com 应被注入证书\n%s", result)
+	}
+	// 全文只应出现一次 ssl_certificate（b.com 块不应被注入）
+	if n := strings.Count(result, "ssl_certificate "); n != 1 {
+		t.Errorf("应仅注入目标块一次 ssl_certificate，实际 %d 次\n%s", n, result)
+	}
+	// 只应新增一条 listen 443 ssl（b.com 块不应新增）
+	if n := strings.Count(result, "listen 443 ssl;"); n != 1 {
+		t.Errorf("应仅目标块新增一条 listen 443 ssl，实际 %d 次\n%s", n, result)
+	}
+	// b.com 块必须原样保留，不得含证书路径
+	if strings.Contains(result, "certs/a.com") && strings.Count(result, "certs/a.com") != 2 {
+		// cert + key 两行，恰好 2 次
+		t.Errorf("目标块应恰好含 cert+key 两行 a.com 路径，实际 %d\n%s", strings.Count(result, "certs/a.com"), result)
+	}
+}
+
+// TestAddSSLConfig_WildcardServerNameMatches 验证目标域名命中块内通配符 server_name。
+func TestAddSSLConfig_WildcardServerNameMatches(t *testing.T) {
+	content := `server {
+    listen 80;
+    server_name *.example.com;
+    root /var/www/html;
+}`
+
+	installer := NewNginxInstaller(
+		"",
+		"/etc/ssl/cert.crt",
+		"/etc/ssl/key.key",
+		"www.example.com",
+		"",
+	)
+
+	result, err := installer.addSSLConfig(content)
+	if err != nil {
+		t.Fatalf("addSSLConfig() error = %v", err)
+	}
+	if !strings.Contains(result, "ssl_certificate ") {
+		t.Errorf("目标域名应命中通配符 server_name 并被注入\n%s", result)
+	}
+}
+
+// TestAddSSLConfig_NoServerNameMatch_NotInjected 验证无匹配 server_name 的块不被注入，
+// addSSLConfig 返回原文（Install 层据此返回明确错误）。
+func TestAddSSLConfig_NoServerNameMatch_NotInjected(t *testing.T) {
+	content := `server {
+    listen 80;
+    server_name other.com;
+    root /var/www/html;
+}`
+
+	installer := NewNginxInstaller(
+		"",
+		"/etc/ssl/cert.crt",
+		"/etc/ssl/key.key",
+		"target.com",
+		"",
+	)
+
+	result, err := installer.addSSLConfig(content)
+	if err != nil {
+		t.Fatalf("addSSLConfig() error = %v", err)
+	}
+	if result != content {
+		t.Errorf("server_name 不匹配时不应注入，应返回原文\n%s", result)
+	}
+}
+
+// TestHasSSLConfig_WildcardBlockDetected 验证 hasSSLConfig 与注入逻辑共用同一匹配谓词：
+// 通配符块（*.example.com）已配 SSL 时，目标 www.example.com 应判定"已配置"
+// （原精确比较 *.example.com != www.example.com 漏检）。
+func TestHasSSLConfig_WildcardBlockDetected(t *testing.T) {
+	content := `server {
+    listen 80;
+    listen 443 ssl;
+    server_name *.example.com;
+    ssl_certificate /etc/ssl/wild.crt;
+    ssl_certificate_key /etc/ssl/wild.key;
+    root /var/www/html;
+}`
+
+	installer := NewNginxInstaller("", "/etc/ssl/cert.crt", "/etc/ssl/key.key", "www.example.com", "")
+	if !installer.hasSSLConfig(content) {
+		t.Error("通配符块已配 SSL 且匹配目标域名时应判定已配置（与注入谓词一致）")
+	}
+}
+
+// TestAddSSLConfig_SkipsBlockWithExistingSSL 复现审核场景：目标块（精确名）无 SSL +
+// 通配符块已有 SSL 且含 listen 80。注入必须跳过已配 SSL 的块，
+// 否则二次注入 listen 443 ssl 产生 duplicate listen，配置测试失败回滚。
+func TestAddSSLConfig_SkipsBlockWithExistingSSL(t *testing.T) {
+	content := `server {
+    listen 80;
+    server_name www.example.com;
+    root /var/www/www;
+}
+
+server {
+    listen 80;
+    listen 443 ssl;
+    server_name *.example.com;
+    ssl_certificate /etc/ssl/wild.crt;
+    ssl_certificate_key /etc/ssl/wild.key;
+    root /var/www/wild;
+}`
+
+	installer := NewNginxInstaller("", "/etc/ssl/new.crt", "/etc/ssl/new.key", "www.example.com", "")
+	result, err := installer.addSSLConfig(content)
+	if err != nil {
+		t.Fatalf("addSSLConfig() error = %v", err)
+	}
+
+	// 目标块（无 SSL）应被注入
+	if !strings.Contains(result, "ssl_certificate /etc/ssl/new.crt;") {
+		t.Fatalf("目标块应被注入新证书\n%s", result)
+	}
+	// 已配 SSL 的通配符块不得二次注入：全文 listen 443 ssl 应恰好 2 条（原有 1 + 新注入 1）
+	if n := strings.Count(result, "listen 443 ssl;"); n != 2 {
+		t.Errorf("已配 SSL 的块不应二次注入 listen 443（duplicate listen），期望 2 条实际 %d\n%s", n, result)
+	}
+	// 通配符块的原证书不应被改动，且新证书只注入一次
+	if !strings.Contains(result, "ssl_certificate /etc/ssl/wild.crt;") {
+		t.Errorf("通配符块原有 SSL 配置应保持\n%s", result)
+	}
+	if n := strings.Count(result, "ssl_certificate /etc/ssl/new.crt;"); n != 1 {
+		t.Errorf("新证书应只注入目标块一次，实际 %d\n%s", n, result)
+	}
+}
+
 // TestGetIndent 测试缩进检测
 func TestGetIndent(t *testing.T) {
 	tests := []struct {
@@ -275,7 +538,7 @@ func TestGetIndent(t *testing.T) {
 		{
 			name: "纯空白行",
 			line: "    ",
-			want: "",  // getIndent 遍历到非空白字符时返回，纯空白行返回空
+			want: "", // getIndent 遍历到非空白字符时返回，纯空白行返回空
 		},
 	}
 
@@ -523,9 +786,9 @@ include ` + includedPath + `;
 // TestAddSSLConfig_Listen80Variations 测试各种 listen 80 变体
 func TestAddSSLConfig_Listen80Variations(t *testing.T) {
 	tests := []struct {
-		name       string
-		listen     string
-		shouldAdd  bool
+		name      string
+		listen    string
+		shouldAdd bool
 	}{
 		{"标准 listen 80", "listen 80;", true},
 		{"带默认服务器", "listen 80 default_server;", true},
@@ -611,6 +874,138 @@ server {
 
 	if result.Modified {
 		t.Error("已有 SSL 配置时不应修改")
+	}
+}
+
+// TestInstall_TargetInjectedDespiteWildcardSSLBlock 回归：hasSSLConfig 谓词放宽为通配符后，
+// Install 的全局短路会被"通配符块已配 SSL（无 listen 80）"命中，静默跳过仍可注入的目标块
+// （证书写到无人引用的默认路径并误报成功）。修复为先注入后判定：目标块应被注入且 Modified=true。
+func TestInstall_TargetInjectedDespiteWildcardSSLBlock(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "test.conf")
+
+	content := `server {
+    listen 80;
+    server_name www.example.com;
+    root /var/www/www;
+}
+
+server {
+    listen 443 ssl;
+    server_name *.example.com;
+    ssl_certificate /etc/ssl/wild.crt;
+    ssl_certificate_key /etc/ssl/wild.key;
+    root /var/www/wild;
+}`
+	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
+		t.Fatalf("创建配置文件失败: %v", err)
+	}
+
+	installer := NewNginxInstaller(
+		configPath,
+		"/etc/ssl/new-cert.crt",
+		"/etc/ssl/new-key.key",
+		"www.example.com",
+		"", // 不执行配置测试
+	)
+
+	result, err := installer.Install()
+	if err != nil {
+		t.Fatalf("Install() error = %v", err)
+	}
+	if !result.Modified {
+		t.Fatal("目标块（listen 80 无 SSL）应被注入，Modified 应为 true（通配符 SSL 块不应导致全局短路）")
+	}
+
+	written, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("读取配置失败: %v", err)
+	}
+	got := string(written)
+	// 目标块被注入新证书
+	if !strings.Contains(got, "ssl_certificate /etc/ssl/new-cert.crt;") {
+		t.Errorf("目标块应被注入新证书\n%s", got)
+	}
+	// 通配符块原 SSL 配置不动，新证书只注入一次
+	if !strings.Contains(got, "ssl_certificate /etc/ssl/wild.crt;") {
+		t.Errorf("通配符块原有 SSL 配置应保持\n%s", got)
+	}
+	if n := strings.Count(got, "ssl_certificate /etc/ssl/new-cert.crt;"); n != 1 {
+		t.Errorf("新证书应只注入一次，实际 %d\n%s", n, got)
+	}
+	// 全文 listen 443 ssl 应恰好 2 条（通配符块原有 1 + 目标块新增 1）
+	if n := strings.Count(got, "listen 443 ssl;"); n != 2 {
+		t.Errorf("listen 443 ssl 期望 2 条，实际 %d\n%s", n, got)
+	}
+}
+
+// TestInstall_TargetAlreadySSL_NotModified 回归：目标站点自身已配 SSL 时
+// Install 返回 Modified=false 且不报错（先注入后判定不改变该语义）。
+func TestInstall_TargetAlreadySSL_NotModified(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "test.conf")
+
+	content := `server {
+    listen 80;
+    listen 443 ssl;
+    server_name www.example.com;
+    ssl_certificate /etc/ssl/existing.crt;
+    ssl_certificate_key /etc/ssl/existing.key;
+    root /var/www/www;
+}`
+	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
+		t.Fatalf("创建配置文件失败: %v", err)
+	}
+
+	installer := NewNginxInstaller(configPath, "/etc/ssl/new.crt", "/etc/ssl/new.key", "www.example.com", "")
+
+	result, err := installer.Install()
+	if err != nil {
+		t.Fatalf("目标已有 SSL 时不应报错: %v", err)
+	}
+	if result.Modified {
+		t.Error("目标已有 SSL 时 Modified 应为 false")
+	}
+	// 配置不应被改动
+	written, _ := os.ReadFile(configPath)
+	if string(written) != content {
+		t.Error("目标已有 SSL 时配置文件不应被改动")
+	}
+}
+
+// TestInstall_NoListen80_ReturnsError 验证站点没有 listen 80（如非标准端口）时，
+// Install 返回明确错误，而非静默 Modified=false。
+// 否则 setup/deploy 会以为"无需安装"继续部署证书并误报成功，但 HTTPS 实际未生效。
+func TestInstall_NoListen80_ReturnsError(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "test.conf")
+
+	content := `
+server {
+    listen 8080;
+    server_name example.com;
+    root /var/www/html;
+}`
+	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
+		t.Fatalf("创建配置文件失败: %v", err)
+	}
+
+	installer := NewNginxInstaller(
+		configPath,
+		"/etc/ssl/cert.crt",
+		"/etc/ssl/key.key",
+		"example.com",
+		"",
+	)
+
+	result, err := installer.Install()
+	if err == nil {
+		t.Fatalf("非 80 端口站点应返回错误，实际 result=%+v, err=nil", result)
+	}
+
+	// 未实际安装时不应残留备份文件
+	if baks, _ := filepath.Glob(filepath.Join(tmpDir, "*.bak")); len(baks) > 0 {
+		t.Errorf("未安装时不应残留备份文件，实际残留: %v", baks)
 	}
 }
 

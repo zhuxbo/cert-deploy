@@ -10,9 +10,9 @@ type migrateAction int
 
 const (
 	actionRename migrateAction = iota + 1 // 重命名字段（path 下 field→target）
-	actionDelete                           // 删除字段（path 下的 field）
-	actionMove                             // 扁平字段移入子对象（path 下 field→target 子对象的同名键，不覆盖已有值）
-	actionSpread                           // 顶层字段分发到数组元素（合并语义，不覆盖已有值）
+	actionDelete                          // 删除字段（path 下的 field）
+	actionMove                            // 扁平字段移入子对象（path 下 field→target 子对象的同名键，不覆盖已有值）
+	actionSpread                          // 顶层字段分发到数组元素（合并语义，不覆盖已有值）
 )
 
 // migrateRule 声明式迁移规则
@@ -45,6 +45,11 @@ func migrateConfig(data []byte) ([]byte, bool, error) {
 		if applyRule(raw, rule) {
 			changed = true
 		}
+	}
+
+	// 证书生命周期状态迁移（deploy-spec §3.4）
+	if normalizeCertLifecycle(raw) {
+		changed = true
 	}
 
 	// 递归补齐默认值
@@ -179,6 +184,107 @@ func applySpread(root map[string]interface{}, sourceKey, targetPath string) bool
 
 	delete(root, sourceKey)
 	return true
+}
+
+// normalizeCertLifecycle 迁移证书生命周期状态（deploy-spec §3.4，均幂等）：
+//   - 旧非法 IP 配置（IP+pull 或 IP+delegation）→ policy_blocked_needs_setup（不自动改配置、不计数、不回调）
+//   - 旧计数 >= 10 → CAPPED(legacy)，升级即静默，不补发历史事件
+//   - 旧 pending / approving 状态 → processing（保留私钥与订单信息，spec 2.4）
+//
+// 部署计数为新字段，默认 0，不从旧混合计数推断。三类判定优先级：非法 IP > 旧计数触顶 > pending 归一。
+func normalizeCertLifecycle(root map[string]interface{}) bool {
+	globalMode := RenewModePull
+	if sched, ok := getMap(root, "schedule"); ok {
+		if m, ok := sched["renew_mode"].(string); ok && m != "" {
+			globalMode = m
+		}
+	}
+
+	changed := false
+	for _, cert := range resolvePath(root, "certificates[]") {
+		meta, _ := getMap(cert, "metadata")
+
+		curState := ""
+		if meta != nil {
+			curState, _ = meta["last_issue_state"].(string)
+		}
+
+		// 已是终止态（新版运行时已记录 CAPPED/EXPIRED/policy_blocked 及其阶段）：
+		// 迁移不重复归一，避免覆盖运行时记录的触顶阶段（issue/deploy）为 legacy。
+		if isRawTerminalState(curState) {
+			continue
+		}
+
+		// 有效续签模式：证书级优先，回退全局
+		effMode := globalMode
+		if m, ok := cert["renew_mode"].(string); ok && m != "" {
+			effMode = m
+		}
+		validation, _ := cert["validation_method"].(string)
+		illegalIP := ContainsIPDomain(rawStringSlice(cert, "domains")) &&
+			(effMode != RenewModeLocal || validation == ValidationMethodDelegation)
+
+		var targetState, targetPhase string
+		switch {
+		case illegalIP:
+			targetState = IssueStatePolicyBlocked
+		case rawNumField(meta, "issue_retry_count") >= AttemptCap:
+			targetState = IssueStateCapped
+			targetPhase = CappedPhaseLegacy
+		case curState == "pending" || curState == "approving":
+			targetState = IssueStateProcessing
+		}
+
+		if targetState == "" {
+			continue
+		}
+		if meta == nil {
+			meta = make(map[string]interface{})
+			cert["metadata"] = meta
+		}
+		if curState != targetState {
+			meta["last_issue_state"] = targetState
+			changed = true
+		}
+		if targetPhase != "" {
+			if cp, _ := meta["capped_phase"].(string); cp != targetPhase {
+				meta["capped_phase"] = targetPhase
+				changed = true
+			}
+		}
+	}
+	return changed
+}
+
+// isRawTerminalState 判断状态是否为终止态（运行时权威，迁移不再归一）
+func isRawTerminalState(state string) bool {
+	switch state {
+	case IssueStateCapped, IssueStateExpired, IssueStatePolicyBlocked:
+		return true
+	}
+	return false
+}
+
+// rawStringSlice 从原始 map 读取字符串切片字段（非字符串元素跳过）
+func rawStringSlice(m map[string]interface{}, key string) []string {
+	var out []string
+	for _, v := range getSlice(m, key) {
+		if s, ok := v.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// rawNumField 从原始 map 读取数值字段（JSON 数字为 float64；缺失或非数值返回 0）
+func rawNumField(m map[string]interface{}, key string) float64 {
+	if m == nil {
+		return 0
+	}
+	if f, ok := m[key].(float64); ok {
+		return f
+	}
+	return 0
 }
 
 // --- 默认值填充 ---

@@ -2,7 +2,6 @@
 package config
 
 import (
-	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -27,8 +26,7 @@ type ConfigManager struct {
 	backupDir  string
 	mu         sync.RWMutex
 	config     *Config
-	cachedAt   time.Time    // 缓存加载时间，用于 mtime 检测
-	cachedHash [sha256.Size]byte // 缓存内容哈希，防止 NFS/VM 环境 mtime 不准
+	cachedAt   time.Time // 缓存加载时间，用于 mtime 检测
 }
 
 // NewConfigManager 创建统一配置管理器
@@ -66,7 +64,7 @@ func (cm *ConfigManager) ensureDirs() error {
 		path string
 		perm os.FileMode
 	}{
-		{cm.workDir, 0700},  // 工作目录收紧权限，仅 root 可访问
+		{cm.workDir, 0700}, // 工作目录收紧权限，仅 root 可访问
 		{cm.certsDir, 0700},
 		{cm.logsDir, 0700},
 		{cm.backupDir, 0700},
@@ -138,9 +136,9 @@ func (cm *ConfigManager) Load() (*Config, error) {
 // 此函数确保返回的配置对象与内部缓存完全独立，调用方可以安全修改返回值。
 //
 // 维护注意事项：
-// - 如果向 CertConfig 或 SiteBinding 添加新的引用类型字段（map、slice、指针），
-//   必须在此函数中添加对应的深拷贝逻辑，否则会破坏并发安全保证！
-// - 当前已处理的引用类型：Certificates(slice)、Bindings(slice)、Domains(slice)、Docker(*DockerInfo)、FailedBindings(slice)、ValidationFiles(slice)
+//   - 如果向 CertConfig 或 SiteBinding 添加新的引用类型字段（map、slice、指针），
+//     必须在此函数中添加对应的深拷贝逻辑，否则会破坏并发安全保证！
+//   - 当前已处理的引用类型：Certificates(slice)、Bindings(slice)、Domains(slice)、Docker(*DockerInfo)、FailedBindings(slice)、ValidationFiles(slice)
 func (cm *ConfigManager) copyConfig(src *Config) *Config {
 	if src == nil {
 		return nil
@@ -183,8 +181,24 @@ func (cm *ConfigManager) copyConfig(src *Config) *Config {
 	return &dst
 }
 
+// refreshIfModifiedLocked 检查配置文件是否被外部修改（mtime 比缓存时间新），
+// 是则丢弃内存缓存，下次 loadLocked 重读文件（内容哈希比对避免无谓的 JSON 解析）。
+// 调用者需持有写锁。
+func (cm *ConfigManager) refreshIfModifiedLocked() {
+	if cm.config == nil || cm.cachedAt.IsZero() {
+		return
+	}
+	if info, err := os.Stat(cm.configPath); err == nil && info.ModTime().After(cm.cachedAt) {
+		cm.config = nil
+	}
+}
+
 // loadLocked 加载配置（调用者需持有锁）
 func (cm *ConfigManager) loadLocked() (*Config, error) {
+	// 外部修改检测：CLI 与 daemon 两进程并发时，命中缓存前先校验盘上 mtime，
+	// 防止写路径（Update* 系列）基于陈旧缓存读-改-写，丢掉另一进程的更新
+	cm.refreshIfModifiedLocked()
+
 	// 双重检查
 	if cm.config != nil {
 		return cm.config, nil
@@ -199,7 +213,6 @@ func (cm *ConfigManager) loadLocked() (*Config, error) {
 				Certificates: []CertConfig{},
 			}
 			cm.cachedAt = time.Now()
-			cm.cachedHash = sha256.Sum256(nil)
 			return cm.config, nil
 		}
 		return nil, fmt.Errorf("failed to read config: %w", err)
@@ -216,15 +229,6 @@ func (cm *ConfigManager) loadLocked() (*Config, error) {
 		_ = os.WriteFile(cm.configPath, data, 0600)
 	}
 
-	// 计算内容哈希，防止 mtime 变更但内容未变时不必要的重新加载
-	// 设计说明：mtime 变更时仍需 ReadFile（无法避免 I/O），但哈希匹配时跳过 JSON 解析。
-	// 此检查仅在 mtime 触发重新加载时生效，正常缓存命中不涉及文件读取。
-	hash := sha256.Sum256(data)
-	if cm.cachedHash == hash && cm.config != nil {
-		cm.cachedAt = time.Now()
-		return cm.config, nil
-	}
-
 	var cfg Config
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("failed to parse config: %w", err)
@@ -232,7 +236,6 @@ func (cm *ConfigManager) loadLocked() (*Config, error) {
 
 	cm.config = &cfg
 	cm.cachedAt = time.Now()
-	cm.cachedHash = hash
 
 	return cm.config, nil
 }
@@ -245,26 +248,9 @@ func (cm *ConfigManager) Save(cfg *Config) error {
 	return cm.saveLocked(cfg)
 }
 
-// saveLocked 保存配置（调用者需持有锁）
-// 注意：序列化在文件锁之前完成，减少文件锁持有时间
-// 使用 flock 机制，多个进程可以同时打开锁文件，但只有一个能获得排他锁
-func (cm *ConfigManager) saveLocked(cfg *Config) error {
-	// 1. 创建配置副本进行修改，避免修改原始对象
-	cfgCopy := cm.copyConfig(cfg)
-	cfgCopy.Metadata.UpdatedAt = time.Now()
-	if cfgCopy.Metadata.CreatedAt.IsZero() {
-		cfgCopy.Metadata.CreatedAt = time.Now()
-	}
-
-	// 2. 序列化配置（在文件锁之前完成，减少锁持有时间）
-	data, err := json.MarshalIndent(cfgCopy, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to marshal config: %w", err)
-	}
-
-	// 3. 获取文件锁，防止并发写入和 TOCTOU 攻击
-	// 注意：这里使用 flock 而非 O_EXCL，因为 flock 是基于文件描述符的锁
-	// 多个进程可以同时打开同一个锁文件，但只有一个能成功获得 flock
+// withConfigFileLock 获取配置文件锁执行 fn（flock 进程间互斥）
+// 多个进程可以同时打开同一个锁文件，但只有一个能成功获得排他锁
+func (cm *ConfigManager) withConfigFileLock(fn func() error) error {
 	lockPath := cm.configPath + ".lock"
 	lf, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
@@ -280,7 +266,56 @@ func (cm *ConfigManager) saveLocked(cfg *Config) error {
 		_ = lf.Close()
 	}()
 
-	// 4. 原子写入（在文件锁保护下）
+	return fn()
+}
+
+// mutateLocked 在配置文件锁内执行读-改-写（进程间原子）。
+// 文件锁内先感知外部修改并加载最新盘上状态，再将 fn 应用到深拷贝副本后写回，
+// 消除跨进程 read-modify-write 丢更新窗口；fn 返回错误时不写盘、不污染内存缓存。
+// 调用者需持有 cm.mu 写锁。
+func (cm *ConfigManager) mutateLocked(fn func(*Config) error) error {
+	return cm.withConfigFileLock(func() error {
+		// 写路径必须基于盘上最新状态读-改-写：置空内存缓存强制 loadLocked 重读文件。
+		// 仅靠 mtime 门控无法感知外部修改的两类场景——同秒写入、以及 NFS/VM 环境 mtime 粒度或时钟偏移
+		// 使盘上 mtime 不晚于本进程 cachedAt——会让写路径复用陈旧缓存，覆盖另一进程的更新（跨进程丢更新）。
+		// 读路径（Load）保持 mtime 缓存不变，daemon 高频读不因此每次落盘。
+		cm.config = nil
+		cfg, err := cm.loadLocked()
+		if err != nil {
+			return err
+		}
+		// 在副本上应用修改：fn 或保存失败时内存缓存保持与盘上一致
+		working := cm.copyConfig(cfg)
+		if err := fn(working); err != nil {
+			return err
+		}
+		return cm.saveLockedHeld(working)
+	})
+}
+
+// saveLocked 保存配置（调用者需持有内存锁；内部自行获取配置文件锁）
+func (cm *ConfigManager) saveLocked(cfg *Config) error {
+	return cm.withConfigFileLock(func() error {
+		return cm.saveLockedHeld(cfg)
+	})
+}
+
+// saveLockedHeld 保存配置（调用者需同时持有内存锁与配置文件锁）
+func (cm *ConfigManager) saveLockedHeld(cfg *Config) error {
+	// 1. 创建配置副本进行修改，避免修改原始对象
+	cfgCopy := cm.copyConfig(cfg)
+	cfgCopy.Metadata.UpdatedAt = time.Now()
+	if cfgCopy.Metadata.CreatedAt.IsZero() {
+		cfgCopy.Metadata.CreatedAt = time.Now()
+	}
+
+	// 2. 序列化配置
+	data, err := json.MarshalIndent(cfgCopy, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal config: %w", err)
+	}
+
+	// 3. 原子写入（在文件锁保护下）
 	// 使用 O_EXCL 防止符号链接攻击：如果文件已存在则失败
 	tmpPath := cm.configPath + ".tmp"
 	// 先删除可能存在的临时文件（可能是上次失败遗留的）
@@ -320,23 +355,21 @@ func (cm *ConfigManager) saveLocked(cfg *Config) error {
 		return fmt.Errorf("failed to rename file: %w", err)
 	}
 
-	// 5. 只有在所有操作成功后才更新内存缓存
+	// 4. 只有在所有操作成功后才更新内存缓存
 	cm.config = cfgCopy
 	cm.cachedAt = time.Now()
 	return nil
 }
 
-// UpdateMetadata 原子更新配置元数据（重新加载最新配置，避免覆盖其他更新）
+// UpdateMetadata 原子更新配置元数据（文件锁内读-改-写，避免覆盖其他进程的更新）
 func (cm *ConfigManager) UpdateMetadata(fn func(*ConfigMetadata)) error {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
-	cfg, err := cm.loadLocked()
-	if err != nil {
-		return err
-	}
-	fn(&cfg.Metadata)
-	return cm.saveLocked(cfg)
+	return cm.mutateLocked(func(cfg *Config) error {
+		fn(&cfg.Metadata)
+		return nil
+	})
 }
 
 // UpdateSchedule 原子更新调度配置（重新加载最新配置，避免覆盖其他更新）
@@ -344,12 +377,24 @@ func (cm *ConfigManager) UpdateSchedule(fn func(*ScheduleConfig)) error {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
-	cfg, err := cm.loadLocked()
-	if err != nil {
-		return err
+	return cm.mutateLocked(func(cfg *Config) error {
+		fn(&cfg.Schedule)
+		return nil
+	})
+}
+
+// UpdateRenewBeforeDays 按 deploy-spec §2.9 校验并回写服务端下发的提前续签天数。
+// 0/负数表示响应未提供该字段；超过上限视为异常值，二者均忽略并保留现值。
+func (cm *ConfigManager) UpdateRenewBeforeDays(value int) (bool, error) {
+	if value <= 0 || value > MaxRenewBeforeDays {
+		return false, nil
 	}
-	fn(&cfg.Schedule)
-	return cm.saveLocked(cfg)
+	if err := cm.UpdateSchedule(func(schedule *ScheduleConfig) {
+		schedule.RenewBeforeDays = value
+	}); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // SetUpgradeChannel 保存升级通道到配置
@@ -360,12 +405,10 @@ func (cm *ConfigManager) SetUpgradeChannel(channel string) error {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
-	cfg, err := cm.loadLocked()
-	if err != nil {
-		return err
-	}
-	cfg.UpgradeChannel = channel
-	return cm.saveLocked(cfg)
+	return cm.mutateLocked(func(cfg *Config) error {
+		cfg.UpgradeChannel = channel
+		return nil
+	})
 }
 
 // Reload 重新加载配置
@@ -417,41 +460,38 @@ func (cm *ConfigManager) AddCert(cert *CertConfig) error {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
-	cfg, err := cm.loadLocked()
-	if err != nil {
-		return err
-	}
-
-	// 收集新证书绑定的站点名
-	newSites := make(map[string]bool)
-	for _, b := range cert.Bindings {
-		newSites[b.ServerName] = true
-	}
-
-	// 移除其他证书中对相同站点的绑定（一个站点只能绑定一个证书）
-	for i := range cfg.Certificates {
-		if cfg.Certificates[i].CertName == cert.CertName {
-			continue
+	return cm.mutateLocked(func(cfg *Config) error {
+		// 收集新证书绑定的站点名
+		newSites := make(map[string]bool)
+		for _, b := range cert.Bindings {
+			newSites[b.ServerName] = true
 		}
-		var kept []SiteBinding
-		for _, b := range cfg.Certificates[i].Bindings {
-			if !newSites[b.ServerName] {
-				kept = append(kept, b)
+
+		// 移除其他证书中对相同站点的绑定（一个站点只能绑定一个证书）
+		for i := range cfg.Certificates {
+			if cfg.Certificates[i].CertName == cert.CertName {
+				continue
+			}
+			var kept []SiteBinding
+			for _, b := range cfg.Certificates[i].Bindings {
+				if !newSites[b.ServerName] {
+					kept = append(kept, b)
+				}
+			}
+			cfg.Certificates[i].Bindings = kept
+		}
+
+		// 检查是否已存在同名证书
+		for i := range cfg.Certificates {
+			if cfg.Certificates[i].CertName == cert.CertName {
+				cfg.Certificates[i] = *cert
+				return nil
 			}
 		}
-		cfg.Certificates[i].Bindings = kept
-	}
 
-	// 检查是否已存在同名证书
-	for i := range cfg.Certificates {
-		if cfg.Certificates[i].CertName == cert.CertName {
-			cfg.Certificates[i] = *cert
-			return cm.saveLocked(cfg)
-		}
-	}
-
-	cfg.Certificates = append(cfg.Certificates, *cert)
-	return cm.saveLocked(cfg)
+		cfg.Certificates = append(cfg.Certificates, *cert)
+		return nil
+	})
 }
 
 // UpdateCert 更新证书配置
@@ -459,18 +499,15 @@ func (cm *ConfigManager) UpdateCert(cert *CertConfig) error {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
-	cfg, err := cm.loadLocked()
-	if err != nil {
-		return err
-	}
-
-	for i := range cfg.Certificates {
-		if cfg.Certificates[i].CertName == cert.CertName {
-			cfg.Certificates[i] = *cert
-			return cm.saveLocked(cfg)
+	return cm.mutateLocked(func(cfg *Config) error {
+		for i := range cfg.Certificates {
+			if cfg.Certificates[i].CertName == cert.CertName {
+				cfg.Certificates[i] = *cert
+				return nil
+			}
 		}
-	}
-	return fmt.Errorf("certificate not found: %s", cert.CertName)
+		return fmt.Errorf("certificate not found: %s", cert.CertName)
+	})
 }
 
 // RenameCert 按旧名查找证书并替换为新配置（支持 cert_name 变更）
@@ -478,18 +515,15 @@ func (cm *ConfigManager) RenameCert(oldName string, cert *CertConfig) error {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
-	cfg, err := cm.loadLocked()
-	if err != nil {
-		return err
-	}
-
-	for i := range cfg.Certificates {
-		if cfg.Certificates[i].CertName == oldName {
-			cfg.Certificates[i] = *cert
-			return cm.saveLocked(cfg)
+	return cm.mutateLocked(func(cfg *Config) error {
+		for i := range cfg.Certificates {
+			if cfg.Certificates[i].CertName == oldName {
+				cfg.Certificates[i] = *cert
+				return nil
+			}
 		}
-	}
-	return fmt.Errorf("certificate not found: %s", oldName)
+		return fmt.Errorf("certificate not found: %s", oldName)
+	})
 }
 
 // DeleteCert 删除证书配置
@@ -497,18 +531,15 @@ func (cm *ConfigManager) DeleteCert(certName string) error {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
-	cfg, err := cm.loadLocked()
-	if err != nil {
-		return err
-	}
-
-	for i := range cfg.Certificates {
-		if cfg.Certificates[i].CertName == certName {
-			cfg.Certificates = append(cfg.Certificates[:i], cfg.Certificates[i+1:]...)
-			return cm.saveLocked(cfg)
+	return cm.mutateLocked(func(cfg *Config) error {
+		for i := range cfg.Certificates {
+			if cfg.Certificates[i].CertName == certName {
+				cfg.Certificates = append(cfg.Certificates[:i], cfg.Certificates[i+1:]...)
+				return nil
+			}
 		}
-	}
-	return fmt.Errorf("certificate not found: %s", certName)
+		return fmt.Errorf("certificate not found: %s", certName)
+	})
 }
 
 // ListCerts 列出所有证书配置

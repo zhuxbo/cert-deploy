@@ -4,7 +4,8 @@
 #   bash run-tests.sh                                   # 运行全部测试
 #   bash run-tests.sh --distro ubuntu --server nginx    # 指定发行版和服务器
 #   bash run-tests.sh --test scan                       # 指定测试文件
-#   bash run-tests.sh --dind                            # 运行 Docker-in-Docker 测试
+#   bash run-tests.sh --no-dind                         # 跳过 Docker-in-Docker 测试
+#   bash run-tests.sh --dind-only                       # 仅运行全部 Docker-in-Docker 测试
 #   bash run-tests.sh --no-build                        # 跳过构建步骤
 set -euo pipefail
 
@@ -16,7 +17,9 @@ DISTROS=""
 SERVERS=""
 TESTS=""
 NO_BUILD=false
-RUN_DIND=false
+RUN_DIND=true
+RUN_REGULAR=true
+DIND_EXPLICIT=false
 
 # 颜色定义
 RED='\033[0;31m'
@@ -48,6 +51,17 @@ while [[ $# -gt 0 ]]; do
             ;;
         --dind)
             RUN_DIND=true
+            DIND_EXPLICIT=true
+            shift
+            ;;
+        --dind-only)
+            RUN_DIND=true
+            RUN_REGULAR=false
+            DIND_EXPLICIT=true
+            shift
+            ;;
+        --no-dind)
+            RUN_DIND=false
             shift
             ;;
         -h|--help)
@@ -58,7 +72,9 @@ while [[ $# -gt 0 ]]; do
             echo "  --server <type>   服务器 (nginx/apache)，默认全部"
             echo "  --test <name>     测试文件名 (不含 .bats 后缀)，默认全部"
             echo "  --no-build        跳过构建步骤"
-            echo "  --dind            运行 Docker-in-Docker 测试"
+            echo "  --dind            运行 Docker-in-Docker 测试（默认已启用，保留兼容）"
+            echo "  --dind-only       仅运行 Docker-in-Docker 测试"
+            echo "  --no-dind         跳过 Docker-in-Docker 测试"
             echo "  -h, --help        显示帮助"
             exit 0
             ;;
@@ -75,6 +91,27 @@ if [[ -z "$DISTROS" ]]; then
 fi
 if [[ -z "$SERVERS" ]]; then
     SERVERS="nginx apache"
+fi
+
+is_dind_test() {
+    [[ "$1" == docker-* ]]
+}
+
+if [[ -n "$TESTS" ]]; then
+    if is_dind_test "$TESTS"; then
+        if [[ "$RUN_DIND" != "true" ]]; then
+            echo "错误: docker-* 测试必须在 DinD 中运行，不能与 --no-dind 同时使用"
+            exit 1
+        fi
+        RUN_REGULAR=false
+    else
+        # 常规测试不能放进 DinD 容器运行；指定 --test 时仅运行其所属矩阵。
+        if [[ "$DIND_EXPLICIT" == "true" ]]; then
+            echo "错误: --dind 只能与 docker-* 测试组合使用"
+            exit 1
+        fi
+        RUN_DIND=false
+    fi
 fi
 
 # ==============================================================================
@@ -104,10 +141,19 @@ get_bats_cmd() {
     if [[ -n "$test_name" ]]; then
         echo "bats --tap /tests/$test_name.bats"
     else
-        # 全部测试：排除 uninstall（放最后）和 docker-scan（仅 DinD 运行）
+        # 全部测试：排除 uninstall（放最后）和 docker-*（仅 DinD 运行）
         # shellcheck disable=SC2016
-        echo 'TESTS=$(ls /tests/*.bats 2>/dev/null | grep -v -e uninstall -e docker-scan | sort); UNINSTALL=$(ls /tests/uninstall.bats 2>/dev/null); bats --tap $TESTS $UNINSTALL'
+        echo 'TESTS=$(ls /tests/*.bats 2>/dev/null | grep -v -e uninstall -e docker- | sort); UNINSTALL=$(ls /tests/uninstall.bats 2>/dev/null); bats --tap $TESTS $UNINSTALL'
     fi
+}
+
+collect_failure_logs() {
+    local service="$1"
+    docker compose logs "$service" > "reports/${service}-container.log" 2>&1 || true
+    docker compose logs mock-api > "reports/${service}-mock-api.log" 2>&1 || true
+    docker compose exec -T "$service" bash -c \
+        'cat /opt/sslctl/logs/*.log 2>/dev/null' \
+        > "reports/${service}-sslctl.log" 2>/dev/null || true
 }
 
 # ==============================================================================
@@ -129,8 +175,41 @@ fi
 cd "$TEST_DIR"
 mkdir -p reports
 
+# 每次运行使用独立 Compose project，避免并行任务或上次中断资源互相复用/误删。
+export COMPOSE_PROJECT_NAME="${SSLCTL_E2E_PROJECT_NAME:-sslctl-e2e-$$-$RANDOM}"
+COMPOSE_STARTED=false
+CLEANUP_DONE=false
+
+cleanup_compose() {
+    if [[ "$CLEANUP_DONE" == "true" || "$COMPOSE_STARTED" != "true" ]]; then
+        return
+    fi
+    CLEANUP_DONE=true
+    echo ""
+    echo -e "${CYAN}=== 清理 (${COMPOSE_PROJECT_NAME}) ===${NC}"
+    docker compose down -v --remove-orphans >/dev/null 2>&1 || true
+}
+
+cleanup_on_exit() {
+    local status=$?
+    cleanup_compose
+    return "$status"
+}
+
+cleanup_on_signal() {
+    local status="$1"
+    trap - EXIT INT TERM
+    cleanup_compose
+    exit "$status"
+}
+
+trap cleanup_on_exit EXIT
+trap 'cleanup_on_signal 130' INT
+trap 'cleanup_on_signal 143' TERM
+
 # 2. 启动 Mock API
 echo -e "${CYAN}=== 启动 Mock API ===${NC}"
+COMPOSE_STARTED=true
 docker compose up -d mock-api
 echo "等待 Mock API 健康检查..."
 docker compose exec mock-api wget -q --spider http://localhost:8080/health 2>/dev/null && echo "Mock API 已就绪" || {
@@ -157,7 +236,8 @@ FAILED=0
 FAILED_LIST=""
 
 # 常规服务测试（nginx/apache × distro）
-for server in $SERVERS; do
+if [[ "$RUN_REGULAR" == "true" ]]; then
+  for server in $SERVERS; do
     for distro in $DISTROS; do
         service="${server}-${distro}"
         TOTAL=$((TOTAL + 1))
@@ -170,12 +250,20 @@ for server in $SERVERS; do
             echo -e "${RED}FAIL: $service (容器启动失败)${NC}"
             FAILED=$((FAILED + 1))
             FAILED_LIST="$FAILED_LIST $service"
+            collect_failure_logs "$service"
             continue
         fi
 
         # 复制二进制到可写路径（挂载为只读暂存，upgrade 测试需要可写）
-        docker compose exec -T "$service" cp /opt/sslctl-binary /usr/local/bin/sslctl
-        docker compose exec -T "$service" chmod +x /usr/local/bin/sslctl
+        if ! docker compose exec -T "$service" cp /opt/sslctl-binary /usr/local/bin/sslctl || \
+           ! docker compose exec -T "$service" chmod +x /usr/local/bin/sslctl; then
+            echo -e "${RED}FAIL: $service (准备测试二进制失败)${NC}"
+            FAILED=$((FAILED + 1))
+            FAILED_LIST="$FAILED_LIST $service"
+            collect_failure_logs "$service"
+            docker compose stop "$service" >/dev/null 2>&1 || true
+            continue
+        fi
 
         # 启动 web 服务器 + 运行 bats
         start_cmd=$(get_start_cmd "$server" "$distro")
@@ -193,12 +281,14 @@ for server in $SERVERS; do
             echo "--- TAP 输出 ---"
             cat "$report_file"
             echo "--- 结束 ---"
+            collect_failure_logs "$service"
         fi
 
         # 停止当前服务容器（释放资源）
         docker compose stop "$service" >/dev/null 2>&1
     done
-done
+  done
+fi
 
 # 4. DinD 测试（可选）
 if [[ "$RUN_DIND" == "true" ]]; then
@@ -222,28 +312,39 @@ if [[ "$RUN_DIND" == "true" ]]; then
             echo -e "${RED}Docker daemon 启动超时${NC}"
             FAILED=$((FAILED + 1))
             FAILED_LIST="$FAILED_LIST dind"
+            collect_failure_logs dind
             docker compose stop dind >/dev/null 2>&1
         else
             # 复制二进制到可写路径
-            docker compose exec -T dind cp /opt/sslctl-binary /usr/local/bin/sslctl
-            docker compose exec -T dind chmod +x /usr/local/bin/sslctl
-
-            report_file="reports/dind.tap"
-            dind_bats="bats --tap /tests/docker-scan.bats"
-            if [[ -n "$TESTS" ]]; then
-                dind_bats="bats --tap /tests/$TESTS.bats"
-            fi
-
-            if docker compose exec -T dind bash -c "$dind_bats" > "$report_file" 2>&1; then
-                echo -e "${GREEN}PASS: dind${NC}"
-                PASSED=$((PASSED + 1))
-            else
-                echo -e "${RED}FAIL: dind${NC}"
+            if ! docker compose exec -T dind cp /opt/sslctl-binary /usr/local/bin/sslctl || \
+               ! docker compose exec -T dind chmod +x /usr/local/bin/sslctl; then
+                echo -e "${RED}FAIL: dind (准备测试二进制失败)${NC}"
                 FAILED=$((FAILED + 1))
                 FAILED_LIST="$FAILED_LIST dind"
-                echo "--- TAP 输出 ---"
-                cat "$report_file"
-                echo "--- 结束 ---"
+                collect_failure_logs dind
+                docker compose stop dind >/dev/null 2>&1 || true
+                dind_ready=false
+            fi
+
+            if [[ "$dind_ready" == "true" ]]; then
+                report_file="reports/dind.tap"
+                dind_bats='TESTS=$(ls /tests/docker-*.bats 2>/dev/null | sort); bats --tap $TESTS'
+                if [[ -n "$TESTS" ]]; then
+                    dind_bats="bats --tap /tests/$TESTS.bats"
+                fi
+
+                if docker compose exec -T dind bash -c "$dind_bats" > "$report_file" 2>&1; then
+                    echo -e "${GREEN}PASS: dind${NC}"
+                    PASSED=$((PASSED + 1))
+                else
+                    echo -e "${RED}FAIL: dind${NC}"
+                    FAILED=$((FAILED + 1))
+                    FAILED_LIST="$FAILED_LIST dind"
+                    echo "--- TAP 输出 ---"
+                    cat "$report_file"
+                    echo "--- 结束 ---"
+                    collect_failure_logs dind
+                fi
             fi
 
             docker compose stop dind >/dev/null 2>&1
@@ -252,13 +353,12 @@ if [[ "$RUN_DIND" == "true" ]]; then
         echo -e "${RED}FAIL: dind (容器启动失败)${NC}"
         FAILED=$((FAILED + 1))
         FAILED_LIST="$FAILED_LIST dind"
+        collect_failure_logs dind
     fi
 fi
 
 # 5. 清理
-echo ""
-echo -e "${CYAN}=== 清理 ===${NC}"
-docker compose down -v
+cleanup_compose
 
 # 6. 汇总结果
 echo ""

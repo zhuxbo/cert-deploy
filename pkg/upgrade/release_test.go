@@ -280,6 +280,24 @@ func TestCompareVersions(t *testing.T) {
 		{"", "", 0},
 		{"v1", "v1.0.0", 0},
 		{"v1.2", "v1.2.0", 0},
+		// pre-release 内数字段按数值比较（修复 beta.9 vs beta.10 等顺序错误）
+		{"v0.4.1-beta.1", "v0.4.1-beta.2", -1},
+		{"v0.4.1-beta.2", "v0.4.1-beta.1", 1},
+		{"v0.4.1-beta.9", "v0.4.1-beta.10", -1},
+		{"v0.4.1-beta.10", "v0.4.1-beta.9", 1},
+		{"v1.0.0-beta.11", "v1.0.0-beta.2", 1},
+		{"v0.4.1-beta.1", "v0.4.1", -1},
+		{"v0.4.1-beta.1", "v0.4.1-rc.1", -1},
+		{"v0.4.1-rc.1", "v0.4.1-beta.1", 1},
+		// 字段数：更多字段 > 更少字段（共同前缀相等时）
+		{"v1.0.0-alpha", "v1.0.0-alpha.1", -1},
+		{"v1.0.0-alpha.1", "v1.0.0-alpha", 1},
+		// 数字段 < 字母段
+		{"v1.0.0-alpha.1", "v1.0.0-alpha.beta", -1},
+		{"v1.0.0-alpha.beta", "v1.0.0-alpha.1", 1},
+		// build metadata 不参与排序
+		{"v1.0.0+build1", "v1.0.0+build2", 0},
+		{"v1.0.0-beta.1+abc", "v1.0.0-beta.1+xyz", 0},
 	}
 
 	for _, tt := range tests {

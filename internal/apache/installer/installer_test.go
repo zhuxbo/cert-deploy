@@ -82,10 +82,11 @@ func TestExtractVirtualHost80_Simple(t *testing.T) {
 	}
 }
 
-func TestExtractHTTPVirtualHost_CustomPort(t *testing.T) {
+func TestExtractHTTPVirtualHost_CustomPortSkipped(t *testing.T) {
 	inst := NewApacheInstaller("", "", "", "", "example.com", "")
-	// 自定义端口（如与 IIS 冲突改为 1800 等）应被匹配
-	for _, port := range []string{"8080", "180", "1800"} {
+	// 非 80 端口的 VirtualHost 不应被提取：generateSSLVirtualHost 只把端口 80 改写为 443，
+	// 基于 *:8080 等端口生成会得到端口未改写的伪 SSL 块，故一律跳过（找不到 → 空结果 → 调用方报错）。
+	for _, port := range []string{"8080", "180", "1800", "8443"} {
 		content := `<VirtualHost *:` + port + `>
     ServerName example.com
     DocumentRoot /var/www/html
@@ -95,9 +96,52 @@ func TestExtractHTTPVirtualHost_CustomPort(t *testing.T) {
 		if err != nil {
 			t.Fatalf("port %s: unexpected error: %v", port, err)
 		}
-		if vhost == "" {
-			t.Errorf("port %s: expected non-empty result for custom port VirtualHost", port)
+		if vhost != "" {
+			t.Errorf("port %s: 非 80 端口 VirtualHost 不应被提取，实际提取到内容", port)
 		}
+	}
+}
+
+// TestAddSSLVirtualHost_CustomPortErrors 端口非 80 时 addSSLVirtualHost 应明确报错，
+// 而非基于自定义端口注入伪 SSL 配置（与 Nginx 安装器无 80 块即报错的行为一致）。
+func TestAddSSLVirtualHost_CustomPortErrors(t *testing.T) {
+	inst := NewApacheInstaller("", "/ssl/cert.pem", "/ssl/key.pem", "", "example.com", "")
+	content := `<VirtualHost *:8080>
+    ServerName example.com
+    DocumentRoot /var/www/html
+</VirtualHost>`
+
+	out, err := inst.addSSLVirtualHost(content)
+	if err == nil {
+		t.Fatal("端口 8080 的站点应报错（无 :80 VirtualHost），而非注入 SSL")
+	}
+	if out != "" {
+		t.Errorf("报错时不应产生配置输出，实际: %q", out)
+	}
+}
+
+// TestExtractHTTPVirtualHost_Port80AmongCustom 混合端口时仅提取端口 80 的 VirtualHost。
+func TestExtractHTTPVirtualHost_Port80AmongCustom(t *testing.T) {
+	inst := NewApacheInstaller("", "", "", "", "example.com", "")
+	content := `<VirtualHost *:8080>
+    ServerName example.com
+    DocumentRoot /var/www/alt
+</VirtualHost>
+
+<VirtualHost *:80>
+    ServerName example.com
+    DocumentRoot /var/www/html
+</VirtualHost>`
+
+	vhost, err := inst.extractHTTPVirtualHost(content)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(vhost, "/var/www/html") {
+		t.Error("应提取端口 80 的 VirtualHost（DocumentRoot /var/www/html）")
+	}
+	if strings.Contains(vhost, "/var/www/alt") {
+		t.Error("不应提取端口 8080 的 VirtualHost")
 	}
 }
 
@@ -315,6 +359,29 @@ func TestInstall_AlreadyHasSSL(t *testing.T) {
 	}
 }
 
+// TestInstall_NoMatchingVirtualHost_ReturnsError 锁定契约：找不到目标站点的 HTTP
+// VirtualHost 时返回错误（而非静默无操作）。nginx 安装器已对齐此行为，避免调用方
+// 误以为"无需安装"继续部署证书并误报成功。
+func TestInstall_NoMatchingVirtualHost_ReturnsError(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "site.conf")
+
+	// 配置里只有 other.com，目标 example.com 找不到可用的 HTTP VirtualHost
+	content := `<VirtualHost *:80>
+    ServerName other.com
+    DocumentRoot /var/www/other
+</VirtualHost>`
+	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	inst := NewApacheInstaller(configPath, "/ssl/cert.pem", "/ssl/key.pem", "", "example.com", "")
+	result, err := inst.Install()
+	if err == nil {
+		t.Fatalf("找不到目标站点的 HTTP VirtualHost 时应返回错误，实际 result=%+v, err=nil", result)
+	}
+}
+
 func TestRollback_Success(t *testing.T) {
 	tmpDir := t.TempDir()
 	configPath := filepath.Join(tmpDir, "site.conf")
@@ -465,5 +532,71 @@ func TestGetIndent(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("getIndent(%q) = %q, want %q", tt.line, got, tt.want)
 		}
+	}
+}
+
+// TestSwapAddrPort80 验证仅端口恰为 80 的地址被换成 443，其余端口（如 8080）不受影响。
+func TestSwapAddrPort80(t *testing.T) {
+	tests := []struct {
+		token string
+		want  string
+	}{
+		{"*:80", "*:443"},
+		{"1.2.3.4:80", "1.2.3.4:443"},
+		{"example.com:80", "example.com:443"},
+		{"[2001:db8::1]:80", "[2001:db8::1]:443"},
+		{"_default_:80", "_default_:443"},
+		{"*:8080", "*:8080"}, // 端口 8080 不是 80，不动
+		{"1.2.3.4:8080", "1.2.3.4:8080"},
+		{"[2001:db8::1]:8080", "[2001:db8::1]:8080"},
+		{"*", "*"},                           // 无端口不动
+		{"[2001:db8::80]", "[2001:db8::80]"}, // 带方括号裸 IPv6，无端口不动
+		{"*:443", "*:443"},                   // 已是 443 不动
+	}
+	for _, tt := range tests {
+		if got := swapAddrPort80(tt.token); got != tt.want {
+			t.Errorf("swapAddrPort80(%q) = %q, want %q", tt.token, got, tt.want)
+		}
+	}
+}
+
+// TestReplaceVirtualHostPort80 验证 <VirtualHost> 开始标签的多地址端口替换。
+func TestReplaceVirtualHostPort80(t *testing.T) {
+	tests := []struct {
+		line string
+		want string
+	}{
+		{"<VirtualHost *:80>", "<VirtualHost *:443>"},
+		{"    <VirtualHost *:80>", "    <VirtualHost *:443>"},
+		{"<VirtualHost *:8080>", "<VirtualHost *:8080>"},
+		{"<VirtualHost *:80 1.2.3.4:80>", "<VirtualHost *:443 1.2.3.4:443>"},
+		{"<VirtualHost *:80 5.6.7.8:8080>", "<VirtualHost *:443 5.6.7.8:8080>"},
+		{"<VirtualHost [2001:db8::1]:80>", "<VirtualHost [2001:db8::1]:443>"},
+		{"<virtualhost *:80>", "<virtualhost *:443>"},
+		{"    ServerName example.com", "    ServerName example.com"}, // 非开始行不动
+	}
+	for _, tt := range tests {
+		if got := replaceVirtualHostPort80(tt.line); got != tt.want {
+			t.Errorf("replaceVirtualHostPort80(%q) = %q, want %q", tt.line, got, tt.want)
+		}
+	}
+}
+
+// TestGenerateSSLVirtualHost_CustomPortNotCorrupted 回归：字面替换会把 <VirtualHost *:8080>
+// 误改成 *:44380。改为按地址 token 精确端口替换后，8080 端口保持不变。
+func TestGenerateSSLVirtualHost_CustomPortNotCorrupted(t *testing.T) {
+	inst := NewApacheInstaller("", "/ssl/cert.pem", "/ssl/key.pem", "", "example.com", "")
+	vhost := `<VirtualHost *:8080>
+    ServerName example.com
+    DocumentRoot /var/www/html
+</VirtualHost>`
+
+	result := inst.generateSSLVirtualHost(vhost)
+
+	if strings.Contains(result, "44380") {
+		t.Errorf("端口 8080 不应被污染成 44380\n%s", result)
+	}
+	if !strings.Contains(result, "<VirtualHost *:8080>") {
+		t.Errorf("非 80 端口地址应保持不变\n%s", result)
 	}
 }

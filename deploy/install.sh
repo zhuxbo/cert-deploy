@@ -316,7 +316,7 @@ if [ -n "$CURRENT_VERSION" ]; then
             exit 0
         fi
     else
-        echo_info "升级: $CURRENT_VERSION → $VERSION"
+        echo_info "安装: $CURRENT_VERSION → $VERSION"
     fi
 fi
 

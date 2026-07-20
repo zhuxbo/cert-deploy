@@ -84,6 +84,17 @@ func Run(args []string, version, buildTime string, debug bool) {
 		log.SetLevel(logger.LevelDebug)
 	}
 
+	// 与守护进程共享续签互斥锁，避免手动部署与自动续签并发操作同一证书目录与配置
+	release, acquired, lockErr := config.AcquireRenewalLock(cfgManager.GetWorkDir())
+	if lockErr != nil {
+		log.Warn("%v，继续执行", lockErr)
+	} else if !acquired {
+		fmt.Fprintln(os.Stderr, "守护进程正在续签（或另一部署进程正在运行），请稍后再试")
+		os.Exit(1)
+	} else {
+		defer release()
+	}
+
 	ctx := context.Background()
 	f := fetcher.New(30 * time.Second)
 	backupMgr := backup.NewManager(cfgManager.GetBackupDir(), 5)
@@ -95,12 +106,15 @@ func Run(args []string, version, buildTime string, debug bool) {
 			fmt.Fprintf(os.Stderr, "获取证书列表失败: %v\n", err)
 			os.Exit(1)
 		}
-		for i := range certs {
-			cert := &certs[i]
-			if err := fetchAndDeployCert(ctx, cfgManager, cert, f, backupMgr, log); err != nil {
-				fmt.Fprintf(os.Stderr, "  失败: %v\n", err)
+		if err := deployAllCerts(certs, func(cert *config.CertConfig) error {
+			err := fetchAndDeployCert(ctx, cfgManager, cert, f, backupMgr, log)
+			if err != nil {
 				log.Error("部署证书 %s 失败: %v", cert.CertName, err)
 			}
+			return err
+		}); err != nil {
+			fmt.Fprintf(os.Stderr, "部署未全部完成: %v\n", err)
+			os.Exit(1)
 		}
 	} else {
 		// 部署指定证书
@@ -127,6 +141,21 @@ func Run(args []string, version, buildTime string, debug bool) {
 	fmt.Println("部署完成")
 }
 
+func deployAllCerts(certs []config.CertConfig, deploy func(*config.CertConfig) error) error {
+	failedCerts := make([]string, 0)
+	for i := range certs {
+		cert := &certs[i]
+		if err := deploy(cert); err != nil {
+			fmt.Fprintf(os.Stderr, "  失败: %v\n", err)
+			failedCerts = append(failedCerts, fmt.Sprintf("%s: %v", cert.CertName, err))
+		}
+	}
+	if len(failedCerts) > 0 {
+		return fmt.Errorf("%d 个证书部署失败: %s", len(failedCerts), strings.Join(failedCerts, "; "))
+	}
+	return nil
+}
+
 // fetchAndDeployCert 从 API 获取并部署单个证书到所有绑定
 func fetchAndDeployCert(ctx context.Context, cfgManager *config.ConfigManager, cert *config.CertConfig, f *fetcher.Fetcher, backupMgr *backup.Manager, log *logger.Logger) error {
 	fmt.Printf("部署证书: %s\n", cert.CertName)
@@ -137,10 +166,11 @@ func fetchAndDeployCert(ctx context.Context, cfgManager *config.ConfigManager, c
 	}
 
 	// 查询证书
-	certData, _, err := f.QueryOrder(ctx, api.URL, api.Token, cert.OrderID)
+	certData, renewBeforeDays, err := f.QueryOrder(ctx, api.URL, api.Token, cert.OrderID)
 	if err != nil {
 		return fmt.Errorf("查询证书失败: %w", err)
 	}
+	applyDeployRenewBeforeDays(cfgManager, log, renewBeforeDays)
 
 	// 订单续费后 API 返回新订单号，同步更新 order_id
 	if certData.OrderID > 0 && certData.OrderID != cert.OrderID {
@@ -149,8 +179,12 @@ func fetchAndDeployCert(ctx context.Context, cfgManager *config.ConfigManager, c
 		cert.OrderID = certData.OrderID
 	}
 
-	// 修正 cert_name：确保与 order_id 一致
-	fixCertName(cfgManager, cert, log)
+	// 修正 cert_name：确保与 order_id 一致（复用 certops 单一实现，含 pending 私钥迁移）
+	oldCertName := cert.CertName
+	certops.FixCertName(cfgManager, cert, log)
+	if cert.CertName != oldCertName {
+		fmt.Printf("  证书名称修正: %s -> %s\n", oldCertName, cert.CertName)
+	}
 
 	if certData.Status != "active" || certData.Cert == "" {
 		return fmt.Errorf("证书未就绪: status=%s", certData.Status)
@@ -163,8 +197,9 @@ func fetchAndDeployCert(ctx context.Context, cfgManager *config.ConfigManager, c
 		return fmt.Errorf("证书验证失败: %w", err)
 	}
 
-	// 获取私钥：优先使用 API 返回，否则从本地读取
-	privateKey, err := certops.GetPrivateKeyFromBindings(cert.Bindings, certData.PrivateKey)
+	// 获取私钥：优先使用 API 返回，否则从本地读取（pending 感知，配对校验；
+	// 续签部署全失败后 pending 私钥尚未转正，手动 deploy 须能用它补救）
+	privateKey, err := certops.GetPrivateKeyForCert(cfgManager.GetWorkDir(), cert, certData.Cert, certData.PrivateKey, log)
 	if err != nil {
 		return err
 	}
@@ -194,54 +229,73 @@ func fetchAndDeployCert(ctx context.Context, cfgManager *config.ConfigManager, c
 		return cfgManager.UpdateCert(cert)
 	}
 
-	successCount := 0
-	for i := range cert.Bindings {
-		binding := &cert.Bindings[i]
-		if !binding.Enabled {
-			continue
-		}
-
-		fmt.Printf("  部署到: %s\n", binding.ServerName)
-
-		if err := deployToBinding(binding, certData, privateKey, backupMgr, log); err != nil {
-			fmt.Printf("    失败: %v\n", err)
-			continue
-		}
-		fmt.Printf("    成功\n")
-		successCount++
-	}
+	successCount, deployErr := deployToBindings(cert.Bindings, certData, privateKey, backupMgr, log)
 
 	// 仅在至少有一个绑定部署成功时才更新元数据
 	if successCount > 0 {
 		cert.Metadata.LastDeployAt = time.Now()
 		cert.Metadata.CertExpiresAt = parsedCert.NotAfter
 		cert.Metadata.CertSerial = fmt.Sprintf("%X", parsedCert.SerialNumber)
+		// 部署成功后补转正 pending 私钥（若本次使用的正是 pending 私钥）
+		certops.CommitPendingKeyIfMatches(cfgManager.GetWorkDir(), cert, privateKey, log)
 	}
 
-	return cfgManager.UpdateCert(cert)
+	if err := cfgManager.UpdateCert(cert); err != nil {
+		return err
+	}
+	return deployErr
 }
 
-// fixCertName 修正 cert_name 使其与 order_id 一致
-// cert_name 格式: {domain}-{order_id}
-func fixCertName(cfgManager *config.ConfigManager, cert *config.CertConfig, log *logger.Logger) {
-	idx := strings.LastIndex(cert.CertName, "-")
-	if idx < 0 {
+// deployToBindings 部署全部启用绑定；只要有一个绑定失败就返回错误，
+// 便于脚本调用方通过退出码识别部分失败，同时不影响其他绑定继续部署。
+func deployToBindings(bindings []config.SiteBinding, certData *fetcher.CertData, privateKey string, backupMgr *backup.Manager, log *logger.Logger) (int, error) {
+	successCount := 0
+	failedSites := make([]string, 0)
+	for i := range bindings {
+		binding := &bindings[i]
+		if !binding.Enabled {
+			continue
+		}
+
+		fmt.Printf("  部署到: %s\n", binding.ServerName)
+		if err := deployToBinding(binding, certData, privateKey, backupMgr, log); err != nil {
+			fmt.Printf("    失败: %v\n", err)
+			failedSites = append(failedSites, fmt.Sprintf("%s: %v", binding.ServerName, err))
+			continue
+		}
+		fmt.Printf("    成功\n")
+		successCount++
+	}
+
+	if len(failedSites) > 0 {
+		return successCount, fmt.Errorf("%d 个站点部署失败: %s", len(failedSites), strings.Join(failedSites, "; "))
+	}
+	return successCount, nil
+}
+
+func applyDeployRenewBeforeDays(cm *config.ConfigManager, log *logger.Logger, value int) {
+	if value > config.MaxRenewBeforeDays {
+		if log != nil {
+			log.Warn("服务端返回的 renew_before_days=%d 超过上限 %d，保留本地配置", value, config.MaxRenewBeforeDays)
+		}
 		return
 	}
-	expectedName := fmt.Sprintf("%s-%d", cert.CertName[:idx], cert.OrderID)
-	if expectedName == cert.CertName {
-		return
-	}
-	oldName := cert.CertName
-	cert.CertName = expectedName
-	fmt.Printf("  证书名称修正: %s -> %s\n", oldName, expectedName)
-	if err := cfgManager.RenameCert(oldName, cert); err != nil {
-		log.Warn("重命名证书配置失败: %v", err)
+	if _, err := cm.UpdateRenewBeforeDays(value); err != nil && log != nil {
+		log.Warn("更新 renew_before_days 失败: %v", err)
 	}
 }
 
 // deployToBinding 部署到绑定（带备份和回滚）
 func deployToBinding(binding *config.SiteBinding, certData *fetcher.CertData, privateKey string, backupMgr *backup.Manager, log *logger.Logger) error {
+	// Docker 站点：校验可安全部署（挂载卷模式 + 容器重载命令），否则如实报错而非静默成功
+	if config.IsDockerType(binding.ServerType) {
+		if err := config.ValidateDockerBinding(binding); err != nil {
+			return err
+		}
+	} else if binding.Reload.ReloadCommand == "" && log != nil {
+		log.Warn("站点 %s 无重载命令，部署后不会自动重载服务", binding.ServerName)
+	}
+
 	certDir := filepath.Dir(binding.Paths.Certificate)
 	if err := util.EnsureDir(certDir, 0700); err != nil {
 		return fmt.Errorf("创建证书目录失败: %w", err)
@@ -386,16 +440,17 @@ func installSSLForSite(ctx context.Context, site *config.ScannedSite, binding *c
 	if api.URL == "" || api.Token == "" {
 		return fmt.Errorf("证书 API 配置不完整")
 	}
-	certData, _, err := f.QueryOrder(ctx, api.URL, api.Token, cert.OrderID)
+	certData, renewBeforeDays, err := f.QueryOrder(ctx, api.URL, api.Token, cert.OrderID)
 	if err != nil {
 		return fmt.Errorf("获取证书失败: %w", err)
 	}
+	applyDeployRenewBeforeDays(cfgManager, nil, renewBeforeDays)
 	if certData.Status != "active" || certData.Cert == "" {
 		return fmt.Errorf("证书未就绪: status=%s", certData.Status)
 	}
 
-	// 获取私钥
-	privateKey, err := certops.GetPrivateKeyFromBindings(cert.Bindings, certData.PrivateKey)
+	// 获取私钥（pending 感知，配对校验）
+	privateKey, err := certops.GetPrivateKeyForCert(cfgManager.GetWorkDir(), cert, certData.Cert, certData.PrivateKey, nil)
 	if err != nil {
 		return err
 	}
@@ -513,6 +568,17 @@ func runLocal(args []string, debug bool) {
 
 	if debug {
 		log.SetLevel(logger.LevelDebug)
+	}
+
+	// 与守护进程共享续签互斥锁，避免手动部署与自动续签并发操作同一证书目录与配置
+	release, acquired, lockErr := config.AcquireRenewalLock(cfgManager.GetWorkDir())
+	if lockErr != nil {
+		log.Warn("%v，继续执行", lockErr)
+	} else if !acquired {
+		fmt.Fprintln(os.Stderr, "守护进程正在续签（或另一部署进程正在运行），请稍后再试")
+		os.Exit(1)
+	} else {
+		defer release()
 	}
 
 	// 验证并读取证书文件（使用 SafeReadFile 防止 TOCTOU 攻击）
@@ -701,28 +767,36 @@ func buildBindingFromScanResult(site *config.ScannedSite, cfgManager *config.Con
 	}
 
 	// Apache：保留扫描到的 ChainFile 路径（已有 SSLCertificateChainFile 的站点）
-	// 新站点 ChainFilePath 为空，使用 fullchain 模式
-	if site.ChainFilePath != "" {
+	// 新站点 ChainFilePath 为空，使用 fullchain 模式。
+	// Docker 卷模式必须用宿主机链路径，否则会把证书链写到容器内路径（宿主机错误位置）。
+	if site.VolumeMode && site.HostChainPath != "" {
+		binding.Paths.ChainFile = site.HostChainPath
+	} else if site.ChainFilePath != "" {
 		binding.Paths.ChainFile = site.ChainFilePath
 	}
 
 	// Docker 站点添加信息
-	if site.Source == "docker" {
+	isDocker := config.IsDockerType(serverType)
+	if isDocker {
+		// 仅当卷模式且已解析出宿主机路径时，才算可通过宿主机写入部署（volume）
+		deployMode := "copy"
+		if site.VolumeMode && site.HostCertPath != "" {
+			deployMode = "volume"
+		}
 		binding.Docker = &config.DockerInfo{
 			ContainerName: site.ContainerName,
-		}
-		if site.VolumeMode {
-			binding.Docker.DeployMode = "volume"
-		} else {
-			binding.Docker.DeployMode = "copy"
+			DeployMode:    deployMode,
 		}
 	}
 
 	// 添加默认重载命令（根据系统环境动态检测）
 	var cmds webserver.ServerCommands
-	if serverType == config.ServerTypeNginx {
+	switch {
+	case isDocker:
+		cmds = webserver.DetectDockerCommands(webserver.ServerType(serverType), site.ContainerName)
+	case serverType == config.ServerTypeNginx:
 		cmds = webserver.DetectNginxCommands()
-	} else if serverType == config.ServerTypeApache {
+	case serverType == config.ServerTypeApache:
 		cmds = webserver.DetectApacheCommands()
 	}
 	if cmds.TestCmd != "" {

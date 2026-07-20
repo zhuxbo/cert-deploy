@@ -7,6 +7,7 @@ import (
 	"github.com/zhuxbo/sslctl/pkg/config"
 	"github.com/zhuxbo/sslctl/pkg/logger"
 	"github.com/zhuxbo/sslctl/pkg/util"
+	"github.com/zhuxbo/sslctl/pkg/validator"
 )
 
 // GetPrivateKey 统一获取私钥逻辑
@@ -47,48 +48,44 @@ func GetPrivateKey(cert *config.CertConfig, apiPrivateKey string, log *logger.Lo
 	return result, nil
 }
 
-// GetPrivateKeyFromBindings 从绑定列表获取私钥
-// 用于 setup/deploy CLI 场景，直接传入绑定列表
-// bindings: 站点绑定列表
-// apiPrivateKey: API 返回的私钥（可为空）
-//
-// 注意：私钥内存残留风险同 GetPrivateKey
-func GetPrivateKeyFromBindings(bindings []config.SiteBinding, apiPrivateKey string) (string, error) {
+// GetPrivateKeyForCert 获取与目标证书配对的私钥（pending 感知）。
+// 优先级：API 返回的私钥 → 正式位置私钥（配对校验通过）→ pending-keys/ 待确认私钥（配对校验通过才用）。
+// 场景：local 续签签发成功但当日部署全部失败时，pending 私钥尚未转正（规范 3.8 部署成功后才转正），
+// 正式位置仍是旧私钥；重试/手动部署若只读正式位置会与新证书配对必败，须能回退到 pending 私钥补救。
+// certPEM 为空时退化为原有行为（读正式位置，不做配对校验）。
+// 使用 pending 私钥部署成功后，调用方应通过 CommitPendingKeyIfMatches 补转正。
+func GetPrivateKeyForCert(workDir string, cert *config.CertConfig, certPEM, apiPrivateKey string, log *logger.Logger) (string, error) {
 	// 优先使用 API 返回的私钥
 	if apiPrivateKey != "" {
 		return apiPrivateKey, nil
 	}
 
-	// 从绑定中获取私钥路径
-	keyPath := pickKeyPathFromBindings(bindings)
-	if keyPath == "" {
-		return "", fmt.Errorf("缺少私钥路径")
+	formalKey, formalErr := GetPrivateKey(cert, "", log)
+
+	// 无证书内容时无法校验配对，保持原有行为
+	if certPEM == "" {
+		return formalKey, formalErr
 	}
 
-	// 使用安全读取函数，防止符号链接攻击和 TOCTOU
-	keyData, err := util.SafeReadFile(keyPath, config.MaxPrivateKeySize)
-	if err != nil {
-		return "", fmt.Errorf("读取本地私钥失败: %w", err)
-	}
-
-	result := string(keyData)
-	clear(keyData) // 清零原始字节切片
-
-	return result, nil
-}
-
-// pickKeyPathFromBindings 从绑定列表选择私钥路径
-// 优先选择已启用绑定的私钥路径
-func pickKeyPathFromBindings(bindings []config.SiteBinding) string {
-	for i := range bindings {
-		// 使用值拷贝而非指针，与 DeployOne 保持一致
-		binding := bindings[i]
-		if binding.Enabled && binding.Paths.PrivateKey != "" {
-			return binding.Paths.PrivateKey
+	v := validator.New("")
+	if formalErr == nil {
+		if err := v.ValidateCertKeyPair(certPEM, formalKey); err == nil {
+			return formalKey, nil
 		}
 	}
-	if len(bindings) > 0 {
-		return bindings[0].Paths.PrivateKey
+
+	// 正式私钥缺失或与目标证书不配对：尝试 pending 私钥（续签部署全失败后未转正的场景）
+	if pendingKey, pendingErr := readPendingKey(workDir, cert.CertName); pendingErr == nil {
+		if err := v.ValidateCertKeyPair(certPEM, pendingKey); err == nil {
+			if log != nil {
+				log.Info("证书 %s 正式私钥与目标证书不配对，使用 pending 私钥（部署成功后将转正）", cert.CertName)
+			}
+			return pendingKey, nil
+		}
 	}
-	return ""
+
+	if formalErr != nil {
+		return "", formalErr
+	}
+	return "", fmt.Errorf("证书 %s 的正式私钥与目标证书不配对，且无可用的 pending 私钥", cert.CertName)
 }

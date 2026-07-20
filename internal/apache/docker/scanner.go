@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	nginxDocker "github.com/zhuxbo/sslctl/internal/nginx/docker"
+	"github.com/zhuxbo/sslctl/pkg/matcher"
 	"github.com/zhuxbo/sslctl/pkg/util"
 )
 
@@ -273,15 +274,15 @@ func (s *Scanner) parseConfig(content, configPath string, info *ContainerInfo) [
 			continue
 		}
 
-		// ServerName
+		// ServerName（剥离 [scheme://]fqdn[:port] 中的 scheme 与端口）
 		if matches := serverNameRe.FindStringSubmatch(line); len(matches) > 1 {
-			currentSite.ServerName = strings.Trim(strings.TrimSpace(matches[1]), `"'`)
+			currentSite.ServerName = matcher.StripPort(strings.Trim(strings.TrimSpace(matches[1]), `"'`))
 		}
 
 		// ServerAlias
 		if matches := serverAliasRe.FindStringSubmatch(line); len(matches) > 1 {
 			for _, alias := range strings.Fields(matches[1]) {
-				currentSite.ServerAlias = append(currentSite.ServerAlias, strings.Trim(alias, `"'`))
+				currentSite.ServerAlias = append(currentSite.ServerAlias, matcher.StripPort(strings.Trim(alias, `"'`)))
 			}
 		}
 
@@ -320,10 +321,12 @@ func (s *Scanner) parseConfig(content, configPath string, info *ContainerInfo) [
 }
 
 // resolveHostPaths 解析宿主机路径
+// VolumeMode 仅在待写的每个证书文件都解析出宿主机映射时才置位：证书、私钥必须解析出宿主机路径，
+// 若配置了 SSLCertificateChainFile，则证书链也必须解析出宿主机路径。任一未挂载都判为非卷模式，
+// 交由 config.ValidateDockerBinding 明确报错并计为失败，避免把未挂载文件写到宿主机错误位置后误报成功。
 func (s *Scanner) resolveHostPaths(site *SSLSite) {
 	if m := s.client.FindMountForPath(s.mounts, site.CertificatePath); m != nil {
 		site.HostCertPath = s.client.ResolveHostPath(site.CertificatePath, m)
-		site.VolumeMode = true
 	}
 	if m := s.client.FindMountForPath(s.mounts, site.PrivateKeyPath); m != nil {
 		site.HostKeyPath = s.client.ResolveHostPath(site.PrivateKeyPath, m)
@@ -333,6 +336,9 @@ func (s *Scanner) resolveHostPaths(site *SSLSite) {
 			site.HostChainPath = s.client.ResolveHostPath(site.ChainPath, m)
 		}
 	}
+	// 证书 + 私钥必须解析出宿主机路径；若配置了证书链，则链也必须解析出宿主机路径
+	site.VolumeMode = site.HostCertPath != "" && site.HostKeyPath != "" &&
+		(site.ChainPath == "" || site.HostChainPath != "")
 	if site.Webroot != "" {
 		if m := s.client.FindMountForPath(s.mounts, site.Webroot); m != nil {
 			site.HostWebroot = s.client.ResolveHostPath(site.Webroot, m)

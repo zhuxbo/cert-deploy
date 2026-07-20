@@ -434,3 +434,34 @@ func TestResolveHostPaths_NoMount(t *testing.T) {
 		t.Error("expected VolumeMode = false")
 	}
 }
+
+// TestResolveHostPaths_PartialMount 证书挂载但私钥未挂载：不得标记为卷模式，
+// 否则通用部署路径会把未挂载的私钥写到宿主机错误位置并误报成功。
+func TestResolveHostPaths_PartialMount(t *testing.T) {
+	client := NewClient("abc123")
+	s := &Scanner{
+		client:       client,
+		scannedFiles: make(map[string]bool),
+		mounts: []MountInfo{
+			// 仅证书目录挂载，私钥所在目录未挂载
+			{Type: "bind", Source: "/host/cert", Destination: "/etc/nginx/cert", RW: true},
+		},
+	}
+
+	site := &SSLSite{
+		CertificatePath: "/etc/nginx/cert/cert.pem",
+		PrivateKeyPath:  "/etc/nginx/private/key.pem", // 未挂载
+	}
+
+	s.resolveHostPaths(site)
+
+	if site.HostCertPath != "/host/cert/cert.pem" {
+		t.Errorf("HostCertPath = %q, want /host/cert/cert.pem", site.HostCertPath)
+	}
+	if site.HostKeyPath != "" {
+		t.Errorf("HostKeyPath = %q, want empty（私钥未挂载）", site.HostKeyPath)
+	}
+	if site.VolumeMode {
+		t.Error("私钥未挂载时 VolumeMode 应为 false（部分挂载不算安全可写）")
+	}
+}

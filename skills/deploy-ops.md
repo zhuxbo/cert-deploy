@@ -231,7 +231,6 @@ sudo journalctl -u sslctl -f
 ```
 
 **重要**：API 返回的 `ca_certificate` 字段为必需项（空则报错，等待下一周期重试）。`deploy local` 命令的 `--ca` 参数仍然可选。
-```
 
 ### 证书状态
 
@@ -239,7 +238,8 @@ sudo journalctl -u sslctl -f
 |------|------|-----------------|
 | `active` | 证书就绪 | 直接部署 |
 | `processing` | 验证中 | 放置验证文件，轮询等待 |
-| `pending` | 待提交 | POST 提交 CSR |
+| `pending` | 已提交但仍在处理 | 归一为 `processing`，后续只 GET 查询，不重复 POST |
+| `approving` | 审批中（processing 与 active 之间的短暂中间态） | 归一为 `processing`，继续查询等待 |
 | `unpaid` | 待支付 | POST 触发支付 |
 
 ### 部署流程
@@ -271,9 +271,32 @@ sslctl                    Manager API                    CA
 
 ---
 
+## 部署链与回调契约
+
+统一规范详见 `deploy-spec.md`，此处为 sslctl 侧要点。
+
+### 回调契约（`pkg/certops`）
+
+- 部署/续签结果通过 `POST /api/deploy/callback` 上报，属**非关键路径**：失败仅记录日志，传输层含指数退避重试。
+- 请求体固定三字段 `order_id` / `status` / `deployed_at`，外加**可选** `message`（`omitempty`，仅 `status=failure` 携带）。
+- `status` 仅 `success` / `failure`（`pending` 不上报回调）。
+- `message` 为失败原因摘要：客户端复用 `logger.Sanitize` 脱敏后按 rune 截断 ≤256（`callbackMessageMaxLen=256`，服务端上限 500，超限整条被拒）。
+- 客户端只上报明确的部署结果：每次部署成功或失败由编排层在结果落盘后尽力回调一次；签发失败不回调，触顶、过期和 policy 阻断均静默终止且不回调。
+- 底层部署函数只返回结构化结果，不自行发送回调；传输失败仅由既有退避重试兜底，最终失败只记日志，不持久排队或补发。
+
+### 部署链语义（setup/deploy/续签）
+
+- **复用统一部署路径**：setup 部署走 `Service.DeployToBinding`，与 deploy/续签一致地做证书私钥校验、覆盖前备份现有证书、测试/reload 失败自动回滚，消除 setup 直接覆盖无备份的旧路径。
+- **失败如实统计**：SSL 配置安装失败的绑定标记 `Enabled=false` 后跳过部署并计入失败，单证书与批量模式一致，不误报"部署成功"。
+- **退出码语义**（`hasDeployFailures`）：任一站点部署失败、任一证书失败、或存在需人工提供私钥而跳过的证书，进程即以退出码 1 结束（部分失败也算失败，先保存成功站点配置再退出），单证书与批量模式一致。
+- **pending 私钥转正时机**（local 续签，deploy-spec §3.8）：签发 active 后先校验服务端证书与 pending 私钥配对，不配对按失败处理（保留 pending、不动线上私钥）；配对通过并部署成功后才转正，旧线上私钥由部署路径覆盖前备份。部署全失败时不得更新到期元数据，保持下轮完整自愈。
+
+---
+
 ## 安全特性
 
 - **HTTPS 强制**：远程 API 必须使用 HTTPS（仅 localhost 允许 HTTP）
+- **续签/部署进程互斥**：`config.AcquireRenewalLock` 共享 `renewal.lock`，daemon 续签检查与手动 deploy/setup 非阻塞互斥，手动侧被占用时提示"守护进程正在续签"退出（deploy-spec §3.7）
 - **SSRF 防护**：阻止访问内网 IP（10/172.16/192.168）和云元数据地址（169.254.169.254）
 - **命令白名单**：统一的 `internal/executor` 包，只允许执行预定义的 Nginx/Apache 命令
 - **日志脱敏**：自动过滤 PEM 私钥、Bearer Token、password/secret 参数
@@ -288,7 +311,7 @@ sslctl                    Manager API                    CA
 - **systemd 安全加固**：NoNewPrivileges + ProtectSystem=strict + ReadWritePaths 白名单
 - **日志轮转**：自动清理旧日志文件（保留 30 天/10 个）
 - **重试限制**：CSR 签发重试次数上限（10 次）
-- **私钥保护**：本机提交下，新私钥先保存到临时位置，签发成功后再替换
+- **私钥保护**：本机提交下，新私钥先保存到临时位置（pending-keys/），证书私钥配对校验通过且部署成功后再转正；配对校验失败按失败处理，保留 pending 私钥、不动线上私钥
 - **环境变量**：支持通过环境变量配置敏感信息（优先级高于配置文件）
 
 ---
@@ -302,7 +325,7 @@ sslctl                    Manager API                    CA
     "token": "xxx"
   },
   "schedule": {
-    "renew_before_days": 13,
+    "renew_before_days": 14,
     "renew_mode": "pull"
   },
   "certificates": [
@@ -332,7 +355,7 @@ sslctl                    Manager API                    CA
 
 | 字段 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `renew_before_days` | int | 13 | 提前续期天数，最大 13，0 使用默认值 |
+| `renew_before_days` | int | 14 | 提前续期天数，上限 30，0 使用默认值 14；由服务端下发并在每次 API 交互后回写（`DefaultRenewBeforeDays=14`、`MaxRenewBeforeDays=30`，见 deploy-spec 2.9） |
 | `renew_mode` | string | `pull` | 全局续签模式，证书级别 `certificates[].renew_mode` 可覆盖 |
 
 ### config.json.lock
@@ -368,12 +391,33 @@ sslctl                    Manager API                    CA
 
 ## 续签模式
 
-两种模式统一：`renew_before_days` 最大 13 天，默认 13 天。
+两种模式统一：`renew_before_days` 默认 14 天、上限 30 天，由服务端下发并在每次 API 交互后回写本地配置。超过 30 视为服务端异常值，拒绝更新并保留本地现值，防止异常大值把全部证书拉入需续签状态、触发每日全量续签（`DefaultRenewBeforeDays=14`、`MaxRenewBeforeDays=30`，见 deploy-spec 2.9）。
 
-| 模式 | 说明 | 默认值 |
+| 模式 | 说明 | 默认续签阈值 |
 |------|------|--------|
-| `local` | 本机提交，本地生成私钥和 CSR | 13 天 |
-| `pull` | 自动签发，从服务端拉取已签发证书 | 13 天 |
+| `local` | 本机提交，本地生成私钥和 CSR | 14 天 |
+| `pull` | 自动签发，从服务端拉取已签发证书 | 14 天 |
+
+### 续签判定与调度
+
+- **续签判定**（`NeedsRenewal`）：到期时间未知（元数据零值）返回 false，交由续签检查先查询 API 回填元数据后再判定；已过期证书不再触发续签（`IsExpired` 按时间点判定，过期不足 24 小时也算已过期，无整数天截断偏移）；否则 `DaysUntilExpiry() <= renew_before_days` 时续签。
+- **到期时间未知不再静默跳过**：元数据零值（部署成功但保存失败、带外换证等）会自动查询 API 回填元数据后按正常逻辑判定；过期告警对该情况输出"到期时间未知"。
+- **定时检查**：每天一次，随机选择明天 09:00~23:59 的时间点执行（服务端 0:00~7:59 续签，预留 1 小时签发）；启动即检查一次；运行中若 `LastCheckAt` 距今超 25 小时（停摆/睡眠/任务跳过）则在 30~60 分钟内补偿一轮。
+- **单证书 panic 隔离**：续签循环中单证书处理 panic 记为该证书 failure（Error 日志 + 计入统计），不拖垮整轮。
+- **多证书续签间隔**：每个证书处理后随机延迟 30~90 秒，分散 API 请求压力。
+- **证书过期告警**（守护进程 `CheckExpiry` 周期检查）：剩余不足 7 天输出 Error，不足 13 天输出 Warn，已过期输出 Error（阈值来自 `pkg/certops/service.go` 的 `7*24h`/`13*24h`）。
+- **尝试次数上限**：签发与部署分别计数，各自达到 10 次即进入 `CAPPED`，静默停止并等待人工处理（不自动重置、不发送回调）。
+
+### processing / active 状态处理
+
+- `processing`（含 `pending` / `approving` 归一）：保持查询等待，不自动重提交；返回 `file` 字段时放置验证文件后等待下次检查。
+- 异常状态（订单终态）：持久化后停止，交人工处理；后续轮次仍只 GET 查询自愈，状态未变化不重复记录/落盘，绝不重新提交 CSR。
+- 提交 CSR 遇明确业务拒绝（API code != 1）：属确定结果，清理在途 pending 私钥后停止；超时/断连/解析失败等不确定结果保留 pending 私钥并归一 `processing`，下轮只查询恢复。
+- `active` 时若 pending 私钥缺失且正式私钥与服务端证书不配对（历史改名残留 / 误删）：重置签发状态走重新提交 CSR（递增 retry，受 10 次上限约束），避免永久卡死。
+
+### order_id 变更（订单续费）改名迁移
+
+订单续费导致 `order_id` 变更、证书按 `{domain}-{order_id}` 改名时，同步迁移 `pending-keys/{cert_name}` 目录（`renamePendingKey`，不存在则跳过），确保 local 模式续签不丢失 pending 私钥。
 
 ### 配置级别
 
@@ -469,7 +513,9 @@ sslctl setup --key /path/key.pem --webroot /var/www/html --url <url> --token <to
 2. 对每个 webroot：`util.JoinUnderDir(webroot, file.Path)` 防目录穿越 → `util.AtomicWrite` 写入（0644）
 3. 记录已写入路径到 `cert.Metadata.ValidationFiles` → 持久化到 config.json
 4. 返回等待下次检查（次日 CA 完成验证后 status 变为 active）
-5. 部署成功后 `cleanupValidationFiles()` 删除文件并清理空目录
+5. 签发完成后无论部署成败均由 `cleanupValidationFiles()` 删除文件并清理空目录，不残留 webroot
+
+**全部放置失败按失败处理**：若无可用 webroot、或所有 webroot 写入均失败，按失败处理并上报原因（回调 failure），不再静默永远 pending。
 
 **配置字段**：
 - `certificates[].validation_method`：验证方法（`file` | `delegation`），传递给 API 的 `validation_method` 参数

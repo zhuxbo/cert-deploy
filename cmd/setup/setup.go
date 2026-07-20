@@ -17,6 +17,7 @@ import (
 
 	apacheScanner "github.com/zhuxbo/sslctl/internal/apache/scanner"
 	nginxScanner "github.com/zhuxbo/sslctl/internal/nginx/scanner"
+	"github.com/zhuxbo/sslctl/pkg/certops"
 	"github.com/zhuxbo/sslctl/pkg/config"
 	sslerrors "github.com/zhuxbo/sslctl/pkg/errors"
 	"github.com/zhuxbo/sslctl/pkg/fetcher"
@@ -134,6 +135,17 @@ func Run(args []string, debug bool) {
 		log.SetLevel(logger.LevelDebug)
 	}
 
+	// 与守护进程共享续签互斥锁，避免 setup 与自动续签并发操作同一证书目录与配置
+	release, acquired, lockErr := config.AcquireRenewalLock(cfgManager.GetWorkDir())
+	if lockErr != nil {
+		log.Warn("%v，继续执行", lockErr)
+	} else if !acquired {
+		fmt.Fprintln(os.Stderr, "守护进程正在续签（或另一部署进程正在运行），请稍后再试")
+		os.Exit(1)
+	} else {
+		defer release()
+	}
+
 	params := &setupParams{
 		apiURL:         *apiURL,
 		token:          *token,
@@ -173,11 +185,12 @@ func runSingle(p *setupParams, orderID int) {
 	// 2. 获取证书信息
 	fmt.Println("\n步骤 2/7: 获取证书信息...")
 	f := fetcher.New(30 * time.Second)
-	certData, _, err := f.QueryOrder(p.ctx, p.apiURL, p.token, orderID)
+	certData, renewBeforeDays, err := f.QueryOrder(p.ctx, p.apiURL, p.token, orderID)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "查询订单失败: %v\n", err)
 		os.Exit(1)
 	}
+	applyRenewBeforeDays(p.cfgManager, p.log, renewBeforeDays)
 
 	// 订单续费后 API 返回新订单号
 	if certData.OrderID > 0 && certData.OrderID != orderID {
@@ -203,6 +216,12 @@ func runSingle(p *setupParams, orderID int) {
 	if len(certDomains) == 0 {
 		fmt.Fprintln(os.Stderr, "证书缺少域名信息（CN 和 SAN 均为空）")
 		os.Exit(1)
+	}
+
+	// SAN 含 IP 的证书强制 local + file（deploy-spec §5.2）；DNS 证书按命令行参数派生
+	useLocalKey, useFileValidation := deriveRenewPolicy(certDomains, p.localKey, p.fileValidation)
+	if config.ContainsIPDomain(certDomains) {
+		fmt.Println("  检测到 IP 证书，自动启用本机提交 + 文件验证（local/file）")
 	}
 
 	// 如果 API 返回了私钥，立即验证匹配
@@ -287,14 +306,14 @@ func runSingle(p *setupParams, orderID int) {
 	}
 
 	// 校验验证方式与域名兼容性（在部署前检查，避免部署后配置保存失败导致状态不一致）
-	if p.fileValidation {
+	if useFileValidation {
 		for _, domain := range certDomains {
 			if errMsg := config.ValidateValidationMethod(domain, config.ValidationMethodFile); errMsg != "" {
 				fmt.Fprintf(os.Stderr, "域名 %s: %s\n", domain, errMsg)
 				os.Exit(1)
 			}
 		}
-		// --file-validation 无 --webroot 时，检查至少一个绑定有扫描到的 webroot
+		// 文件验证无 --webroot 时，检查至少一个绑定有扫描到的 webroot
 		if p.webroot == "" {
 			hasWebroot := false
 			for _, b := range bindings {
@@ -385,13 +404,8 @@ func runSingle(p *setupParams, orderID int) {
 		if certData.IntermediateCert != "" {
 			fullchain += "\n" + certData.IntermediateCert
 		}
-		if err := util.AtomicWrite(binding.Paths.Certificate, []byte(fullchain), 0644); err != nil {
-			fmt.Fprintf(os.Stderr, "    %s: 写入证书失败: %v\n", site.ServerName, err)
-			binding.Enabled = false
-			continue
-		}
-		if err := util.AtomicWrite(binding.Paths.PrivateKey, []byte(privateKey), 0600); err != nil {
-			fmt.Fprintf(os.Stderr, "    %s: 写入私钥失败: %v\n", site.ServerName, err)
+		if err := prewriteKeyThenCert(binding.Paths.Certificate, binding.Paths.PrivateKey, fullchain, privateKey); err != nil {
+			fmt.Fprintf(os.Stderr, "    %s: %v\n", site.ServerName, err)
 			binding.Enabled = false
 			continue
 		}
@@ -409,23 +423,9 @@ func runSingle(p *setupParams, orderID int) {
 		}
 	}
 
-	// 部署到每个绑定
-	var successCount, failCount int
-	var failedSites []string
-	for i := range bindings {
-		binding := &bindings[i]
-		fmt.Printf("  部署到: %s\n", binding.ServerName)
-
-		if err := deployToSiteBinding(p.ctx, binding, certData, privateKey, p.log); err != nil {
-			fmt.Fprintf(os.Stderr, "    部署失败: %v\n", err)
-			failCount++
-			failedSites = append(failedSites, binding.ServerName)
-			binding.Enabled = false // 标记失败绑定为禁用，避免守护进程持续重试
-			continue
-		}
-		fmt.Printf("    ✓ 部署成功\n")
-		successCount++
-	}
+	// 部署到每个绑定（跳过因 SSL 配置安装失败而被禁用的绑定，计为失败而非误报成功）
+	svc := certops.NewService(p.cfgManager, p.log)
+	successCount, failCount, failedSites := deploySingleBindings(p.ctx, svc, bindings, certData, privateKey)
 
 	// 全部失败时退出
 	if successCount == 0 && failCount > 0 {
@@ -444,19 +444,19 @@ func runSingle(p *setupParams, orderID int) {
 	certConfig.Metadata.CertSerial = fmt.Sprintf("%X", parsedCert.SerialNumber)
 	certConfig.Metadata.LastDeployAt = time.Now()
 
-	if p.localKey {
+	if useLocalKey {
 		certConfig.RenewMode = config.RenewModeLocal
 	}
 
-	// 验证方式和 webroot（域名兼容性已在部署前校验）
-	if p.fileValidation {
+	// 验证方式和 webroot（域名兼容性已在部署前校验；IP 证书已强制 file）
+	if useFileValidation {
 		certConfig.ValidationMethod = config.ValidationMethodFile
 		if p.webroot != "" {
 			for i := range certConfig.Bindings {
 				certConfig.Bindings[i].Paths.Webroot = p.webroot
 			}
 		}
-	} else if p.localKey {
+	} else if useLocalKey {
 		certConfig.ValidationMethod = config.ValidationMethodDelegation
 	}
 
@@ -508,6 +508,22 @@ func runSingle(p *setupParams, orderID int) {
 		fmt.Println("\n[!] 检测到 Docker 容器站点的证书路径未挂载为卷")
 		fmt.Println("    重建容器后需要重新部署证书")
 	}
+
+	// 存在部署失败的站点时非零退出（部分失败也算失败），便于脚本调用方感知
+	if hasDeployFailures(failCount, 0, 0) {
+		os.Exit(1)
+	}
+}
+
+// deriveRenewPolicy 按证书域名与命令行参数逐证书派生续签策略（deploy-spec §5.2）。
+// SAN 含 IP 的证书强制 local + file；DNS 证书按命令行参数透传。
+// 逐证书独立派生，混合批次下 IP 证书不影响 DNS 证书。
+// 返回 (useLocalKey, useFileValidation)。
+func deriveRenewPolicy(certDomains []string, localKey, fileValidation bool) (useLocalKey, useFileValidation bool) {
+	if config.ContainsIPDomain(certDomains) {
+		return true, true
+	}
+	return localKey, fileValidation
 }
 
 // scanSites 扫描站点（使用 webserver 抽象层）
@@ -544,16 +560,20 @@ func scanSites(serverType string, log *logger.Logger) []*matcher.ScannedSiteInfo
 	// 转换为 matcher.ScannedSiteInfo
 	for _, site := range allSites {
 		sites = append(sites, &matcher.ScannedSiteInfo{
-			ServerName:  site.ServerName,
-			ServerAlias: site.ServerAlias,
-			ConfigFile:  site.ConfigFile,
-			HasSSL:      site.CertificatePath != "",
-			CertPath:    site.CertificatePath,
-			KeyPath:     site.PrivateKeyPath,
-			ChainPath:   site.ChainFile,
-			ServerType:  string(site.ServerType),
-			ContainerID: site.ContainerID,
-			VolumeMode:  site.VolumeMode,
+			ServerName:    site.ServerName,
+			ServerAlias:   site.ServerAlias,
+			ConfigFile:    site.ConfigFile,
+			HasSSL:        site.CertificatePath != "",
+			CertPath:      site.CertificatePath,
+			KeyPath:       site.PrivateKeyPath,
+			ChainPath:     site.ChainFile,
+			ServerType:    string(site.ServerType),
+			ContainerID:   site.ContainerID,
+			ContainerName: site.ContainerName,
+			HostCertPath:  site.HostCertPath,
+			HostKeyPath:   site.HostKeyPath,
+			HostChainPath: site.HostChainPath,
+			VolumeMode:    site.VolumeMode,
 		})
 	}
 
@@ -597,12 +617,24 @@ func mergeSameNameSites(sites []*matcher.ScannedSiteInfo) []*matcher.ScannedSite
 
 // createBinding 创建站点绑定
 func createBinding(site *matcher.ScannedSiteInfo, cm *config.ConfigManager) config.SiteBinding {
+	isDocker := config.IsDockerType(site.ServerType)
+
 	// 确定证书路径
 	certPath := site.CertPath
 	keyPath := site.KeyPath
 
-	// 如果站点没有 SSL 配置，使用默认路径
-	if certPath == "" {
+	// Docker 站点：证书写入宿主机侧挂载路径（容器内路径不能直接写）
+	if isDocker {
+		if site.HostCertPath != "" {
+			certPath = site.HostCertPath
+		}
+		if site.HostKeyPath != "" {
+			keyPath = site.HostKeyPath
+		}
+	}
+
+	// 本地站点无 SSL 配置时使用默认路径；Docker 站点缺挂载路径由部署层报错，不落默认路径
+	if certPath == "" && !isDocker {
 		certDir, _ := cm.EnsureSiteCertsDir(site.ServerName)
 		certPath = filepath.Join(certDir, "cert.pem")
 		keyPath = filepath.Join(certDir, "key.pem")
@@ -621,16 +653,31 @@ func createBinding(site *matcher.ScannedSiteInfo, cm *config.ConfigManager) conf
 	}
 
 	// Apache：保留扫描到的 ChainFile 路径（已有 SSLCertificateChainFile 的站点）
-	// 新安装 SSL 的站点 ChainPath 为空，使用 fullchain 模式
-	if site.ChainPath != "" {
+	// 新安装 SSL 的站点 ChainPath 为空，使用 fullchain 模式。
+	// Docker 卷模式必须用宿主机链路径，否则会把证书链写到容器内路径（宿主机错误位置）。
+	if site.VolumeMode && site.HostChainPath != "" {
+		binding.Paths.ChainFile = site.HostChainPath
+	} else if site.ChainPath != "" {
 		binding.Paths.ChainFile = site.ChainPath
 	}
 
 	// 设置重载命令（根据系统环境动态检测）
 	var cmds webserver.ServerCommands
-	if site.ServerType == config.ServerTypeNginx {
+	switch {
+	case isDocker:
+		// Docker 站点：容器化 test/reload 命令 + Docker 元信息
+		cmds = webserver.DetectDockerCommands(webserver.ServerType(site.ServerType), site.ContainerName)
+		deployMode := "copy"
+		if site.VolumeMode && site.HostCertPath != "" {
+			deployMode = "volume"
+		}
+		binding.Docker = &config.DockerInfo{
+			ContainerName: site.ContainerName,
+			DeployMode:    deployMode,
+		}
+	case site.ServerType == config.ServerTypeNginx:
 		cmds = webserver.DetectNginxCommands()
-	} else if site.ServerType == config.ServerTypeApache {
+	case site.ServerType == config.ServerTypeApache:
 		cmds = webserver.DetectApacheCommands()
 	}
 	if cmds.TestCmd != "" {
@@ -658,27 +705,42 @@ func processRestartServerName(bindings []config.SiteBinding) string {
 }
 
 // deployToSiteBinding 部署证书到单个站点绑定
-func deployToSiteBinding(ctx context.Context, binding *config.SiteBinding, certData *fetcher.CertData, privateKey string, log *logger.Logger) error {
-	// 确保目录存在
-	certDir := filepath.Dir(binding.Paths.Certificate)
-	if err := util.EnsureDir(certDir, 0700); err != nil {
-		return fmt.Errorf("创建证书目录失败: %w", err)
-	}
+// 复用 certops 的部署路径（证书校验 + 现有证书备份 + 失败自动回滚），与 deploy/续签路径一致
+func deployToSiteBinding(ctx context.Context, svc *certops.Service, binding *config.SiteBinding, certData *fetcher.CertData, privateKey string) error {
+	return svc.DeployToBinding(ctx, binding, certData, privateKey)
+}
 
-	// 使用 webserver 抽象层创建部署器
-	deployer, err := webserver.NewDeployer(
-		webserver.ServerType(binding.ServerType),
-		binding.Paths.Certificate,
-		binding.Paths.PrivateKey,
-		binding.Paths.ChainFile,
-		binding.Reload.TestCommand,
-		binding.Reload.ReloadCommand,
-	)
-	if err != nil {
-		return fmt.Errorf("创建部署器失败: %w", err)
-	}
+// deploySingleBindings 部署单证书模式的所有绑定，返回成功数、失败数和失败站点列表。
+func deploySingleBindings(ctx context.Context, svc *certops.Service, bindings []config.SiteBinding, certData *fetcher.CertData, privateKey string) (success, fail int, failedSites []string) {
+	for i := range bindings {
+		binding := &bindings[i]
+		if !binding.Enabled {
+			// SSL 配置安装失败等已禁用该绑定：计为失败，避免误报部署成功
+			fmt.Fprintf(os.Stderr, "    %s: 跳过部署（SSL 配置安装失败）\n", binding.ServerName)
+			fail++
+			failedSites = append(failedSites, binding.ServerName)
+			continue
+		}
+		fmt.Printf("  部署到: %s\n", binding.ServerName)
 
-	return deployer.Deploy(certData.Cert, certData.IntermediateCert, privateKey)
+		if err := deployToSiteBinding(ctx, svc, binding, certData, privateKey); err != nil {
+			fmt.Fprintf(os.Stderr, "    部署失败: %v\n", err)
+			fail++
+			failedSites = append(failedSites, binding.ServerName)
+			binding.Enabled = false
+			continue
+		}
+		fmt.Printf("    ✓ 部署成功\n")
+		success++
+	}
+	return
+}
+
+// hasDeployFailures 判断本次部署是否存在失败/未完成（用于决定进程退出码）。
+// 任一站点部署失败、任一证书失败、或存在需人工提供私钥而跳过的证书，均视为失败。
+// 部分失败也算失败，便于脚本调用方通过退出码感知，而非误判为全部成功。
+func hasDeployFailures(siteFail, certFail, needKey int) bool {
+	return siteFail > 0 || certFail > 0 || needKey > 0
 }
 
 // installService 安装守护服务
@@ -703,6 +765,19 @@ func installService() error {
 
 	// 启动服务
 	return svcMgr.Start()
+}
+
+// prewriteKeyThenCert 为待安装 SSL 的站点预写证书文件：先写私钥后写证书，
+// 与全项目"先写私钥后写证书"原则一致，中途失败不留下"新证书 + 旧私钥"的错配状态。
+// 注意：两文件各自原子写，但两者之间尚未事务化（TODO：needSSLInstall 预写整体事务化）。
+func prewriteKeyThenCert(certPath, keyPath, fullchain, privateKey string) error {
+	if err := util.AtomicWrite(keyPath, []byte(privateKey), 0600); err != nil {
+		return fmt.Errorf("写入私钥失败: %w", err)
+	}
+	if err := util.AtomicWrite(certPath, []byte(fullchain), 0644); err != nil {
+		return fmt.Errorf("写入证书失败: %w", err)
+	}
+	return nil
 }
 
 // installSSLConfig 为未启用 SSL 的站点安装 HTTPS 配置
@@ -910,7 +985,20 @@ func extractDomainsFromCert(cert *x509.Certificate) []string {
 // pull 模式 → autoReissue=true；local 模式 → autoReissue=false
 func notifyAutoReissue(p *setupParams, f *fetcher.Fetcher, orderID int, renewMode string) {
 	autoReissue := renewMode != config.RenewModeLocal
-	if err := f.ToggleAutoReissue(p.ctx, p.apiURL, p.token, orderID, autoReissue); err != nil {
+	renewBeforeDays, err := f.ToggleAutoReissue(p.ctx, p.apiURL, p.token, orderID, autoReissue)
+	if err != nil {
 		p.log.Warn("toggleAutoReissue 失败 (order_id=%d, auto_reissue=%v): %v", orderID, autoReissue, err)
+		return
+	}
+	applyRenewBeforeDays(p.cfgManager, p.log, renewBeforeDays)
+}
+
+func applyRenewBeforeDays(cm *config.ConfigManager, log *logger.Logger, value int) {
+	if value > config.MaxRenewBeforeDays {
+		log.Warn("服务端返回的 renew_before_days=%d 超过上限 %d，保留本地配置", value, config.MaxRenewBeforeDays)
+		return
+	}
+	if _, err := cm.UpdateRenewBeforeDays(value); err != nil {
+		log.Warn("更新 renew_before_days 失败: %v", err)
 	}
 }

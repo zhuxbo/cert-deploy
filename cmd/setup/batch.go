@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/zhuxbo/sslctl/pkg/certops"
 	"github.com/zhuxbo/sslctl/pkg/config"
 	"github.com/zhuxbo/sslctl/pkg/fetcher"
 	"github.com/zhuxbo/sslctl/pkg/matcher"
@@ -30,10 +31,10 @@ type certDeployPlan struct {
 
 // siteCandidate 站点的候选证书信息（用于冲突解决）
 type siteCandidate struct {
-	planIndex    int                // certDeployPlan 索引
-	matchType    config.MatchType   // 匹配类型
-	matchedCount int                // 匹配域名数
-	orderID      int                // 订单 ID（越大越新）
+	planIndex    int              // certDeployPlan 索引
+	matchType    config.MatchType // 匹配类型
+	matchedCount int              // 匹配域名数
+	orderID      int              // 订单 ID（越大越新）
 }
 
 // runBatch 批量部署
@@ -50,11 +51,12 @@ func runBatch(p *setupParams, query string) {
 	// 2/8: 查询证书
 	fmt.Println("\n步骤 2/8: 查询证书...")
 	f := fetcher.New(30 * time.Second)
-	certList, _, err := f.QueryBatch(p.ctx, p.apiURL, p.token, query)
+	certList, renewBeforeDays, err := f.QueryBatch(p.ctx, p.apiURL, p.token, query)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "查询证书失败: %v\n", err)
 		os.Exit(1)
 	}
+	applyRenewBeforeDays(p.cfgManager, p.log, renewBeforeDays)
 
 	if len(certList) == 0 {
 		fmt.Fprintln(os.Stderr, "未查询到证书")
@@ -232,11 +234,18 @@ func runBatch(p *setupParams, query string) {
 		certConfig.Metadata.CertSerial = fmt.Sprintf("%X", plan.ParsedCert.SerialNumber)
 		certConfig.Metadata.LastDeployAt = time.Now()
 
-		if p.localKey {
+		// 逐证书派生续签模式：SAN 含 IP 的证书强制 local + file（deploy-spec §5.2），
+		// DNS 证书按命令行参数派生，混合批次下 DNS 证书不受 IP 证书影响。
+		useLocalKey, useFileValidation := deriveRenewPolicy(plan.CertDomains, p.localKey, p.fileValidation)
+		if config.ContainsIPDomain(plan.CertDomains) {
+			fmt.Printf("  证书 %s 含 IP，自动启用 local/file\n", certConfig.CertName)
+		}
+
+		if useLocalKey {
 			certConfig.RenewMode = config.RenewModeLocal
 		}
 
-		if p.fileValidation {
+		if useFileValidation {
 			// 校验：通配符域名不支持文件验证
 			skipCert := false
 			for _, domain := range plan.CertDomains {
@@ -268,7 +277,7 @@ func runBatch(p *setupParams, query string) {
 					continue
 				}
 			}
-		} else if p.localKey {
+		} else if useLocalKey {
 			certConfig.ValidationMethod = config.ValidationMethodDelegation
 		}
 
@@ -333,6 +342,11 @@ func runBatch(p *setupParams, query string) {
 				break
 			}
 		}
+	}
+
+	// 存在失败/未完成（含需私钥而跳过）时非零退出（部分失败也算失败），便于脚本调用方感知
+	if hasDeployFailures(totalSiteFail, certFail, len(needKeyNames)) {
+		os.Exit(1)
 	}
 }
 
@@ -492,6 +506,7 @@ func installSSLForBatch(site *matcher.ScannedSiteInfo, plan *certDeployPlan, p *
 
 // deployPlanBindings 部署证书计划中的所有绑定，返回成功和失败数
 func deployPlanBindings(p *setupParams, plan *certDeployPlan) (success, fail int) {
+	svc := certops.NewService(p.cfgManager, p.log)
 	for i := range plan.Bindings {
 		binding := &plan.Bindings[i]
 		if !binding.Enabled {
@@ -500,7 +515,7 @@ func deployPlanBindings(p *setupParams, plan *certDeployPlan) (success, fail int
 		}
 		fmt.Printf("    部署到: %s\n", binding.ServerName)
 
-		if err := deployToSiteBinding(p.ctx, binding, plan.CertData, plan.PrivateKey, p.log); err != nil {
+		if err := deployToSiteBinding(p.ctx, svc, binding, plan.CertData, plan.PrivateKey); err != nil {
 			fmt.Fprintf(os.Stderr, "      部署失败: %v\n", err)
 			fail++
 			binding.Enabled = false

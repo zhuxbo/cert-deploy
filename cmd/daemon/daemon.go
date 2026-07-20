@@ -82,8 +82,12 @@ func Run(parentCtx context.Context, args []string, version, buildTime string, de
 		checkAndDeploy(ctx, svc, cfgManager, log)
 	}()
 
+	firstRound := true
 	for {
-		delay := nextRandomDaily()
+		// 首轮跳过补偿判定：启动时已无条件立即检查一次（异步进行中，LastCheckAt 尚未更新），
+		// 若首轮也按 overdue 排短延迟会与启动轮双跑
+		delay := nextCheckDelay(cfgManager, log, firstRound)
+		firstRound = false
 		log.Info("下次检查: %v 后", delay.Round(time.Minute))
 		timer := time.NewTimer(delay)
 
@@ -132,6 +136,47 @@ func gracefulShutdown(wg *sync.WaitGroup, timeout time.Duration, log *logger.Log
 	}
 }
 
+// overdueCheckThreshold 补偿检查阈值：上次成功检查距今超过该时长视为已错过
+// （正常节奏为每天一次，留 1 小时余量）
+const overdueCheckThreshold = 25 * time.Hour
+
+// isCheckOverdue 判断续签检查是否已错过（从未检查或距上次检查超过阈值）
+// 配置读取失败时按未错过处理（checkAndDeploy 执行时会再报错）
+func isCheckOverdue(cfgManager *config.ConfigManager) (bool, time.Time) {
+	cfg, err := cfgManager.Load()
+	if err != nil {
+		return false, time.Time{}
+	}
+	last := cfg.Metadata.LastCheckAt
+	if last.IsZero() || time.Since(last) > overdueCheckThreshold {
+		return true, last
+	}
+	return false, last
+}
+
+// nextCheckDelay 计算下次检查延迟：
+// 常规为明天随机时刻；已错过（daemon 停摆、系统睡眠、上一任务超时跳过等）时
+// 30~60 分钟内补偿一轮，而非等到明天，消除调度错过后的自愈盲区。
+// 补偿延迟不取过短值：若检查因配置损坏等持续失败（LastCheckAt 不更新），重试频率可控。
+// skipOverdue 为 true 时跳过补偿判定（首轮：启动检查已覆盖）。
+func nextCheckDelay(cfgManager *config.ConfigManager, log *logger.Logger, skipOverdue bool) time.Duration {
+	if skipOverdue {
+		return nextRandomDaily()
+	}
+	overdue, last := isCheckOverdue(cfgManager)
+	if !overdue {
+		return nextRandomDaily()
+	}
+	delay := time.Duration(30+rand.IntN(31)) * time.Minute
+	if last.IsZero() {
+		log.Info("尚无续签检查完成记录，%v 后执行补偿检查", delay.Round(time.Minute))
+	} else {
+		log.Warn("上次续签检查在 %s（已超过 %v），%v 后执行补偿检查",
+			last.Format("2006-01-02 15:04"), overdueCheckThreshold, delay.Round(time.Minute))
+	}
+	return delay
+}
+
 // nextRandomDaily 计算到明天随机时刻的延迟
 // 在明天 09:00~23:59 之间随机选择一个时间点，最短不低于 1 小时
 // 避开 0:00~8:59：服务端 0:00~7:59 执行续签，预留 1 小时签发时间
@@ -173,25 +218,15 @@ func checkAndDeploy(parentCtx context.Context, svc *certops.Service, cfgManager 
 		}
 	}()
 
-	// 进程级文件锁：防止 cron 重叠、手动与 daemon 并发
-	lockPath := filepath.Join(cfgManager.GetWorkDir(), "renewal.lock")
-	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
-	if err != nil {
-		log.Warn("创建锁文件失败: %v，继续执行", err)
+	// 进程级文件锁：防止 cron 重叠、手动 deploy/setup 与 daemon 并发（共享同一把锁）
+	release, acquired, lockErr := config.AcquireRenewalLock(cfgManager.GetWorkDir())
+	if lockErr != nil {
+		log.Warn("%v，继续执行", lockErr)
+	} else if !acquired {
+		log.Info("另一个续签/部署进程正在运行，跳过本次检查")
+		return
 	} else {
-		locked, lockErr := config.TryLockFile(lockFile)
-		if lockErr != nil {
-			_ = lockFile.Close()
-			log.Warn("获取文件锁失败: %v，继续执行", lockErr)
-		} else if !locked {
-			_ = lockFile.Close()
-			log.Info("另一个续签进程正在运行，跳过本次检查")
-			return
-		} else {
-			defer func() {
-				_ = lockFile.Close() // 关闭文件自动释放锁
-			}()
-		}
+		defer release()
 	}
 
 	// 动态计算超时：根据证书数量调整，防止大量证书场景超时

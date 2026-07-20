@@ -1163,9 +1163,11 @@ func TestDeployCertToBindings_AllFailed(t *testing.T) {
 	if len(failedBindings) != 2 {
 		t.Errorf("failedBindings count = %d, want 2", len(failedBindings))
 	}
-	// CertExpiresAt 应已更新（证书本身有效）
-	if cert.Metadata.CertExpiresAt.IsZero() {
-		t.Error("CertExpiresAt 应已更新（即使部署全部失败）")
+	// 元数据不变式：全部失败时 CertExpiresAt 不得更新，
+	// 否则下轮 NeedsRenewal=false 只走 retryFailedBindings，
+	// 而未转正的 pending 私钥读不到，旧钥与新证书配对必败，站点走向真实过期
+	if !cert.Metadata.CertExpiresAt.IsZero() {
+		t.Error("CertExpiresAt 不应更新（全部部署失败，保持自愈能力）")
 	}
 	// LastDeployAt 不应更新（没有成功部署）
 	if !cert.Metadata.LastDeployAt.IsZero() {

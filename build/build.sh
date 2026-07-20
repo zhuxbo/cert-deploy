@@ -1,93 +1,51 @@
-#!/bin/bash
-# 构建脚本 - 多平台交叉编译
-# 用法: ./build.sh [version]
+#!/usr/bin/env bash
+# 仅负责从当前工作树构建 sslctl 的固定三平台产物。
 
-set -e
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-OUTPUT_DIR="${PROJECT_DIR}/dist"
+SOURCE_DIR="${SSLCTL_SOURCE_DIR:-$PROJECT_DIR}"
+VERSION="${1:-}"
+OUTPUT_DIR="${2:-}"
 
-# 检测 Go 路径
-if command -v go &>/dev/null; then
-    GO_CMD="go"
-elif [ -x "/usr/local/go/bin/go" ]; then
-    GO_CMD="/usr/local/go/bin/go"
-else
-    echo "Error: Go not found"
+if [[ -z "$VERSION" || -z "$OUTPUT_DIR" ]]; then
+    echo "用法: $0 <x.y.z[-prerelease]> <output-dir>" >&2
+    exit 2
+fi
+VERSION="${VERSION#v}"
+python3 "$SCRIPT_DIR/release_helper.py" channel "$VERSION" >/dev/null
+
+if ! command -v go >/dev/null 2>&1; then
+    echo "错误: 未找到 Go" >&2
     exit 1
 fi
-
-# 读取版本号
-BUILD_TIME=$(date -u +%Y-%m-%d)
-
-if [ -n "$1" ]; then
-    VERSION="$1"
-elif [ -f "${PROJECT_DIR}/version.json" ]; then
-    if command -v jq &>/dev/null; then
-        VERSION=$(jq -r '.version' "${PROJECT_DIR}/version.json")
-    else
-        VERSION=$(grep '"version"' "${PROJECT_DIR}/version.json" | sed 's/.*: "\(.*\)".*/\1/')
-    fi
-    [ -z "$VERSION" ] && VERSION="dev"
-else
-    # 从 git tag 获取最新版本，或使用默认值
-    VERSION=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0-dev")
-    echo "version.json 不存在，从 git tag 获取版本: ${VERSION}"
-    # 生成 version.json
-    cat > "${PROJECT_DIR}/version.json" << EOF
-{
-  "version": "${VERSION}",
-  "build_date": "${BUILD_TIME}"
-}
-EOF
-    echo "已生成 version.json"
+[[ -f "$SOURCE_DIR/go.mod" && -d "$SOURCE_DIR/cmd" ]] || { echo "错误: 构建源快照无效: $SOURCE_DIR" >&2; exit 1; }
+TOOLCHAIN="$(awk '$1 == "toolchain" { print $2; exit }' "$SOURCE_DIR/go.mod")"
+[[ "$TOOLCHAIN" =~ ^go1\.24\.[0-9]+$ ]] || { echo "错误: go.mod 必须固定 Go 1.24 patch toolchain" >&2; exit 1; }
+if [[ -e "$OUTPUT_DIR" && -n "$(find "$OUTPUT_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
+    echo "错误: 输出目录必须为空，防止混入旧产物: $OUTPUT_DIR" >&2
+    exit 1
 fi
-LDFLAGS="-s -w -X 'main.version=${VERSION}' -X 'main.buildTime=${BUILD_TIME}'"
-
-echo "Building sslctl ${VERSION} (${BUILD_TIME})"
-
-# 创建输出目录
 mkdir -p "$OUTPUT_DIR"
 
-# 构建目标
-TARGETS=(
-    "linux/amd64"
-    "linux/arm64"
-    "windows/amd64"
-)
+SOURCE_EPOCH="${SOURCE_DATE_EPOCH:-$(date +%s)}"
+BUILD_TIME="$(python3 -c 'import datetime,sys; print(datetime.datetime.fromtimestamp(int(sys.argv[1]), datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))' "$SOURCE_EPOCH")"
+LDFLAGS="-s -w -X main.version=$VERSION -X main.buildTime=$BUILD_TIME"
 
-for target in "${TARGETS[@]}"; do
-    GOOS="${target%/*}"
-    GOARCH="${target#*/}"
-
-    OUTPUT_NAME="sslctl-${GOOS}-${GOARCH}"
-    if [ "$GOOS" = "windows" ]; then
-        OUTPUT_NAME="${OUTPUT_NAME}.exe"
-    fi
-
-    echo "  Building ${GOOS}/${GOARCH}..."
-
-    cd "$PROJECT_DIR"
-    GOOS="$GOOS" GOARCH="$GOARCH" $GO_CMD build -trimpath -ldflags "$LDFLAGS" -o "${OUTPUT_DIR}/${OUTPUT_NAME}" ./cmd/
-
-    # 压缩
-    if [ "$GOOS" = "windows" ]; then
-        gzip -kf "${OUTPUT_DIR}/${OUTPUT_NAME}"
-    else
-        gzip -kf "${OUTPUT_DIR}/${OUTPUT_NAME}"
-    fi
-
-    # 生成 SHA256 校验文件
-    if command -v sha256sum &>/dev/null; then
-        (cd "$OUTPUT_DIR" && sha256sum "${OUTPUT_NAME}.gz" > "${OUTPUT_NAME}.gz.sha256")
-    else
-        (cd "$OUTPUT_DIR" && shasum -a 256 "${OUTPUT_NAME}.gz" > "${OUTPUT_NAME}.gz.sha256")
-    fi
-
-    echo "    -> ${OUTPUT_NAME}.gz + .sha256"
+targets=("linux/amd64" "linux/arm64" "windows/amd64")
+for target in "${targets[@]}"; do
+    goos="${target%/*}"
+    goarch="${target#*/}"
+    name="sslctl-${goos}-${goarch}"
+    [[ "$goos" == "windows" ]] && name+=".exe"
+    echo "构建 $goos/$goarch -> $name"
+    (
+        cd "$SOURCE_DIR"
+        CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" GOFLAGS= GOEXPERIMENT= GOENV=off \
+            GOTOOLCHAIN="$TOOLCHAIN" go build -trimpath -buildvcs=false -ldflags "$LDFLAGS" -o "$OUTPUT_DIR/$name" ./cmd/
+    )
+    gzip -n -9 -c "$OUTPUT_DIR/$name" >"$OUTPUT_DIR/$name.gz"
 done
 
-echo ""
-echo "Build complete! Output: ${OUTPUT_DIR}"
-ls -lh "$OUTPUT_DIR"
+echo "构建完成: version=$VERSION build_time=$BUILD_TIME output=$OUTPUT_DIR"

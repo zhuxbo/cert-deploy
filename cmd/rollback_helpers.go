@@ -63,11 +63,14 @@ func applyRollbackMetadata(cfg *config.Config, siteName string, cert *x509.Certi
 			certCfg.Metadata.CertSerial = serial
 		}
 
-		// 回滚视为一次部署成功，清理本地续签状态
+		// 回滚视为一次部署成功，清理本地续签与部署状态（签发/部署计数一并清零）
 		certCfg.Metadata.CSRSubmittedAt = time.Time{}
 		certCfg.Metadata.LastCSRHash = ""
 		certCfg.Metadata.LastIssueState = ""
+		certCfg.Metadata.CappedPhase = ""
 		certCfg.Metadata.IssueRetryCount = 0
+		certCfg.Metadata.DeployAttemptCount = 0
+		certCfg.Metadata.DeployStartedAt = time.Time{}
 
 		updated = append(updated, certCfg)
 	}

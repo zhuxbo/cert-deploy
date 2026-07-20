@@ -113,6 +113,13 @@ func DetectApache() (configPath string, serverRoot string, err error) {
 		}
 	}
 
+	// Windows: httpd.exe 通常不在 PATH（XAMPP/WAMP 等），从运行中的进程反推 ServerRoot
+	if runtime.GOOS == "windows" {
+		if cp, sr, e := detectApacheFromWindowsProcess(); e == nil && cp != "" {
+			return cp, sr, nil
+		}
+	}
+
 	// 尝试常见路径
 	commonConfigs := getCommonApachePaths()
 	for _, cfg := range commonConfigs {
@@ -183,12 +190,22 @@ func getCommonApachePaths() []apacheConfig {
 			{`C:\Apache24\conf\httpd.conf`, `C:\Apache24`},
 			{`C:\Apache\conf\httpd.conf`, `C:\Apache`},
 			{`C:\Program Files\Apache24\conf\httpd.conf`, `C:\Program Files\Apache24`},
+			{`C:\xampp\apache\conf\httpd.conf`, `C:\xampp\apache`},
 		}
 		// Windows 集成面板（路径含版本号，需 glob）
-		matches, _ := filepath.Glob(`C:\phpstudy_pro\Extensions\Apache*\conf\httpd.conf`)
-		for _, m := range matches {
-			root := filepath.Dir(filepath.Dir(m))
-			paths = append(paths, apacheConfig{m, root})
+		globPatterns := []string{
+			`C:\phpstudy_pro\Extensions\Apache*\conf\httpd.conf`,
+			`C:\wamp64\bin\apache\apache*\conf\httpd.conf`,
+			`C:\wamp\bin\apache\apache*\conf\httpd.conf`,
+			`C:\Bitnami\wampstack-*\apache2\conf\httpd.conf`,
+			`C:\AppServ\Apache*\conf\httpd.conf`,
+		}
+		for _, gp := range globPatterns {
+			matches, _ := filepath.Glob(gp)
+			for _, m := range matches {
+				root := filepath.Dir(filepath.Dir(m))
+				paths = append(paths, apacheConfig{m, root})
+			}
 		}
 		return paths
 	}
@@ -203,6 +220,117 @@ func getCommonApachePaths() []apacheConfig {
 		// 编译安装
 		{"/usr/local/apache2/conf/httpd.conf", "/usr/local/apache2"},
 	}
+}
+
+// detectApacheFromWindowsProcess 通过运行中的 httpd.exe 反推 Apache 配置路径。
+// XAMPP/WAMP/Bitnami 等集成面板的 httpd.exe 不在 PATH，apachectl -V 探不到，
+// 但进程命令行的 -d 参数（运行时 ServerRoot）和 ExecutablePath 足以定位配置。
+func detectApacheFromWindowsProcess() (configPath, serverRoot string, err error) {
+	if runtime.GOOS != "windows" {
+		return "", "", fmt.Errorf("not windows")
+	}
+	procs := queryHttpdProcessesWindows()
+	if len(procs) == 0 {
+		return "", "", fmt.Errorf("未找到 httpd.exe 进程")
+	}
+	// 优先级 1：命令行 -d 参数（覆盖编译时的 HTTPD_ROOT）
+	for _, p := range procs {
+		root := parseApacheDArg(p.commandLine)
+		if root == "" {
+			continue
+		}
+		root = filepath.FromSlash(root)
+		cfg := filepath.Join(root, "conf", "httpd.conf")
+		if _, e := os.Stat(cfg); e == nil {
+			return cfg, root, nil
+		}
+	}
+	// 优先级 2：从 ExecutablePath 反推（<root>\bin\httpd.exe → root）
+	for _, p := range procs {
+		if p.executablePath == "" {
+			continue
+		}
+		root := filepath.Dir(filepath.Dir(p.executablePath))
+		cfg := filepath.Join(root, "conf", "httpd.conf")
+		if _, e := os.Stat(cfg); e == nil {
+			return cfg, root, nil
+		}
+	}
+	return "", "", fmt.Errorf("已检测到 httpd.exe 但定位不到 httpd.conf")
+}
+
+type httpdWinProcess struct {
+	executablePath string
+	commandLine    string
+}
+
+// queryHttpdProcessesWindows 通过 wmic（优先）+ PowerShell（兜底）查询 httpd.exe 进程。
+// wmic 在 Win7~Win10 内置；Win11 24H2 默认不装但仍可启用，回落到 PowerShell。
+func queryHttpdProcessesWindows() []httpdWinProcess {
+	cmd := exec.Command("wmic", "process", "where", "name='httpd.exe'",
+		"get", "ExecutablePath,CommandLine", "/format:list")
+	if out, err := cmd.Output(); err == nil {
+		if procs := parseWinProcList(string(out)); len(procs) > 0 {
+			return procs
+		}
+	}
+	psScript := `Get-CimInstance Win32_Process -Filter "Name='httpd.exe'" | ` +
+		`Select-Object ExecutablePath, CommandLine | Format-List`
+	cmd = exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", psScript)
+	if out, err := cmd.Output(); err == nil {
+		return parseWinProcList(string(out))
+	}
+	return nil
+}
+
+// parseWinProcList 解析 wmic /format:list（Key=Value）和 PowerShell Format-List（Key : Value）
+// 的输出，按空行分隔进程块。
+func parseWinProcList(text string) []httpdWinProcess {
+	var procs []httpdWinProcess
+	var cur httpdWinProcess
+	flush := func() {
+		if cur.executablePath != "" || cur.commandLine != "" {
+			procs = append(procs, cur)
+		}
+		cur = httpdWinProcess{}
+	}
+	for _, raw := range strings.Split(text, "\n") {
+		ln := strings.TrimRight(strings.TrimSpace(raw), "\r")
+		if ln == "" {
+			flush()
+			continue
+		}
+		var key, val string
+		if i := strings.Index(ln, "="); i > 0 {
+			key, val = strings.TrimSpace(ln[:i]), strings.TrimSpace(ln[i+1:])
+		} else if i := strings.Index(ln, ":"); i > 0 {
+			key, val = strings.TrimSpace(ln[:i]), strings.TrimSpace(ln[i+1:])
+		} else {
+			continue
+		}
+		switch key {
+		case "ExecutablePath":
+			cur.executablePath = val
+		case "CommandLine":
+			cur.commandLine = val
+		}
+	}
+	flush()
+	return procs
+}
+
+// parseApacheDArg 从 httpd 命令行中提取 -d 参数（运行时 ServerRoot）。
+// 支持 -d "C:/path with space" 和 -d C:/path 两种形式。
+func parseApacheDArg(cmdLine string) string {
+	re := regexp.MustCompile(`-d\s+(?:"([^"]+)"|(\S+))`)
+	m := re.FindStringSubmatch(cmdLine)
+	if len(m) == 0 {
+		return ""
+	}
+	if m[1] != "" {
+		return m[1]
+	}
+	return m[2]
 }
 
 // Scan 扫描所有配置
@@ -416,11 +544,11 @@ func (s *Scanner) parseConfigFile(filePath string) ([]*SSLSite, error) {
 			continue
 		}
 
-		// 解析 ServerName
+		// 解析 ServerName（剥离 [scheme://]fqdn[:port] 中的 scheme 与端口）
 		if matches := serverNameRe.FindStringSubmatch(line); len(matches) > 1 {
 			serverName := strings.TrimSpace(matches[1])
 			serverName = strings.Trim(serverName, `"'`)
-			currentSite.ServerName = serverName
+			currentSite.ServerName = matcher.StripPort(serverName)
 		}
 
 		// 解析 ServerAlias（可能包含多个域名，空格分隔）
@@ -428,7 +556,7 @@ func (s *Scanner) parseConfigFile(filePath string) ([]*SSLSite, error) {
 			aliases := strings.Fields(matches[1])
 			for _, alias := range aliases {
 				alias = strings.Trim(alias, `"'`)
-				currentSite.ServerAlias = append(currentSite.ServerAlias, alias)
+				currentSite.ServerAlias = append(currentSite.ServerAlias, matcher.StripPort(alias))
 			}
 		}
 
@@ -661,11 +789,11 @@ func (s *Scanner) parseHTTPConfigFile(filePath string) ([]*HTTPSite, error) {
 			hasSSL = true
 		}
 
-		// 解析 ServerName
+		// 解析 ServerName（剥离 [scheme://]fqdn[:port] 中的 scheme 与端口）
 		if matches := serverNameRe.FindStringSubmatch(line); len(matches) > 1 {
 			serverName := strings.TrimSpace(matches[1])
 			serverName = strings.Trim(serverName, `"'`)
-			currentSite.ServerName = serverName
+			currentSite.ServerName = matcher.StripPort(serverName)
 		}
 
 		// 解析 DocumentRoot
@@ -1095,8 +1223,9 @@ func (s *Scanner) enrichSiteFromConfig(site *Site) {
 		if matches := serverNameRe.FindStringSubmatch(line); len(matches) > 1 {
 			currentServerName = strings.TrimSpace(matches[1])
 			currentServerName = strings.Trim(currentServerName, `"'`)
-			// 检查是否是目标站点
-			if currentServerName == site.ServerName {
+			// 检查是否是目标站点（两侧剥离 [scheme://]fqdn[:port] 后再比较，
+			// 兼容配置写 ServerName www.example.com:443 而 -S 输出裸域名的情形）
+			if matcher.StripPort(currentServerName) == matcher.StripPort(site.ServerName) {
 				inTargetVHost = true
 			}
 		}
@@ -1106,12 +1235,12 @@ func (s *Scanner) enrichSiteFromConfig(site *Site) {
 			continue
 		}
 
-		// 解析 ServerAlias
+		// 解析 ServerAlias（剥离 [scheme://]fqdn[:port] 中的 scheme 与端口）
 		if matches := serverAliasRe.FindStringSubmatch(line); len(matches) > 1 {
 			aliases := strings.Fields(matches[1])
 			for _, alias := range aliases {
 				alias = strings.Trim(alias, `"'`)
-				currentAliases = append(currentAliases, alias)
+				currentAliases = append(currentAliases, matcher.StripPort(alias))
 			}
 		}
 
@@ -1287,11 +1416,11 @@ func (s *Scanner) parseAllConfigFile(filePath string) ([]*Site, error) {
 			currentSite.HasSSL = true
 		}
 
-		// 解析 ServerName
+		// 解析 ServerName（剥离 [scheme://]fqdn[:port] 中的 scheme 与端口）
 		if matches := serverNameRe.FindStringSubmatch(line); len(matches) > 1 {
 			serverName := strings.TrimSpace(matches[1])
 			serverName = strings.Trim(serverName, `"'`)
-			currentSite.ServerName = serverName
+			currentSite.ServerName = matcher.StripPort(serverName)
 		}
 
 		// 解析 ServerAlias（可能包含多个域名，空格分隔）
@@ -1299,7 +1428,7 @@ func (s *Scanner) parseAllConfigFile(filePath string) ([]*Site, error) {
 			aliases := strings.Fields(matches[1])
 			for _, alias := range aliases {
 				alias = strings.Trim(alias, `"'`)
-				currentSite.ServerAlias = append(currentSite.ServerAlias, alias)
+				currentSite.ServerAlias = append(currentSite.ServerAlias, matcher.StripPort(alias))
 			}
 		}
 

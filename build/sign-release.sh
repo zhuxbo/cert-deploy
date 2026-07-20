@@ -1,127 +1,93 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# 对固定正式资产集合签名，输出按公开文件名索引的 JSON；不修改 releases.json。
 
-# 发布包签名脚本
-# 使用 Ed25519 私钥对 .gz 文件签名，并更新 releases.json
-#
-# 用法:
-#   ./sign-release.sh --key <私钥文件> --dir <发布目录> --version <版本号> --key-id <key_id>
-#
-# 支持从 build/release.conf 读取 SIGN_KEY 和 SIGN_KEY_ID 作为默认值（命令行参数优先）
-#
-# 示例:
-#   ./sign-release.sh --key ~/release-key.pem --dir /var/www/sslctl --version v1.0.0 --key-id key-1
+set -euo pipefail
 
-set -e
-
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
-
-log_info()    { echo -e "${BLUE}[INFO]${NC} $1"; }
-log_success() { echo -e "${GREEN}[OK]${NC} $1"; }
-log_error()   { echo -e "${RED}[ERROR]${NC} $1"; }
-
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
-
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 KEY_FILE=""
-RELEASE_DIR=""
-VERSION=""
 KEY_ID=""
+ASSETS_DIR=""
+OUTPUT=""
+VERIFY_SIGNATURES=""
+TRUSTED_PUBLIC_KEY=""
+MANIFEST=""
+VERIFY_MANIFEST_SIGNATURE=""
 
-# 从 release.conf 读取默认值（如果存在）
-CONF_FILE="$SCRIPT_DIR/release.conf"
-if [ -f "$CONF_FILE" ]; then
-    # shellcheck source=/dev/null
-    source "$CONF_FILE"
-    KEY_FILE="${SIGN_KEY:-}"
-    KEY_ID="${SIGN_KEY_ID:-}"
-    # 将相对路径解析为绝对路径（相对于项目根目录）
-    if [ -n "$KEY_FILE" ] && [[ "$KEY_FILE" != /* ]]; then
-        KEY_FILE="$PROJECT_ROOT/$KEY_FILE"
-    fi
-fi
-
-# 解析参数（命令行参数优先于 release.conf）
-while [ $# -gt 0 ]; do
+while (($#)); do
     case "$1" in
-        --key)
-            KEY_FILE="$2"
-            shift 2
-            ;;
-        --dir)
-            RELEASE_DIR="$2"
-            shift 2
-            ;;
-        --version)
-            VERSION="$2"
-            shift 2
-            ;;
-        --key-id)
-            KEY_ID="$2"
-            shift 2
-            ;;
+        --key) KEY_FILE="${2:-}"; shift 2 ;;
+        --key-id) KEY_ID="${2:-}"; shift 2 ;;
+        --assets-dir) ASSETS_DIR="${2:-}"; shift 2 ;;
+        --output) OUTPUT="${2:-}"; shift 2 ;;
+        --verify-signatures) VERIFY_SIGNATURES="${2:-}"; shift 2 ;;
+        --manifest) MANIFEST="${2:-}"; shift 2 ;;
+        --verify-manifest-signature) VERIFY_MANIFEST_SIGNATURE="${2:-}"; shift 2 ;;
+        --trusted-public-key) TRUSTED_PUBLIC_KEY="${2:-}"; shift 2 ;;
         -h|--help)
-            echo "用法: $0 --key <私钥文件> --dir <发布目录> --version <版本号> --key-id <key_id>"
-            echo ""
-            echo "选项:"
-            echo "  --key      私钥文件路径"
-            echo "  --dir      发布目录路径"
-            echo "  --version  版本号（如 v1.0.0）"
-            echo "  --key-id   密钥 ID（如 key-1）"
-            echo ""
-            echo "支持从 build/release.conf 读取 SIGN_KEY 和 SIGN_KEY_ID 作为默认值"
+            echo "用法: $0 --key-id <id> [--key <seed-file>] [--trusted-public-key <file>] (--assets-dir <dir> (--output <json> | --verify-signatures <json>) | --manifest <json> (--output <sig> | --verify-manifest-signature <sig>))"
             exit 0
             ;;
-        *)
-            log_error "未知参数: $1"
-            exit 1
-            ;;
+        *) echo "未知参数: $1" >&2; exit 2 ;;
     esac
 done
 
-if [ -z "$KEY_FILE" ] || [ -z "$RELEASE_DIR" ] || [ -z "$VERSION" ] || [ -z "$KEY_ID" ]; then
-    log_error "缺少必要参数"
-    echo "用法: $0 --key <私钥文件> --dir <发布目录> --version <版本号> --key-id <key_id>"
+if [[ -z "$KEY_ID" ]]; then
+    echo "错误: 缺少签名参数" >&2
+    exit 2
+fi
+if [[ -n "$MANIFEST" ]]; then
+    [[ -z "$ASSETS_DIR" && -z "$VERIFY_SIGNATURES" ]] || { echo "错误: manifest 与资产签名模式不能混用" >&2; exit 2; }
+    [[ -f "$MANIFEST" ]] || { echo "错误: manifest 不存在: $MANIFEST" >&2; exit 1; }
+    [[ -n "$OUTPUT" || -n "$VERIFY_MANIFEST_SIGNATURE" ]] || { echo "错误: 缺少 manifest 签名输出或校验参数" >&2; exit 2; }
+    [[ -z "$OUTPUT" || -z "$VERIFY_MANIFEST_SIGNATURE" ]] || { echo "错误: manifest 签名与校验不能同时执行" >&2; exit 2; }
+else
+    [[ -n "$ASSETS_DIR" && ( -n "$OUTPUT" || -n "$VERIFY_SIGNATURES" ) ]] || { echo "错误: 缺少资产签名参数" >&2; exit 2; }
+    [[ -z "$OUTPUT" || -z "$VERIFY_SIGNATURES" ]] || { echo "错误: 资产签名与校验不能同时执行" >&2; exit 2; }
+fi
+if [[ -n "$OUTPUT" && -z "$KEY_FILE" ]]; then
+    echo "错误: 签名操作缺少私钥" >&2
+    exit 2
+fi
+if [[ ! "$KEY_ID" =~ ^[0-9A-Za-z._-]+$ ]]; then
+    echo "错误: key ID 格式无效" >&2
     exit 1
 fi
-
-if [ ! -f "$KEY_FILE" ]; then
-    log_error "私钥文件不存在: $KEY_FILE"
-    exit 1
+if [[ -n "$OUTPUT" ]]; then
+    [[ -f "$KEY_FILE" ]] || { echo "错误: 签名私钥不存在: $KEY_FILE" >&2; exit 1; }
+    perms="$(stat -c '%a' "$KEY_FILE" 2>/dev/null || stat -f '%Lp' "$KEY_FILE" 2>/dev/null || true)"
+    if [[ "$perms" != "600" ]]; then
+        echo "错误: 签名私钥权限必须是 600，当前为 ${perms:-未知}" >&2
+        exit 1
+    fi
 fi
+command -v go >/dev/null 2>&1 || { echo "错误: 未找到 Go" >&2; exit 1; }
 
-# 确保版本号带 v 前缀
-if [[ "$VERSION" != v* ]]; then
-    VERSION="v$VERSION"
+SIGN_TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/sslctl-sign.XXXXXX")"
+SIGN_PROGRAM="$SIGN_TEMP_DIR/main.go"
+trap 'rm -rf "$SIGN_TEMP_DIR"' EXIT
+
+if [[ -z "$TRUSTED_PUBLIC_KEY" ]]; then
+    TRUSTED_PUBLIC_KEY="$SIGN_TEMP_DIR/trusted-public-key.txt"
+    python3 - "$SCRIPT_DIR/../pkg/upgrade/installer.go" "$KEY_ID" "$TRUSTED_PUBLIC_KEY" <<'PY'
+import base64, re, sys
+source = open(sys.argv[1], encoding="utf-8").read()
+pattern = r'releasePublicKeys\["' + re.escape(sys.argv[2]) + r'"\]\s*=\s*ed25519\.PublicKey\{([^}]*)\}'
+match = re.search(pattern, source)
+if not match:
+    raise SystemExit(f"客户端公钥环中不存在 key ID: {sys.argv[2]}")
+values = bytes(int(item, 16) for item in re.findall(r'0x([0-9a-fA-F]{2})', match.group(1)))
+if len(values) != 32:
+    raise SystemExit("客户端 Ed25519 公钥长度无效")
+open(sys.argv[3], "w", encoding="utf-8").write(base64.b64encode(values).decode() + "\n")
+PY
 fi
+[[ -f "$TRUSTED_PUBLIC_KEY" ]] || { echo "错误: 可信公钥不存在: $TRUSTED_PUBLIC_KEY" >&2; exit 1; }
 
-RELEASES_FILE="$RELEASE_DIR/releases.json"
-
-if [ ! -f "$RELEASES_FILE" ]; then
-    log_error "releases.json 不存在: $RELEASES_FILE"
-    exit 1
-fi
-
-# 检查 Go 是否可用
-if ! command -v go &> /dev/null; then
-    log_error "需要 Go 环境"
-    exit 1
-fi
-
-log_info "签名版本: $VERSION"
-log_info "发布目录: $RELEASE_DIR"
-log_info "Key ID: $KEY_ID"
-
-# 使用 Go 签名并更新 releases.json
-SIGN_GO=$(mktemp /tmp/sign-XXXXXX.go)
-trap 'rm -f "$SIGN_GO"' EXIT
-cat > "$SIGN_GO" << 'GOEOF'
+cat >"$SIGN_PROGRAM" <<'GOEOF'
 package main
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
@@ -131,125 +97,96 @@ import (
 	"strings"
 )
 
-type VersionInfo struct {
-	Checksums  map[string]string `json:"checksums"`
-	Signatures map[string]string `json:"signatures,omitempty"`
-}
-
-type ReleaseInfo struct {
-	LatestMain string                    `json:"latest_main"`
-	LatestDev    string                    `json:"latest_dev"`
-	Channels     json.RawMessage           `json:"channels,omitempty"`
-	Versions     map[string]VersionInfo    `json:"versions,omitempty"`
-}
-
 func main() {
-	keyFile := os.Args[1]
-	releasesFile := os.Args[2]
-	version := os.Args[3]
-	keyID := ""
-	if len(os.Args) > 4 {
-		keyID = os.Args[4]
-	}
-
-	// 读取私钥
-	seedB64, err := os.ReadFile(keyFile)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "读取私钥失败: %v\n", err)
+	mode, keyFile, keyID, trustedFile, input, output := os.Args[1], os.Args[2], os.Args[3], os.Args[4], os.Args[5], os.Args[6]
+	verifyMode := strings.HasSuffix(mode, "verify")
+	trustedText, err := os.ReadFile(trustedFile)
+	if err != nil { panic(err) }
+	trustedKey, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(trustedText)))
+	if err != nil || len(trustedKey) != ed25519.PublicKeySize {
+		fmt.Fprintln(os.Stderr, "客户端内置公钥无效")
 		os.Exit(1)
 	}
-	seed, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(seedB64)))
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "解码私钥失败: %v\n", err)
-		os.Exit(1)
-	}
-	privKey := ed25519.NewKeyFromSeed(seed)
-
-	// 读取 releases.json
-	data, err := os.ReadFile(releasesFile)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "读取 releases.json 失败: %v\n", err)
-		os.Exit(1)
-	}
-
-	var info ReleaseInfo
-	if err := json.Unmarshal(data, &info); err != nil {
-		fmt.Fprintf(os.Stderr, "解析 releases.json 失败: %v\n", err)
-		os.Exit(1)
-	}
-
-	if info.Versions == nil {
-		info.Versions = make(map[string]VersionInfo)
-	}
-
-	verInfo, ok := info.Versions[version]
-	if !ok {
-		fmt.Fprintf(os.Stderr, "版本 %s 不存在于 releases.json\n", version)
-		os.Exit(1)
-	}
-
-	if verInfo.Signatures == nil {
-		verInfo.Signatures = make(map[string]string)
-	}
-
-	// 确定通道
-	channel := "main"
-	if strings.Contains(version, "-") {
-		channel = "dev"
-	}
-
-	// 对每个 .gz 文件签名
-	releasesDir := filepath.Dir(releasesFile)
-	for filename := range verInfo.Checksums {
-		filePath := filepath.Join(releasesDir, channel, version, filename)
-		fileData, err := os.ReadFile(filePath)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "读取文件 %s 失败: %v\n", filename, err)
+	publicKey := ed25519.PublicKey(trustedKey)
+	var privateKey ed25519.PrivateKey
+	if !verifyMode {
+		seedText, err := os.ReadFile(keyFile)
+		if err != nil { panic(err) }
+		seed, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(seedText)))
+		if err != nil || len(seed) != ed25519.SeedSize {
+			fmt.Fprintln(os.Stderr, "签名私钥必须是 base64 编码的 32 字节 Ed25519 seed")
 			os.Exit(1)
 		}
-
-		sig := ed25519.Sign(privKey, fileData)
-		sigB64 := base64.StdEncoding.EncodeToString(sig)
-
-		verInfo.Signatures[filename] = fmt.Sprintf("ed25519:%s:%s", keyID, sigB64)
-
-		fmt.Printf("已签名: %s\n", filename)
+		privateKey = ed25519.NewKeyFromSeed(seed)
+		if !bytes.Equal(privateKey.Public().(ed25519.PublicKey), trustedKey) {
+			fmt.Fprintln(os.Stderr, "签名私钥与客户端内置公钥不匹配")
+			os.Exit(1)
+		}
 	}
-
-	info.Versions[version] = verInfo
-
-	// 写回 releases.json
-	output, err := json.MarshalIndent(info, "", "  ")
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "序列化 releases.json 失败: %v\n", err)
-		os.Exit(1)
+	sign := func(data []byte) string {
+		signature := ed25519.Sign(privateKey, data)
+		if !ed25519.Verify(publicKey, data, signature) { fmt.Fprintln(os.Stderr, "签名自校验失败"); os.Exit(1) }
+		return "ed25519:" + keyID + ":" + base64.StdEncoding.EncodeToString(signature)
 	}
-
-	// 原子写入：先写临时文件再 rename，防止崩溃导致文件损坏
-	tmpFile, err := os.CreateTemp(filepath.Dir(releasesFile), ".releases-*.json")
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "创建临时文件失败: %v\n", err)
-		os.Exit(1)
+	verify := func(data []byte, text string) {
+		prefix := "ed25519:" + keyID + ":"
+		if !strings.HasPrefix(text, prefix) { fmt.Fprintln(os.Stderr, "签名 key ID 不匹配"); os.Exit(1) }
+		signature, err := base64.StdEncoding.DecodeString(strings.TrimSpace(strings.TrimPrefix(text, prefix)))
+		if err != nil || !ed25519.Verify(publicKey, data, signature) { fmt.Fprintln(os.Stderr, "签名验证失败"); os.Exit(1) }
 	}
-	tmpPath := tmpFile.Name()
-	if _, err := tmpFile.Write(output); err != nil {
-		tmpFile.Close()
-		os.Remove(tmpPath)
-		fmt.Fprintf(os.Stderr, "写入临时文件失败: %v\n", err)
-		os.Exit(1)
+	if strings.HasPrefix(mode, "manifest-") {
+		data, err := os.ReadFile(input)
+		if err != nil { panic(err) }
+		if verifyMode {
+			encoded, err := os.ReadFile(output)
+			if err != nil { panic(err) }
+			verify(data, string(encoded))
+			return
+		}
+		if err := os.WriteFile(output+".tmp", []byte(sign(data)+"\n"), 0600); err != nil { panic(err) }
+		if err := os.Rename(output+".tmp", output); err != nil { panic(err) }
+		return
 	}
-	tmpFile.Close()
-	if err := os.Rename(tmpPath, releasesFile); err != nil {
-		os.Remove(tmpPath)
-		fmt.Fprintf(os.Stderr, "替换 releases.json 失败: %v\n", err)
-		os.Exit(1)
+	names := []string{"sslctl-linux-amd64.gz", "sslctl-linux-arm64.gz", "sslctl-windows-amd64.exe.gz"}
+	result := make(map[string]string, len(names))
+	if verifyMode {
+		encoded, err := os.ReadFile(output)
+		if err != nil { panic(err) }
+		if err := json.Unmarshal(encoded, &result); err != nil { panic(err) }
+		if len(result) != len(names) { fmt.Fprintln(os.Stderr, "签名集合数量无效"); os.Exit(1) }
 	}
-	// 确保 Web 服务器可读
-	os.Chmod(releasesFile, 0644)
-
-	fmt.Println("签名完成，releases.json 已更新")
+	for _, name := range names {
+		data, err := os.ReadFile(filepath.Join(input, name))
+		if err != nil { fmt.Fprintf(os.Stderr, "读取正式资产失败 %s: %v\n", name, err); os.Exit(1) }
+		if verifyMode {
+			text, ok := result[name]
+			if !ok { fmt.Fprintf(os.Stderr, "缺少签名: %s\n", name); os.Exit(1) }
+			verify(data, text)
+		} else {
+			result[name] = sign(data)
+		}
+	}
+	if verifyMode { return }
+	data, err := json.MarshalIndent(result, "", "  ")
+	if err != nil { panic(err) }
+	temp := output + ".tmp"
+	if err := os.WriteFile(temp, append(data, '\n'), 0600); err != nil { panic(err) }
+	if err := os.Rename(temp, output); err != nil { panic(err) }
 }
 GOEOF
-go run "$SIGN_GO" "$KEY_FILE" "$RELEASES_FILE" "$VERSION" "$KEY_ID"
 
-log_success "签名完成"
+if [[ -n "$MANIFEST" ]]; then
+    if [[ -n "$VERIFY_MANIFEST_SIGNATURE" ]]; then
+        go run "$SIGN_PROGRAM" manifest-verify "$KEY_FILE" "$KEY_ID" "$TRUSTED_PUBLIC_KEY" "$MANIFEST" "$VERIFY_MANIFEST_SIGNATURE"
+        echo "manifest 签名验证完成"
+    else
+        go run "$SIGN_PROGRAM" manifest-sign "$KEY_FILE" "$KEY_ID" "$TRUSTED_PUBLIC_KEY" "$MANIFEST" "$OUTPUT"
+        echo "manifest 签名完成: $OUTPUT"
+    fi
+elif [[ -n "$VERIFY_SIGNATURES" ]]; then
+    go run "$SIGN_PROGRAM" assets-verify "$KEY_FILE" "$KEY_ID" "$TRUSTED_PUBLIC_KEY" "$ASSETS_DIR" "$VERIFY_SIGNATURES"
+    echo "签名验证完成"
+else
+    go run "$SIGN_PROGRAM" assets-sign "$KEY_FILE" "$KEY_ID" "$TRUSTED_PUBLIC_KEY" "$ASSETS_DIR" "$OUTPUT"
+    echo "签名完成: $OUTPUT"
+fi

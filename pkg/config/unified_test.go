@@ -514,7 +514,7 @@ func TestConfigManager_DeepCopyDocker(t *testing.T) {
 		Enabled:  true,
 		Bindings: []SiteBinding{
 			{
-				ServerName:   "docker-site",
+				ServerName: "docker-site",
 				ServerType: ServerTypeDockerNginx,
 				Enabled:    true,
 				Docker: &DockerInfo{
@@ -676,31 +676,31 @@ func TestCertConfig_NeedsRenewal(t *testing.T) {
 // TestCertConfig_NeedsRenewal_LocalMode 测试本机提交的续签判断
 func TestCertConfig_NeedsRenewal_LocalMode(t *testing.T) {
 	tests := []struct {
-		name           string
-		expiresAt      time.Time
-		retryCount     int
+		name            string
+		expiresAt       time.Time
+		retryCount      int
 		renewBeforeDays int
-		want           bool
+		want            bool
 	}{
 		{
-			name:           "本地模式-在续签窗口内",
-			expiresAt:      time.Now().Add(10 * 24 * time.Hour), // 10 天后过期，<= 13
-			retryCount:     0,
+			name:            "本地模式-在续签窗口内",
+			expiresAt:       time.Now().Add(10 * 24 * time.Hour), // 10 天后过期，<= 13
+			retryCount:      0,
 			renewBeforeDays: 13,
-			want:           true,
+			want:            true,
 		},
 		{
-			name:           "本地模式-超出续签窗口",
-			expiresAt:      time.Now().Add(15 * 24 * time.Hour), // 15 天后过期，> 13
-			retryCount:     0,
+			name:            "本地模式-超出续签窗口",
+			expiresAt:       time.Now().Add(15 * 24 * time.Hour), // 15 天后过期，> 13
+			retryCount:      0,
 			renewBeforeDays: 13,
-			want:           false,
+			want:            false,
 		},
 		{
 			name:            "本地模式-renewBeforeDays超过上限使用默认值13",
 			expiresAt:       time.Now().Add(12 * 24 * time.Hour), // 12 天后过期
 			retryCount:      0,
-			renewBeforeDays: 30, // 超过上限，应回落到 13
+			renewBeforeDays: 30,   // 超过上限，应回落到 13
 			want:            true, // 12 <= 13
 		},
 		{
@@ -983,7 +983,7 @@ func TestCertConfig_Bindings(t *testing.T) {
 		Domains:  []string{"bind.example.com"},
 		Bindings: []SiteBinding{
 			{
-				ServerName:   "site1",
+				ServerName: "site1",
 				ServerType: ServerTypeNginx,
 				Enabled:    true,
 				Paths: BindingPaths{
@@ -1021,7 +1021,7 @@ func TestCertConfig_Bindings(t *testing.T) {
 
 	// 添加新绑定
 	got.Bindings = append(got.Bindings, SiteBinding{
-		ServerName:   "site2",
+		ServerName: "site2",
 		ServerType: ServerTypeApache,
 		Enabled:    true,
 		Paths: BindingPaths{
@@ -1062,7 +1062,7 @@ func TestCertConfig_DockerBinding(t *testing.T) {
 		Domains:  []string{"docker.example.com"},
 		Bindings: []SiteBinding{
 			{
-				ServerName:   "docker-site",
+				ServerName: "docker-site",
 				ServerType: ServerTypeDockerNginx,
 				Enabled:    true,
 				Paths: BindingPaths{
@@ -1321,6 +1321,43 @@ func TestTimeConstants(t *testing.T) {
 	}
 }
 
+func TestUpdateRenewBeforeDaysAppliesOnlySpecRange(t *testing.T) {
+	tests := []struct {
+		name      string
+		value     int
+		wantValue int
+		wantApply bool
+	}{
+		{name: "有效值", value: 7, wantValue: 7, wantApply: true},
+		{name: "上限", value: MaxRenewBeforeDays, wantValue: MaxRenewBeforeDays, wantApply: true},
+		{name: "零值忽略", value: 0, wantValue: DefaultRenewBeforeDays, wantApply: false},
+		{name: "超限忽略", value: MaxRenewBeforeDays + 1, wantValue: DefaultRenewBeforeDays, wantApply: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cm, err := NewConfigManagerWithDir(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			applied, err := cm.UpdateRenewBeforeDays(tt.value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if applied != tt.wantApply {
+				t.Fatalf("applied = %v, want %v", applied, tt.wantApply)
+			}
+			cfg, err := cm.Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.Schedule.RenewBeforeDays != tt.wantValue {
+				t.Fatalf("renew_before_days = %d, want %d", cfg.Schedule.RenewBeforeDays, tt.wantValue)
+			}
+		})
+	}
+}
+
 // TestEnvConstants 测试环境变量常量
 func TestEnvConstants(t *testing.T) {
 	if EnvAPIToken != "SSLCTL_API_TOKEN" {
@@ -1405,7 +1442,7 @@ func TestConfigManager_GetSiteBinding(t *testing.T) {
 		Enabled:  true,
 		Bindings: []SiteBinding{
 			{
-				ServerName:   "nginx-site.com",
+				ServerName: "nginx-site.com",
 				ServerType: ServerTypeNginx,
 				Enabled:    true,
 				Paths: BindingPaths{
@@ -1414,7 +1451,7 @@ func TestConfigManager_GetSiteBinding(t *testing.T) {
 				},
 			},
 			{
-				ServerName:   "apache-site.com",
+				ServerName: "apache-site.com",
 				ServerType: ServerTypeApache,
 				Enabled:    true,
 				Paths: BindingPaths{
@@ -1432,7 +1469,7 @@ func TestConfigManager_GetSiteBinding(t *testing.T) {
 		Enabled:  true,
 		Bindings: []SiteBinding{
 			{
-				ServerName:   "docker-site.com",
+				ServerName: "docker-site.com",
 				ServerType: ServerTypeDockerNginx,
 				Enabled:    true,
 				Docker: &DockerInfo{
@@ -1520,7 +1557,7 @@ func TestConfigManager_GetSiteBinding_DeepCopy(t *testing.T) {
 		Enabled:  true,
 		Bindings: []SiteBinding{
 			{
-				ServerName:   "test-site.com",
+				ServerName: "test-site.com",
 				ServerType: ServerTypeDockerNginx,
 				Enabled:    true,
 				Docker: &DockerInfo{
@@ -1568,7 +1605,7 @@ func TestDeepCopyCompleteness(t *testing.T) {
 		},
 		Bindings: []SiteBinding{
 			{
-				ServerName:   "binding1.com",
+				ServerName: "binding1.com",
 				ServerType: ServerTypeNginx,
 				Enabled:    true,
 				Paths: BindingPaths{
@@ -1577,7 +1614,7 @@ func TestDeepCopyCompleteness(t *testing.T) {
 				},
 			},
 			{
-				ServerName:   "binding2.com",
+				ServerName: "binding2.com",
 				ServerType: ServerTypeDockerNginx,
 				Enabled:    true,
 				Paths: BindingPaths{
@@ -1832,5 +1869,65 @@ func TestSetUpgradeChannel_Invalid(t *testing.T) {
 		if err := cm.SetUpgradeChannel(ch); err == nil {
 			t.Errorf("SetUpgradeChannel(%q) should return error", ch)
 		}
+	}
+}
+
+// TestMutateLocked_ForcesDiskRead_NoLostUpdate 复现并验证写路径 mtime 门控丢更新的修复：
+// cm1 缓存配置 A → cm2（模拟另一进程）写入证书 B → 将盘上 mtime 调到不晚于 cm1 的 cachedAt
+// （模拟同秒写入 / NFS/VM 时钟偏移使 mtime 门控失效）→ cm1 写路径修改 Schedule。
+// 修复前 cm1 复用陈旧缓存覆盖掉 B；修复后写路径强制重读盘上最新状态，B 不丢失且 cm1 修改生效。
+func TestMutateLocked_ForcesDiskRead_NoLostUpdate(t *testing.T) {
+	dir := t.TempDir()
+	cm1, err := NewConfigManagerWithDir(dir)
+	if err != nil {
+		t.Fatalf("创建 cm1 失败: %v", err)
+	}
+	cm2, err := NewConfigManagerWithDir(dir)
+	if err != nil {
+		t.Fatalf("创建 cm2 失败: %v", err)
+	}
+
+	// cm1 写入初始配置并填充自身缓存（cachedAt = 此刻）
+	if err := cm1.UpdateSchedule(func(s *ScheduleConfig) { s.RenewBeforeDays = 10 }); err != nil {
+		t.Fatalf("cm1 初始写入失败: %v", err)
+	}
+
+	// cm2（另一进程）写入证书 B，构成 cm1 感知不到的外部修改
+	if err := cm2.AddCert(&CertConfig{CertName: "b.example.com-1", OrderID: 1, Enabled: true}); err != nil {
+		t.Fatalf("cm2 写入证书 B 失败: %v", err)
+	}
+
+	// 模拟时钟偏移 / 同秒写入：把盘上 mtime 调到不晚于 cm1 的 cachedAt，使 mtime 门控无法感知外部修改
+	past := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(cm1.GetConfigPath(), past, past); err != nil {
+		t.Fatalf("调整 mtime 失败: %v", err)
+	}
+
+	// cm1 写路径修改 Schedule（不触碰 certificates）
+	if err := cm1.UpdateSchedule(func(s *ScheduleConfig) { s.RenewBeforeDays = 20 }); err != nil {
+		t.Fatalf("cm1 二次写入失败: %v", err)
+	}
+
+	// 从盘验证（新建 cm3 绕过任何进程缓存）
+	cm3, err := NewConfigManagerWithDir(dir)
+	if err != nil {
+		t.Fatalf("创建 cm3 失败: %v", err)
+	}
+	cfg, err := cm3.Load()
+	if err != nil {
+		t.Fatalf("cm3 读取失败: %v", err)
+	}
+
+	found := false
+	for _, c := range cfg.Certificates {
+		if c.CertName == "b.example.com-1" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("cm2 写入的证书 B 丢失（写路径复用陈旧缓存覆盖了外部修改）")
+	}
+	if cfg.Schedule.RenewBeforeDays != 20 {
+		t.Errorf("cm1 的 Schedule 修改应生效: RenewBeforeDays=%d, want 20", cfg.Schedule.RenewBeforeDays)
 	}
 }

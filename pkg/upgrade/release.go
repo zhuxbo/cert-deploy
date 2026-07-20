@@ -154,10 +154,15 @@ func NormalizeVersion(ver string) string {
 
 // CompareVersions 比较两个语义化版本号
 // 返回: -1 (a < b), 0 (a == b), 1 (a > b)
-// 遵循 semver 规范：主版本号优先比较，pre-release 版本低于同号正式版
+// 遵循 semver 规范：主版本号优先比较，pre-release 版本低于同号正式版；
+// pre-release 内按 `.` 拆分逐段比较，纯数字段走数值比较，数字段低于字母段。
 func CompareVersions(a, b string) int {
 	parseVer := func(v string) ([3]int, string) {
 		v = strings.TrimPrefix(v, "v")
+		// 剥离 build metadata（semver: +xxx 不参与排序）
+		if idx := strings.Index(v, "+"); idx >= 0 {
+			v = v[:idx]
+		}
 		pre := ""
 		if idx := strings.Index(v, "-"); idx >= 0 {
 			pre = v[idx+1:]
@@ -185,24 +190,76 @@ func CompareVersions(a, b string) int {
 		}
 	}
 
-	// 主版本号相同，比较 pre-release
-	// semver: 有 pre-release 的版本 < 无 pre-release 的版本
-	if preA == "" && preB == "" {
+	return comparePreRelease(preA, preB)
+}
+
+// comparePreRelease 按 semver 规范比较 pre-release 字段。
+// 空字符串视为正式版，正式版高于任何 pre-release。
+func comparePreRelease(a, b string) int {
+	if a == b {
 		return 0
 	}
-	if preA != "" && preB == "" {
-		return -1
-	}
-	if preA == "" && preB != "" {
+	// 有 pre-release 的版本 < 无 pre-release 的版本
+	if a == "" {
 		return 1
 	}
-
-	// 都有 pre-release 时按字典序比较
-	if preA < preB {
+	if b == "" {
 		return -1
 	}
-	if preA > preB {
+	aParts := strings.Split(a, ".")
+	bParts := strings.Split(b, ".")
+	n := len(aParts)
+	if len(bParts) < n {
+		n = len(bParts)
+	}
+	for i := 0; i < n; i++ {
+		aNum, aIsNum := parseNumericIdent(aParts[i])
+		bNum, bIsNum := parseNumericIdent(bParts[i])
+		switch {
+		case aIsNum && bIsNum:
+			if aNum != bNum {
+				if aNum < bNum {
+					return -1
+				}
+				return 1
+			}
+		case aIsNum && !bIsNum:
+			// 数字标识符低于字母数字标识符
+			return -1
+		case !aIsNum && bIsNum:
+			return 1
+		default:
+			if aParts[i] != bParts[i] {
+				if aParts[i] < bParts[i] {
+					return -1
+				}
+				return 1
+			}
+		}
+	}
+	// 所有共同段相等，字段更多者更高（如 alpha < alpha.1）
+	if len(aParts) < len(bParts) {
+		return -1
+	}
+	if len(aParts) > len(bParts) {
 		return 1
 	}
 	return 0
+}
+
+// parseNumericIdent 判断 pre-release 字段是否为纯数字标识符。
+func parseNumericIdent(s string) (int, bool) {
+	if s == "" {
+		return 0, false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
 }

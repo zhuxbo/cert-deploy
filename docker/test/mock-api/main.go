@@ -82,12 +82,20 @@ type CallbackRequest struct {
 	OrderID    int    `json:"order_id"`
 	Status     string `json:"status"`
 	DeployedAt string `json:"deployed_at"`
+	Message    string `json:"message,omitempty"`
 }
 
 // RenewRequest 续签请求
 type RenewRequest struct {
-	OrderID int    `json:"order_id"`
-	CSR     string `json:"csr,omitempty"`
+	OrderID          int    `json:"order_id"`
+	CSR              string `json:"csr,omitempty"`
+	Domains          string `json:"domains,omitempty"`
+	ValidationMethod string `json:"validation_method,omitempty"`
+}
+
+type AutoReissueRequest struct {
+	OrderID     int  `json:"order_id"`
+	AutoReissue bool `json:"auto_reissue"`
 }
 
 // RequestLog 请求日志
@@ -177,8 +185,8 @@ var scenarios = map[string]struct {
 	"processing":   {status: "processing", expiresIn: 0},
 	"expired":      {status: "expired", expiresIn: -30 * 24 * time.Hour},
 	"error":        {errorCode: 500, errorMsg: "Internal server error"},
-	"unauthorized":  {errorCode: 401, errorMsg: "Unauthorized"},
-	"not_found":     {errorCode: 404, errorMsg: "Order not found"},
+	"unauthorized": {errorCode: 401, errorMsg: "Unauthorized"},
+	"not_found":    {errorCode: 404, errorMsg: "Order not found"},
 	"batch":        {status: "active", expiresIn: 90 * 24 * time.Hour},
 	"renew-flow":   {status: "processing", expiresIn: 0},
 	"releases":     {status: "active", expiresIn: 90 * 24 * time.Hour},
@@ -210,6 +218,7 @@ func main() {
 
 	// 主要 API 端点
 	mux.HandleFunc("/api/deploy", handleDeploy)
+	mux.HandleFunc("/api/deploy/auto-reissue", handleAutoReissue)
 	mux.HandleFunc("/api/deploy/callback", handleCallback)
 	mux.HandleFunc("/api/cert", handleCert)
 	mux.HandleFunc("/api/callback", handleCallback)
@@ -523,6 +532,21 @@ func handleGetOrders(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// local CSR 已提交：POST 仅返回 processing；后续 GET 返回按该 CSR 公钥签发的证书。
+		if order.CertData.Cert != "" {
+			certData := order.CertData
+			_ = json.NewEncoder(w).Encode(APIResponse{
+				Code:    1,
+				Message: "success",
+				Data: PaginatedData{
+					Total: 1, CurrentPage: 1, PageSize: 100,
+					RenewBeforeDays: 14,
+					Data:            []interface{}{certData},
+				},
+			})
+			return
+		}
+
 		// renew-flow 场景：根据查询次数切换状态
 		if scenario == "renew-flow" {
 			certData := getRenewFlowResponse(order)
@@ -642,15 +666,40 @@ func handleRenewRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 模拟续签：更新订单状态
-	order.Status = "active"
-	order.ExpiresAt = time.Now().AddDate(0, 3, 0).Format(time.RFC3339)
+	issued, err := issueCertificateForCSR(req.CSR, order.OrderID, order.CommonName)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(APIResponse{Code: 0, Message: err.Error()})
+		return
+	}
+	order.Status = "processing"
+	order.CertData = issued
+	order.ExpiresAt = issued.ExpiresAt
+
+	processing := CertData{
+		OrderID:  order.OrderID,
+		Status:   "processing",
+		Domains:  order.Domains,
+		IssuedAt: "",
+	}
+	if req.ValidationMethod == "file" {
+		processing.File = &FileChallenge{
+			Path:    ".well-known/pki-validation/local-renew.txt",
+			Content: "local-renew-validation-content",
+		}
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(APIResponse{
 		Code:    1,
 		Message: "success",
-		Data:    getCertData(order.CommonName),
+		Data: map[string]interface{}{
+			"order_id":          processing.OrderID,
+			"status":            processing.Status,
+			"domains":           processing.Domains,
+			"file":              processing.File,
+			"renew_before_days": 14,
+		},
 	})
 }
 
@@ -698,6 +747,11 @@ func handleCallback(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(APIResponse{Code: 0, Message: "Invalid request body"})
 		return
 	}
+	if len([]rune(req.Message)) > 500 {
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_ = json.NewEncoder(w).Encode(APIResponse{Code: 0, Message: "Message exceeds 500 characters"})
+		return
+	}
 
 	// 记录回调
 	callbacksMutex.Lock()
@@ -708,14 +762,59 @@ func handleCallback(w http.ResponseWriter, r *http.Request) {
 	log.Printf("  OrderID: %d", req.OrderID)
 	log.Printf("  Status: %s", req.Status)
 	log.Printf("  DeployedAt: %s", req.DeployedAt)
+	if req.Message != "" {
+		log.Printf("  Message: %s", req.Message)
+	}
 	log.Printf("========================")
 
 	w.Header().Set("Content-Type", "application/json")
 	// 回调响应包含 renew_before_days（与 fetcher.CallbackResponse 匹配）
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
-		"code":              1,
-		"msg":               "success",
-		"renew_before_days": 14,
+		"code": 1,
+		"msg":  "success",
+		"data": map[string]int{
+			"renew_before_days": 14,
+		},
+	})
+}
+
+func handleAutoReissue(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		_ = json.NewEncoder(w).Encode(APIResponse{Code: 0, Message: "Method not allowed"})
+		return
+	}
+	if !checkAuth(w, r) {
+		return
+	}
+	var req AutoReissueRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(APIResponse{Code: 0, Message: "Invalid request body"})
+		return
+	}
+	ordersMutex.Lock()
+	order, ok := orders[req.OrderID]
+	if ok {
+		if req.AutoReissue {
+			order.RenewMode = "pull"
+		} else {
+			order.RenewMode = "local"
+		}
+	}
+	ordersMutex.Unlock()
+	if !ok {
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(APIResponse{Code: 0, Message: "Order not found"})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(APIResponse{
+		Code:    1,
+		Message: "success",
+		Data: map[string]int{
+			"renew_before_days": 14,
+		},
 	})
 }
 
@@ -1080,6 +1179,8 @@ var generatedCertBundle struct {
 	serverCert string // 服务器证书 PEM
 	serverKey  string // 服务器私钥 PEM (PKCS8)
 	caCert     string // CA 证书 PEM（作为中间证书返回）
+	caParsed   *x509.Certificate
+	caKey      *rsa.PrivateKey
 	once       sync.Once
 }
 
@@ -1132,6 +1233,8 @@ func doGenerateCACertPair(cn string) {
 		log.Fatalf("Failed to encode CA certificate PEM: %v", err)
 	}
 	generatedCertBundle.caCert = caPEM.String()
+	generatedCertBundle.caParsed = caCert
+	generatedCertBundle.caKey = caKey
 
 	// 2. 生成服务器密钥对
 	serverKey, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -1180,4 +1283,53 @@ func doGenerateCACertPair(cn string) {
 	generatedCertBundle.serverKey = serverKeyPEM.String()
 
 	log.Printf("Generated CA-signed certificate bundle for %s (CA: Mock CA)", cn)
+}
+
+// issueCertificateForCSR 使用 Mock CA 按 CSR 公钥签发证书。
+// local 模式的私钥只存在客户端 pending-keys/，服务端响应不得返回 private_key。
+func issueCertificateForCSR(csrPEM string, orderID int, fallbackCN string) (CertData, error) {
+	block, _ := pem.Decode([]byte(csrPEM))
+	if block == nil || block.Type != "CERTIFICATE REQUEST" {
+		return CertData{}, fmt.Errorf("invalid CSR PEM")
+	}
+	req, err := x509.ParseCertificateRequest(block.Bytes)
+	if err != nil {
+		return CertData{}, fmt.Errorf("parse CSR: %w", err)
+	}
+	if err := req.CheckSignature(); err != nil {
+		return CertData{}, fmt.Errorf("verify CSR signature: %w", err)
+	}
+	if generatedCertBundle.caParsed == nil || generatedCertBundle.caKey == nil {
+		return CertData{}, fmt.Errorf("mock CA signer unavailable")
+	}
+	cn := req.Subject.CommonName
+	if cn == "" {
+		cn = fallbackCN
+	}
+	now := time.Now()
+	tmpl := x509.Certificate{
+		SerialNumber:          big.NewInt(now.UnixNano()),
+		Subject:               pkix.Name{CommonName: cn, Organization: []string{"Mock Local Renew"}},
+		NotBefore:             now.Add(-time.Hour),
+		NotAfter:              now.AddDate(0, 3, 0),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		DNSNames:              []string{cn},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, &tmpl, generatedCertBundle.caParsed, req.PublicKey, generatedCertBundle.caKey)
+	if err != nil {
+		return CertData{}, fmt.Errorf("sign CSR: %w", err)
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	return CertData{
+		OrderID:          orderID,
+		Status:           "active",
+		Domains:          cn,
+		Cert:             string(certPEM),
+		IntermediateCert: generatedCertBundle.caCert,
+		PrivateKey:       "",
+		IssuedAt:         now.Format("2006-01-02"),
+		ExpiresAt:        tmpl.NotAfter.Format("2006-01-02"),
+	}, nil
 }

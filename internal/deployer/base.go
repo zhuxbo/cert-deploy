@@ -66,10 +66,10 @@ func (b *Base) NeedsProcessRestart() bool {
 
 // ReloadService 重载服务
 // 优先使用服务管理命令；失败时尝试回退策略：
-// - Windows 已识别为服务（winsvc: 哨兵）：先走 SCM Stop+Start；失败则回退执行
-//   哨兵中编入的 reload 命令，再失败走进程重启
-// - Linux 容器环境（无 systemd）：先发送 SIGUSR1 再执行 reload 命令
-// - Windows 非服务模式：reload 命令失败时回退到进程重启
+//   - Windows 已识别为服务（winsvc: 哨兵）：先走 SCM Stop+Start；失败则回退执行
+//     哨兵中编入的 reload 命令，再失败走进程重启
+//   - Linux 容器环境（无 systemd）：优先发送 SIGUSR1 并等待新 generation；失败再执行 reload 命令
+//   - Windows 非服务模式：reload 命令失败时回退到进程重启
 func (b *Base) ReloadService() error {
 	if b.ReloadCommand == "" {
 		return nil
@@ -78,6 +78,12 @@ func (b *Base) ReloadService() error {
 	// Windows 服务路径：detector 已识别 nginx/apache 为 Windows 服务
 	if strings.HasPrefix(b.ReloadCommand, webserver.WinSvcReloadPrefix) {
 		return b.reloadWinSvc()
+	}
+
+	// docker exec 重载命令直接在容器内执行，宿主机侧的 SIGUSR1/进程重启回退不适用
+	// （Apache/nginx master 进程在容器内，宿主机没有对应进程）
+	if executor.IsDockerExecCommand(b.ReloadCommand) {
+		return executor.Run(b.ReloadCommand)
 	}
 
 	// Linux 容器环境预检：如果 systemd 不可用且命令涉及 httpd/apache，
@@ -196,12 +202,79 @@ func (b *Base) reloadFallbackLinux() error {
 	if err != nil {
 		return fmt.Errorf("find process %d: %w", pid, err)
 	}
+	childrenBefore := childPIDs(pid)
 
 	// 发送 SIGUSR1（Apache: graceful restart）
 	if err := signalUSR1(proc); err != nil {
 		return fmt.Errorf("send SIGUSR1 to %d: %w", pid, err)
 	}
+
+	// SIGUSR1 只负责通知 master，信号发送成功不代表 graceful reload 已完成。
+	// 必须等到新一代 worker 出现后再允许下一绑定改写另一组证书文件；否则
+	// Apache 可能在读取配置时撞上“新私钥 + 旧证书”的瞬时状态并退出。
+	if err := waitForApacheReload(pid, childrenBefore, 5*time.Second); err != nil {
+		return fmt.Errorf("wait for apache reload: %w", err)
+	}
 	return nil
+}
+
+// waitForApacheReload 等待 Apache master 创建至少一个新 worker，证明 graceful
+// reload 已读取完配置并进入新 generation。master 退出或超时均按 reload 失败处理。
+func waitForApacheReload(masterPID int, childrenBefore map[int]struct{}, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		if _, err := os.Stat(fmt.Sprintf("/proc/%d", masterPID)); err != nil {
+			return fmt.Errorf("apache master %d exited", masterPID)
+		}
+		if hasNewPID(childrenBefore, childPIDs(masterPID)) {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("apache master %d did not create a new worker within %s", masterPID, timeout)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+}
+
+func hasNewPID(before, after map[int]struct{}) bool {
+	for pid := range after {
+		if _, exists := before[pid]; !exists {
+			return true
+		}
+	}
+	return false
+}
+
+func childPIDs(parentPID int) map[int]struct{} {
+	children := make(map[int]struct{})
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return children
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil {
+			continue
+		}
+		status, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(string(status), "\n") {
+			if !strings.HasPrefix(line, "PPid:") {
+				continue
+			}
+			ppid, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(line, "PPid:")))
+			if err == nil && ppid == parentPID {
+				children[pid] = struct{}{}
+			}
+			break
+		}
+	}
+	return children
 }
 
 // apacheProcessName 将 apachectl/apache2ctl 等 wrapper 脚本名映射到实际进程名

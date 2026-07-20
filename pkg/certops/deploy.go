@@ -30,10 +30,11 @@ func (s *Service) DeployOne(ctx context.Context, certName string) (*DeployResult
 	}
 
 	// 从 API 获取证书
-	certData, _, err := s.fetcher.QueryOrder(ctx, api.URL, api.Token, cert.OrderID)
+	certData, renewBeforeDays, err := s.fetcher.QueryOrder(ctx, api.URL, api.Token, cert.OrderID)
 	if err != nil {
 		return nil, fmt.Errorf("获取证书失败: %w", err)
 	}
+	s.tryUpdateRenewBeforeDays(renewBeforeDays)
 
 	// 订单续费后 API 返回新订单号，同步更新
 	s.syncOrderID(cert, certData)
@@ -46,8 +47,8 @@ func (s *Service) DeployOne(ctx context.Context, certName string) (*DeployResult
 		return nil, fmt.Errorf("中间证书为空，等待下一周期重试")
 	}
 
-	// 获取私钥：优先使用 API 返回，否则从本地读取
-	privateKey, err := GetPrivateKey(cert, certData.PrivateKey, s.log)
+	// 获取私钥：优先使用 API 返回，否则从本地读取（pending 感知，配对校验）
+	privateKey, err := GetPrivateKeyForCert(s.cfgManager.GetWorkDir(), cert, certData.Cert, certData.PrivateKey, s.log)
 	if err != nil {
 		return nil, err
 	}
@@ -77,6 +78,11 @@ func (s *Service) DeployOne(ctx context.Context, certName string) (*DeployResult
 			s.log.Info("证书已部署到 %s", binding.ServerName)
 			successCount++
 		}
+	}
+
+	// 部署成功后补转正 pending 私钥（若本次使用的正是 pending 私钥）
+	if successCount > 0 {
+		s.commitPendingKeyAfterDeploy(cert, privateKey)
 	}
 
 	// 持久化配置变更（订单号更新等）
@@ -132,13 +138,33 @@ func (s *Service) sendDeployCallback(ctx context.Context, cert *config.CertConfi
 		Status:     status,
 		DeployedAt: time.Now().Format(time.RFC3339),
 	}
+	if !result.Success {
+		callbackReq.Message = callbackMessage(result.Error)
+		s.log.Error("证书 %s 部署失败（已上报 failure 回调）: %s", cert.CertName, callbackReq.Message)
+	}
 
 	fillCertMetadata(callbackReq, cert)
 	s.sendCallback(ctx, cert.GetAPI(s.log), callbackReq)
 }
 
+// DeployToBinding 将已获取的证书部署到单个绑定（含证书校验、现有证书备份、失败回滚）。
+// 供 setup 等已在外部取得 certData/privateKey 的调用方复用，避免重复实现部署路径。
+func (s *Service) DeployToBinding(ctx context.Context, binding *config.SiteBinding, certData *fetcher.CertData, privateKey string) error {
+	return s.deployToBinding(ctx, binding, certData, privateKey)
+}
+
 // deployToBinding 部署证书到绑定（带备份和回滚）
 func (s *Service) deployToBinding(ctx context.Context, binding *config.SiteBinding, certData *fetcher.CertData, privateKey string) error {
+	// Docker 站点：校验可安全部署（挂载卷模式 + 容器重载命令），否则如实报错而非静默成功
+	if config.IsDockerType(binding.ServerType) {
+		if err := config.ValidateDockerBinding(binding); err != nil {
+			return errors.NewStructuredDeployError(errors.DeployErrorConfig, errors.PhaseWriteCert, err.Error(), nil)
+		}
+	} else if binding.Reload.ReloadCommand == "" {
+		// 非 Docker 站点无重载命令：保留原有跳过行为，但记录告警提示部署后未重载
+		s.log.Warn("站点 %s 无重载命令，部署后不会自动重载服务", binding.ServerName)
+	}
+
 	// 验证证书与私钥
 	v := validator.New("")
 	if _, err := v.ValidateCert(certData.Cert); err != nil {

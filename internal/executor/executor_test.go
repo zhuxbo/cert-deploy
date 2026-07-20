@@ -262,6 +262,55 @@ func TestRunContext_NotAllowed(t *testing.T) {
 	}
 }
 
+// TestIsDockerExecCommand 测试 docker exec 容器重载命令识别与白名单校验
+func TestIsDockerExecCommand(t *testing.T) {
+	tests := []struct {
+		cmd  string
+		want bool
+	}{
+		{"docker exec my-nginx nginx -t", true},
+		{"docker exec my-nginx nginx -s reload", true},
+		{"docker exec web_1 apachectl -t", true},
+		{"docker exec web_1 apachectl graceful", true},
+		{"docker exec c1 httpd -k graceful", true},
+		{"docker exec 3f2a1b apache2ctl -t", true},
+		// 内层命令不在白名单
+		{"docker exec c1 rm -rf /", false},
+		{"docker exec c1 sh -c evil", false},
+		{"docker exec c1 nginx -s stop", false},
+		// 容器名非法（含注入字符）
+		{"docker exec c1;rm nginx -t", false},
+		{"docker exec $(evil) nginx -t", false},
+		// 非 docker exec
+		{"nginx -t", false},
+		{"docker ps", false},
+		{"docker exec c1", false},
+	}
+	for _, tt := range tests {
+		if got := IsDockerExecCommand(tt.cmd); got != tt.want {
+			t.Errorf("IsDockerExecCommand(%q) = %v, want %v", tt.cmd, got, tt.want)
+		}
+	}
+}
+
+// TestRunContext_DockerExec_InvalidRejected 验证 RunContext 在实际执行 docker 前
+// 拒绝非法容器名与非白名单内层命令（不依赖 docker 是否安装）
+func TestRunContext_DockerExec_InvalidRejected(t *testing.T) {
+	ctx := t.Context()
+
+	if err := RunContext(ctx, "docker exec bad;name nginx -t"); err == nil {
+		t.Error("非法容器名应被拒绝")
+	} else if !contains(err.Error(), "invalid docker container name") {
+		t.Errorf("错误应指出非法容器名: %v", err)
+	}
+
+	if err := RunContext(ctx, "docker exec c1 rm -rf /"); err == nil {
+		t.Error("非白名单内层命令应被拒绝")
+	} else if !contains(err.Error(), "docker inner command not in whitelist") {
+		t.Errorf("错误应指出内层命令不在白名单: %v", err)
+	}
+}
+
 // TestRunOutputContext_NotAllowed 测试 RunOutputContext 白名单机制
 func TestRunOutputContext_NotAllowed(t *testing.T) {
 	ctx := t.Context()

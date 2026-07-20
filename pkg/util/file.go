@@ -85,6 +85,12 @@ func CopyFile(src, dst string) error {
 		return fmt.Errorf("source changed to non-regular file (TOCTOU detected)")
 	}
 
+	// 目标路径符号链接检查（与 AtomicWrite 防护对齐）：
+	// O_TRUNC 会跟随符号链接写到链接目标，拒绝以防通过符号链接覆盖任意文件
+	if info, err := os.Lstat(dst); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("destination is a symbolic link, refusing to write")
+	}
+
 	// 创建目标文件
 	dstFile, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, srcInfo.Mode())
 	if err != nil {

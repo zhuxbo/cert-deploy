@@ -1,38 +1,19 @@
-# sslctl Skills
+---
+name: sslctl
+description: 路由 sslctl 的 Go 开发、Web 服务器部署、运维、构建发布、远程发布与完成检查任务。
+---
 
-本目录包含项目开发规范和知识库，按领域组织。
+# sslctl Skill 路由
 
-## Skill 列表
+本文件只负责路由。匹配任务时读取对应叶子资源；涉及多个领域时按需组合，不把叶子规则复制到入口。
 
-| Skill | 目录 | 触发场景 |
-|-------|------|---------|
-| Go 开发 | `go-dev/` | Go 代码、包结构、错误处理 |
-| Nginx/Apache | `nginx-apache/` | 配置解析、证书部署、服务重载 |
-| 部署运维 | `deploy-ops/` | Linux 部署、systemd、daemon 模式 |
-| 构建发布 | `build-release/` | 版本发布、交叉编译、CI/CD |
+| 触发场景 | 叶子资源 |
+| --- | --- |
+| Go 代码、包结构、安全开发、单元测试 | `skills/go-dev.md` |
+| Nginx/Apache 扫描、安装、重载、Docker 绑定 | `skills/nginx-apache.md` |
+| setup/deploy/daemon、续签、回调、运行维护 | `skills/deploy-ops.md` |
+| 多平台构建、正式资产、Ed25519 签名、bundle | `skills/build-release.md` |
+| dev 或 main 远程发布、Git/GitHub 编排、中断恢复 | `skills/remote-release.md` |
+| 完成修改、提交前检查、用户说“finish-check” | `skills/finish-check.md` |
 
-## 使用方式
-
-根据当前任务类型，读取对应 skill 获取详细规范：
-
-```
-skills/go-dev/SKILL.md         # Go 开发任务
-skills/nginx-apache/SKILL.md   # Nginx/Apache 相关任务
-skills/deploy-ops/SKILL.md     # 部署运维任务
-skills/build-release/SKILL.md  # 构建发布任务
-```
-
-## 知识积累
-
-开发过程中遇到以下情况时，将信息写入对应 skill：
-
-- 发现新的架构约定或设计模式
-- 解决了疑难问题（记录原因和解决方案）
-- 确定了最佳实践
-- 发现文档中缺失的重要信息
-
-写入规则：
-
-- 只记录已确定且经过验证的信息
-- 保持简洁，避免冗余
-- 按对应领域写入正确的 skill 文件
+发布任务必须同时读取 `skills/remote-release.md` 与 `skills/build-release.md`；发布语义以 `deploy-spec.md` 第 8 节为上位边界。完成检查以 `skills/finish-check.md` 为唯一清单。

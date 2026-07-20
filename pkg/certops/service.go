@@ -60,9 +60,16 @@ func (s *Service) syncOrderID(cert *config.CertConfig, certData *fetcher.CertDat
 	s.fixCertName(cert)
 }
 
-// fixCertName 修正 cert_name 中的订单号后缀，使其与 order_id 一致
-// cert_name 格式: {domain}-{order_id}
+// fixCertName 修正 cert_name（Service 包装）
 func (s *Service) fixCertName(cert *config.CertConfig) {
+	FixCertName(s.cfgManager, cert, s.log)
+}
+
+// FixCertName 修正 cert_name 中的订单号后缀，使其与 order_id 一致，
+// 并同步迁移 pending 私钥目录与重命名配置条目。
+// cert_name 格式: {domain}-{order_id}
+// 单一实现供续签链与 CLI 部署链（cmd/deploy）共用，避免双实现漂移。
+func FixCertName(cfgManager *config.ConfigManager, cert *config.CertConfig, log *logger.Logger) {
 	idx := strings.LastIndex(cert.CertName, "-")
 	if idx < 0 {
 		return
@@ -73,9 +80,15 @@ func (s *Service) fixCertName(cert *config.CertConfig) {
 	}
 	oldName := cert.CertName
 	cert.CertName = expectedName
-	s.log.Info("证书名称修正: %s -> %s", oldName, expectedName)
-	if err := s.cfgManager.RenameCert(oldName, cert); err != nil {
-		s.log.Warn("重命名证书配置失败: %v", err)
+	if log != nil {
+		log.Info("证书名称修正: %s -> %s", oldName, expectedName)
+	}
+	// pending 私钥按 certName 组织，改名时一并迁移，否则 local 模式续签读不到 pending key
+	if err := renamePendingKey(cfgManager.GetWorkDir(), oldName, expectedName); err != nil && log != nil {
+		log.Warn("迁移 pending 私钥失败: %v", err)
+	}
+	if err := cfgManager.RenameCert(oldName, cert); err != nil && log != nil {
+		log.Warn("重命名证书配置失败: %v", err)
 	}
 }
 
@@ -95,7 +108,12 @@ func (s *Service) CheckExpiry() {
 
 	now := time.Now()
 	for _, cert := range cfg.Certificates {
-		if !cert.Enabled || cert.Metadata.CertExpiresAt.IsZero() {
+		if !cert.Enabled {
+			continue
+		}
+		// 到期时间未知不再静默跳过（告警盲区），下轮续签检查会自动回填
+		if cert.Metadata.CertExpiresAt.IsZero() {
+			s.log.Warn("证书 %s 到期时间未知（元数据缺失），无法判断过期风险，续签检查将自动回填", cert.CertName)
 			continue
 		}
 

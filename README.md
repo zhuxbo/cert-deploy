@@ -129,6 +129,8 @@ sslctl uninstall                                     # 卸载（交互确认是�
 
 CI 覆盖 linux/amd64、linux/arm64、windows/amd64 三平台交叉编译验证。
 
+开发与发布的权威入口：项目规则见 `AGENTS.md`，任务路由见 `skills/SKILL.md`；构建/签名契约见 `skills/build-release.md`，远程发布与中断恢复见 `skills/remote-release.md`，完整完成检查见 `skills/finish-check.md`。脚本参数速查见 `build/README.md`。发布规则不在 README 中重复维护。
+
 支持 Docker 容器 Nginx（挂载卷/docker cp 双模式），自动检测本地或容器环境。
 
 ## Debug 模式
@@ -203,7 +205,7 @@ sslctl status
 {
   "release_url": "https://release.example.com/sslctl",
   "schedule": {
-    "renew_before_days": 13,
+    "renew_before_days": 14,
     "renew_mode": "pull"
   },
   "certificates": [
@@ -239,7 +241,7 @@ sslctl status
 
 | 字段                   | 类型   | 默认值            | 说明                                   |
 | ---------------------- | ------ | ----------------- | -------------------------------------- |
-| `renew_before_days`    | int    | 13                | 提前续期天数，最大 13，0 使用默认值    |
+| `renew_before_days`    | int    | 14                | 提前续期天数，上限 30，0 使用默认值 14 |
 | `renew_mode`           | string | `pull`            | 全局续签模式，证书级别可覆盖           |
 
 ### config.json.lock
@@ -248,12 +250,12 @@ sslctl status
 
 ## 续签模式
 
-两种模式统一：`renew_before_days` 最大 13 天，默认 13 天。
+两种模式统一：`renew_before_days` 默认 14 天、上限 30 天，由服务端下发并在每次 API 交互后回写。
 
-| 模式    | 说明                             | 默认值 |
-| ------- | -------------------------------- | ------ |
-| `local` | 本机提交，本地生成私钥和 CSR     | 13 天  |
-| `pull`  | 自动签发，从服务端拉取已签发证书 | 13 天  |
+| 模式    | 说明                             | 默认续签阈值 |
+| ------- | -------------------------------- | ------------ |
+| `local` | 本机提交，本地生成私钥和 CSR     | 14 天        |
+| `pull`  | 自动签发，从服务端拉取已签发证书 | 14 天        |
 
 - **本机提交**：由本地控制私钥，通过 POST 部署接口提交本地生成的 CSR
 - **自动签发**：查询已签发的证书直接部署
@@ -293,6 +295,17 @@ Docker 站点配置添加 `docker` 字段：
 
 部署模式：`volume`（挂载卷）、`copy`（docker cp）、`auto`（自动检测）
 
+### 存量 Docker 绑定升级说明
+
+自动部署链（setup/deploy/续签）现在对 Docker 站点执行部署前校验：要求证书目录挂载为宿主机卷（`volume` 模式）且具备容器化重载命令（`docker exec <容器> nginx -s reload` 等）。不满足的绑定会**如实报失败**，而不再像旧版本那样静默写错位置并误报成功。
+
+由旧版本 setup 创建的存量 Docker 绑定（copy 模式、或缺少容器重载命令）升级后会持续报部署失败，属预期行为。处理方式：
+
+- 重新执行 `sslctl setup` 让扫描器补齐容器命令与宿主机挂载路径校验；
+- 证书目录未挂载为卷的容器，需调整容器挂载后重跑 setup（copy 模式暂不支持自动部署链）。
+
+已知项：Apache 容器内若仅有 `httpd`/`apache2ctl` 而无 `apachectl`，容器重载会明确报错（不会误报成功），容器内命令自动探测待后续版本支持。
+
 ## 开发测试
 
 ```bash
@@ -310,7 +323,7 @@ bash build/test-linux.sh
 ### 容器端到端测试
 
 ```bash
-# 运行全部 E2E 测试（构建 + 全矩阵）
+# 运行完整 E2E 门禁（常规矩阵 + Docker-in-Docker 扫描/部署）
 bash docker/test/scripts/run-tests.sh
 
 # 指定发行版和服务器
@@ -319,16 +332,19 @@ bash docker/test/scripts/run-tests.sh --distro ubuntu --server nginx
 # 指定测试文件（不含 .bats 后缀）
 bash docker/test/scripts/run-tests.sh --test scan
 
-# Docker-in-Docker 测试
-bash docker/test/scripts/run-tests.sh --dind
+# 仅运行 Docker-in-Docker 部署测试
+bash docker/test/scripts/run-tests.sh --test docker-deploy
+
+# 调试时跳过 Docker-in-Docker（不属于完整门禁）
+bash docker/test/scripts/run-tests.sh --no-dind
 
 # 跳过构建（已构建过镜像）
 bash docker/test/scripts/run-tests.sh --no-build
 ```
 
-测试矩阵：Nginx/Apache × Ubuntu/Debian/Alpine/Rocky + DinD，使用 Mock API 离线运行。
+测试矩阵：Nginx/Apache × Ubuntu/Debian/Alpine/Rocky + DinD，使用 Mock API 离线运行。无参数命令默认同时执行常规矩阵和 DinD 测试。
 
-测试用例：setup、deploy、deploy-local、scan、status、rollback、daemon、upgrade、uninstall、docker-scan（共 10 个 bats 文件，docker-scan 在 DinD 容器中运行，uninstall 自动排最后执行）。
+测试用例：setup、deploy、deploy-local、renew-local、scan、status、rollback、daemon、upgrade、uninstall、docker-scan、docker-deploy（共 12 个 bats 文件；docker-* 在 DinD 容器中运行，uninstall 自动排最后执行）。
 
 ## License
 

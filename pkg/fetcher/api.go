@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/zhuxbo/sslctl/pkg/config"
 	"github.com/zhuxbo/sslctl/pkg/errors"
 	"github.com/zhuxbo/sslctl/pkg/validator"
 )
@@ -58,6 +59,25 @@ type CertData struct {
 	File             *FileChallenge `json:"file,omitempty"`
 }
 
+func validateCertDataSizes(cert *CertData) error {
+	if len(cert.Cert)+len(cert.IntermediateCert) > config.MaxCertFileSize {
+		return fmt.Errorf("certificate chain exceeds %d bytes", config.MaxCertFileSize)
+	}
+	if len(cert.PrivateKey) > config.MaxPrivateKeySize {
+		return fmt.Errorf("private key exceeds %d bytes", config.MaxPrivateKeySize)
+	}
+	return nil
+}
+
+func validateCertDataList(certs []CertData) error {
+	for i := range certs {
+		if err := validateCertDataSizes(&certs[i]); err != nil {
+			return fmt.Errorf("certificate order %d: %w", certs[i].OrderID, err)
+		}
+	}
+	return nil
+}
+
 // APIResponse API 响应结构
 type APIResponse struct {
 	Code    int             `json:"code"`
@@ -73,6 +93,9 @@ func (r *APIResponse) ParseData() (*CertData, error) {
 	// 尝试解析为单个对象
 	var single CertData
 	if err := json.Unmarshal(r.Data, &single); err == nil {
+		if err := validateCertDataSizes(&single); err != nil {
+			return nil, err
+		}
 		return &single, nil
 	}
 	// 尝试解析为数组
@@ -82,6 +105,9 @@ func (r *APIResponse) ParseData() (*CertData, error) {
 	}
 	if len(list) == 0 {
 		return nil, fmt.Errorf("empty data array")
+	}
+	if err := validateCertDataSizes(&list[0]); err != nil {
+		return nil, err
 	}
 	return &list[0], nil
 }
@@ -106,16 +132,25 @@ func (r *APIResponse) ParsePaginatedData() ([]CertData, int, int, error) {
 	// 尝试解析为分页响应
 	var paginated PaginatedResponse
 	if err := json.Unmarshal(r.Data, &paginated); err == nil && paginated.Data != nil {
+		if err := validateCertDataList(paginated.Data); err != nil {
+			return nil, 0, 0, err
+		}
 		return paginated.Data, paginated.Total, paginated.RenewBeforeDays, nil
 	}
 	// 兼容：尝试解析为单个对象
 	var single CertData
 	if err := json.Unmarshal(r.Data, &single); err == nil && single.OrderID != 0 {
+		if err := validateCertDataSizes(&single); err != nil {
+			return nil, 0, 0, err
+		}
 		return []CertData{single}, 1, 0, nil
 	}
 	// 兼容：尝试解析为数组
 	var list []CertData
 	if err := json.Unmarshal(r.Data, &list); err == nil {
+		if err := validateCertDataList(list); err != nil {
+			return nil, 0, 0, err
+		}
 		return list, len(list), 0, nil
 	}
 	return nil, 0, 0, fmt.Errorf("failed to parse paginated data")
@@ -135,6 +170,9 @@ type CallbackRequest struct {
 	OrderID    int    `json:"order_id"`
 	Status     string `json:"status"` // success, failure
 	DeployedAt string `json:"deployed_at"`
+	// Message 失败原因摘要，可选，仅 status=failure 时填充；
+	// 客户端已脱敏并按 rune 截断 ≤256，success 不携带（omitempty）
+	Message string `json:"message,omitempty"`
 }
 
 // UpdateResponse update 接口的 data 字段结构
@@ -149,6 +187,9 @@ type CallbackResponse struct {
 	Code            int    `json:"code"`
 	Message         string `json:"msg"`
 	RenewBeforeDays int    `json:"renew_before_days"`
+	Data            struct {
+		RenewBeforeDays int `json:"renew_before_days"`
+	} `json:"data"`
 }
 
 // Fetcher 证书获取器
@@ -439,7 +480,12 @@ func (f *Fetcher) Callback(ctx context.Context, callbackURL, token string, callb
 	if callbackResp.Code != APICodeSuccess {
 		return 0, errors.NewNetworkError(fmt.Sprintf("callback failed: %s", callbackResp.Message), nil)
 	}
-	return callbackResp.RenewBeforeDays, nil
+	renewBeforeDays := callbackResp.Data.RenewBeforeDays
+	if renewBeforeDays == 0 {
+		// 兼容旧服务端把 renew_before_days 放在顶层的响应。
+		renewBeforeDays = callbackResp.RenewBeforeDays
+	}
+	return renewBeforeDays, nil
 }
 
 // buildAPIURL 构建 API URL
@@ -544,7 +590,9 @@ func (f *Fetcher) Update(ctx context.Context, baseURL, token string, orderID int
 		return nil, 0, errors.NewNetworkError("failed to parse JSON response", err)
 	}
 	if apiResp.Code != APICodeSuccess {
-		return nil, 0, errors.NewNetworkError(fmt.Sprintf("API error: %s", apiResp.Message), nil)
+		// 服务端已成功响应但明确拒绝提交（校验失败、订单状态不允许等）：
+		// 属确定结果而非传输失败，调用方据此清理在途 pending 后停止（spec 2.6）
+		return nil, 0, errors.NewBusinessError(fmt.Sprintf("API error: %s", apiResp.Message), nil)
 	}
 	// update 响应 data 字段为单条，同层包含 renew_before_days
 	var updateResp UpdateResponse
@@ -555,6 +603,9 @@ func (f *Fetcher) Update(ctx context.Context, baseURL, token string, orderID int
 			return nil, 0, errors.NewNetworkError("failed to parse update response", err)
 		}
 		return certData, 0, nil
+	}
+	if err := validateCertDataSizes(&updateResp.CertData); err != nil {
+		return nil, 0, errors.NewNetworkError("invalid update response", err)
 	}
 	return &updateResp.CertData, updateResp.RenewBeforeDays, nil
 }
@@ -615,10 +666,10 @@ type ToggleAutoReissueRequest struct {
 // ToggleAutoReissue 通知服务端是否自动续签
 // POST {baseURL}/api/deploy/auto-reissue
 // 此为非关键路径，调用失败返回 error 由调用方决定是否记录日志
-func (f *Fetcher) ToggleAutoReissue(ctx context.Context, baseURL, token string, orderID int, autoReissue bool) error {
+func (f *Fetcher) ToggleAutoReissue(ctx context.Context, baseURL, token string, orderID int, autoReissue bool) (int, error) {
 	apiURL := buildAPIURL(baseURL, "/auto-reissue")
 	if err := mustValidURL(apiURL); err != nil {
-		return errors.NewNetworkError("invalid API URL", err)
+		return 0, errors.NewNetworkError("invalid API URL", err)
 	}
 
 	reqBody := ToggleAutoReissueRequest{
@@ -627,7 +678,7 @@ func (f *Fetcher) ToggleAutoReissue(ctx context.Context, baseURL, token string, 
 	}
 	bodyData, err := json.Marshal(reqBody)
 	if err != nil {
-		return errors.NewNetworkError("failed to marshal request", err)
+		return 0, errors.NewNetworkError("failed to marshal request", err)
 	}
 
 	newRequest := func() (*http.Request, error) {
@@ -643,24 +694,32 @@ func (f *Fetcher) ToggleAutoReissue(ctx context.Context, baseURL, token string, 
 
 	resp, err := f.doWithRetry(ctx, newRequest)
 	if err != nil {
-		return errors.NewNetworkError("failed to toggle auto reissue", err)
+		return 0, errors.NewNetworkError("failed to toggle auto reissue", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		return errors.NewNetworkError(fmt.Sprintf("unexpected status code: %d", resp.StatusCode), nil)
+		return 0, errors.NewNetworkError(fmt.Sprintf("unexpected status code: %d", resp.StatusCode), nil)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, defaultMaxResponseSize))
 	if err != nil {
-		return errors.NewNetworkError("failed to read response body", err)
+		return 0, errors.NewNetworkError("failed to read response body", err)
 	}
 	var apiResp APIResponse
 	if err := json.Unmarshal(body, &apiResp); err != nil {
-		return errors.NewNetworkError("failed to parse JSON response", err)
+		return 0, errors.NewNetworkError("failed to parse JSON response", err)
 	}
 	if apiResp.Code != APICodeSuccess {
-		return errors.NewNetworkError(fmt.Sprintf("API error: %s", apiResp.Message), nil)
+		return 0, errors.NewNetworkError(fmt.Sprintf("API error: %s", apiResp.Message), nil)
 	}
-	return nil
+	var data struct {
+		RenewBeforeDays int `json:"renew_before_days"`
+	}
+	if len(apiResp.Data) > 0 {
+		if err := json.Unmarshal(apiResp.Data, &data); err != nil {
+			return 0, errors.NewNetworkError("failed to parse auto reissue response data", err)
+		}
+	}
+	return data.RenewBeforeDays, nil
 }
 
 // QueryBatch 批量查询证书

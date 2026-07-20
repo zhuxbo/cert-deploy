@@ -192,7 +192,7 @@ _cleanup_relative_path_site() {
   fi
 
   # 不创建相对路径站点，仅验证 setup 能接受 prefix 参数且扫描阶段不报 prefix 错误
-  run sslctl setup --url "$MOCK_URL" --token "$TOKEN" --order 1001 --yes $flag_name "$prefix"
+  run sslctl setup --url "$MOCK_URL" --token "$TOKEN" --order 1001 --no-service --yes $flag_name "$prefix"
   # setup 会因正常部署流程（部署证书到 test.example.com）决定成功/失败，
   # 但不应出现 prefix 未知的阻断错误
   assert_output_not_contains "无法确定"

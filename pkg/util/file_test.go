@@ -247,6 +247,38 @@ func TestCopyFile_InvalidDestination(t *testing.T) {
 	}
 }
 
+// TestCopyFile_DestinationSymlink 验证目标为符号链接时拒绝写入
+// （O_TRUNC 会跟随符号链接写到链接目标，与 AtomicWrite 防护对齐）。
+func TestCopyFile_DestinationSymlink(t *testing.T) {
+	dir := t.TempDir()
+	srcPath := filepath.Join(dir, "src.txt")
+	realTarget := filepath.Join(dir, "real-target.txt")
+	linkPath := filepath.Join(dir, "dst-link.txt")
+
+	if err := os.WriteFile(srcPath, []byte("new-content"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(realTarget, []byte("original"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(realTarget, linkPath); err != nil {
+		t.Skipf("无法创建符号链接: %v", err)
+	}
+
+	if err := CopyFile(srcPath, linkPath); err == nil {
+		t.Error("目标为符号链接时应拒绝写入")
+	}
+
+	// 链接指向的真实文件不得被篡改
+	data, err := os.ReadFile(realTarget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "original" {
+		t.Error("符号链接目标文件被篡改（防护未生效）")
+	}
+}
+
 // TestFileExists 测试文件存在检查
 func TestFileExists(t *testing.T) {
 	dir := t.TempDir()

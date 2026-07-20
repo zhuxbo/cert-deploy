@@ -27,6 +27,12 @@ var (
 	basicAuthRegex = regexp.MustCompile(`Basic\s+[A-Za-z0-9+/=]+`)
 )
 
+// Sanitize 对外暴露敏感信息过滤，供回调 message 等"需脱敏但不经日志"的场景复用，
+// 与日志过滤共用同一套规则（私钥块 / Bearer / Basic Auth / JSON 敏感字段 / token 参数），避免规则漂移。
+func Sanitize(msg string) string {
+	return sanitize(msg)
+}
+
 // sanitize 过滤敏感信息
 func sanitize(msg string) string {
 	// 过滤私钥

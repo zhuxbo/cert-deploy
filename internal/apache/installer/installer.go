@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/zhuxbo/sslctl/internal/executor"
+	"github.com/zhuxbo/sslctl/pkg/matcher"
 )
 
 // ApacheInstaller Apache HTTPS 安装器
@@ -30,7 +31,7 @@ func NewApacheInstaller(configPath, certPath, keyPath, chainPath, serverName, te
 		certPath:    certPath,
 		keyPath:     keyPath,
 		chainPath:   chainPath,
-		serverName:  serverName,
+		serverName:  matcher.StripPort(serverName),
 		testCommand: testCommand,
 	}
 }
@@ -115,10 +116,10 @@ func (i *ApacheInstaller) hasSSLConfig(content string) bool {
 			continue
 		}
 
-		// 解析 ServerName
+		// 解析 ServerName（剥离端口）
 		if matches := serverNameRe.FindStringSubmatch(line); len(matches) > 1 {
 			name := strings.TrimSpace(matches[1])
-			name = strings.Trim(name, `"'`)
+			name = matcher.StripPort(strings.Trim(name, `"'`))
 			serverNames = append(serverNames, name)
 		}
 
@@ -126,7 +127,7 @@ func (i *ApacheInstaller) hasSSLConfig(content string) bool {
 		if matches := serverAliasRe.FindStringSubmatch(line); len(matches) > 1 {
 			aliases := strings.Fields(matches[1])
 			for _, alias := range aliases {
-				alias = strings.Trim(alias, `"'`)
+				alias = matcher.StripPort(strings.Trim(alias, `"'`))
 				serverNames = append(serverNames, alias)
 			}
 		}
@@ -161,14 +162,14 @@ func (i *ApacheInstaller) backup(content string) (string, error) {
 
 // addSSLVirtualHost 添加 SSL VirtualHost
 func (i *ApacheInstaller) addSSLVirtualHost(content string) (string, error) {
-	// 查找该站点的非 SSL VirtualHost（任意非 443 端口）
+	// 查找该站点端口恰为 80 的 HTTP VirtualHost
 	vhostHTTP, err := i.extractHTTPVirtualHost(content)
 	if err != nil {
 		return "", err
 	}
 
 	if vhostHTTP == "" {
-		return "", fmt.Errorf("未找到该站点的 VirtualHost（需要非 :443 的 VirtualHost）")
+		return "", fmt.Errorf("未找到可安装 HTTPS 的 VirtualHost（需要端口为 80 且 ServerName 匹配 %s 的 VirtualHost）", i.serverName)
 	}
 
 	// 生成 :443 VirtualHost
@@ -178,17 +179,16 @@ func (i *ApacheInstaller) addSSLVirtualHost(content string) (string, error) {
 	return content + "\n" + vhost443, nil
 }
 
-// extractHTTPVirtualHost 提取该站点的非 SSL VirtualHost
-// 匹配任意非 443 端口的 VirtualHost（支持 :80、:1800、:8080 等自定义端口）
+// extractHTTPVirtualHost 提取该站点端口恰为 80 的 HTTP VirtualHost。
+// 仅接受含 :80 地址的 VirtualHost：generateSSLVirtualHost 只把端口 80 改写为 443，
+// 若基于 *:8080 等自定义端口生成，会得到端口未改写的伪 SSL 块（SSL 挂在非 443 端口且无 :443 监听），
+// 因此非 80 端口一律跳过，找不到时由调用方返回明确错误（与 Nginx 安装器无 80 块即报错的行为一致）。
 func (i *ApacheInstaller) extractHTTPVirtualHost(content string) (string, error) {
 	lines := strings.Split(content, "\n")
 	var result []string
 	inVhost := false
 	depth := 0
 
-	// 匹配所有 VirtualHost（排除 :443）
-	vhostStartRe := regexp.MustCompile(`(?i)^\s*<VirtualHost\s+[^>]*>`)
-	vhostStartSSLRe := regexp.MustCompile(`(?i)^\s*<VirtualHost\s+[^>]*:443[^0-9]`)
 	vhostEndRe := regexp.MustCompile(`(?i)^\s*</VirtualHost>`)
 	serverNameRe := regexp.MustCompile(`(?i)^\s*ServerName\s+(.+)$`)
 
@@ -196,7 +196,8 @@ func (i *ApacheInstaller) extractHTTPVirtualHost(content string) (string, error)
 	foundServerName := false
 
 	for _, line := range lines {
-		if vhostStartRe.MatchString(line) && !vhostStartSSLRe.MatchString(line) {
+		// 仅接受端口恰为 80 的 VirtualHost 开始标签（复用 swapAddrPort80 的端口判定）
+		if !inVhost && virtualHostHasPort80(line) {
 			inVhost = true
 			depth = 1
 			currentVhost = []string{line}
@@ -215,10 +216,10 @@ func (i *ApacheInstaller) extractHTTPVirtualHost(content string) (string, error)
 				depth--
 			}
 
-			// 检查 ServerName
+			// 检查 ServerName（剥离端口后比较）
 			if matches := serverNameRe.FindStringSubmatch(line); len(matches) > 1 {
 				serverName := strings.TrimSpace(matches[1])
-				serverName = strings.Trim(serverName, `"'`)
+				serverName = matcher.StripPort(strings.Trim(serverName, `"'`))
 				if serverName == i.serverName {
 					foundServerName = true
 				}
@@ -239,19 +240,71 @@ func (i *ApacheInstaller) extractHTTPVirtualHost(content string) (string, error)
 	return strings.Join(result, "\n"), nil
 }
 
+// vhostOpenTagRe 拆分 <VirtualHost ...> 开始标签为前缀、地址列表、后缀三段
+var vhostOpenTagRe = regexp.MustCompile(`(?i)^(\s*<VirtualHost\s+)([^>]*?)(\s*>.*)$`)
+
+// replaceVirtualHostPort80 将 <VirtualHost> 开始标签地址列表中端口恰为 80 的地址改为 443，
+// 其余端口（如 8080）保持不变；非 VirtualHost 开始行原样返回。
+func replaceVirtualHostPort80(line string) string {
+	m := vhostOpenTagRe.FindStringSubmatch(line)
+	if m == nil {
+		return line
+	}
+	tokens := strings.Fields(m[2])
+	for idx, tok := range tokens {
+		tokens[idx] = swapAddrPort80(tok)
+	}
+	return m[1] + strings.Join(tokens, " ") + m[3]
+}
+
+// virtualHostHasPort80 判断 <VirtualHost ...> 开始标签的地址列表中是否存在端口恰为 80 的地址。
+// 复用 swapAddrPort80 的端口判定：仅端口恰为 80 的地址会被改写，故 swap 后有变化即含 80 端口。
+// 非 VirtualHost 开始行返回 false。
+func virtualHostHasPort80(line string) bool {
+	m := vhostOpenTagRe.FindStringSubmatch(line)
+	if m == nil {
+		return false
+	}
+	for _, tok := range strings.Fields(m[2]) {
+		if swapAddrPort80(tok) != tok {
+			return true
+		}
+	}
+	return false
+}
+
+// swapAddrPort80 若地址 token 的端口恰为 80 则替换为 443，否则原样返回。
+// 支持 *:80、1.2.3.4:80、[2001:db8::1]:80、example.com:80；*:8080、裸 IPv6 等不受影响。
+func swapAddrPort80(token string) string {
+	// IPv6 带方括号：端口在 "]:" 之后
+	if idx := strings.LastIndex(token, "]:"); idx >= 0 {
+		if token[idx+2:] == "80" {
+			return token[:idx+2] + "443"
+		}
+		return token
+	}
+	// 其余：仅单冒号才视为 host:port（裸 IPv6 多冒号无端口，不动）
+	if idx := strings.LastIndex(token, ":"); idx >= 0 && strings.Count(token, ":") == 1 {
+		if token[idx+1:] == "80" {
+			return token[:idx+1] + "443"
+		}
+	}
+	return token
+}
+
 // generateSSLVirtualHost 生成 SSL VirtualHost
 func (i *ApacheInstaller) generateSSLVirtualHost(vhost80 string) string {
-	// 替换端口
-	vhost443 := regexp.MustCompile(`(?i)(<VirtualHost\s+[^>]*):80([^>]*>)`).
-		ReplaceAllString(vhost80, "${1}:443${2}")
-
-	lines := strings.Split(vhost443, "\n")
+	lines := strings.Split(vhost80, "\n")
 	var result []string
 
 	vhostStartRe := regexp.MustCompile(`(?i)^\s*<VirtualHost`)
 	sslInserted := false
 
 	for _, line := range lines {
+		// 将 <VirtualHost> 开始标签中端口恰为 80 的地址改为 443（*:8080 等非 80 端口不受影响）
+		if vhostStartRe.MatchString(line) {
+			line = replaceVirtualHostPort80(line)
+		}
 		result = append(result, line)
 
 		// 在 VirtualHost 开始后插入 SSL 配置
@@ -313,7 +366,7 @@ func (i *ApacheInstaller) Rollback(backupPath string) error {
 
 // FindHTTPVirtualHost 查找 HTTP VirtualHost 的配置文件
 func FindHTTPVirtualHost(configPath, serverName string) (string, error) {
-	return findConfigWithServerName(configPath, serverName)
+	return findConfigWithServerName(configPath, matcher.StripPort(serverName))
 }
 
 // findConfigWithServerName 递归查找配置文件
@@ -332,10 +385,10 @@ func findConfigWithServerName(configPath, serverName string) (string, error) {
 	for scanner.Scan() {
 		line := scanner.Text()
 
-		// 检查 ServerName
+		// 检查 ServerName（剥离端口后比较）
 		if matches := serverNameRe.FindStringSubmatch(line); len(matches) > 1 {
 			name := strings.TrimSpace(matches[1])
-			name = strings.Trim(name, `"'`)
+			name = matcher.StripPort(strings.Trim(name, `"'`))
 			if name == serverName {
 				return configPath, nil
 			}

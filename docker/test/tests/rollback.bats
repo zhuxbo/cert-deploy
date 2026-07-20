@@ -22,10 +22,10 @@ setup_file() {
   fi
   echo "$cert_name" > /tmp/rollback-test-cert-name
   # 2. 第一次 deploy（创建初始状态）
-  sslctl deploy --cert "$cert_name" --yes 2>&1 || true
+  sslctl deploy --cert "$cert_name" --yes
   sleep 1
   # 3. 第二次 deploy（创建备份）
-  sslctl deploy --cert "$cert_name" --yes 2>&1 || true
+  sslctl deploy --cert "$cert_name" --yes
 }
 
 setup() {
@@ -73,4 +73,13 @@ setup() {
   # 验证 Web 服务器配置仍然有效
   run test_webserver_config
   assert_success
+}
+
+@test "rollback: 恢复后的证书私钥仍配对" {
+  run sslctl rollback --site test.example.com
+  assert_success
+  local cert_path key_path
+  cert_path=$(binding_value '.paths.certificate')
+  key_path=$(binding_value '.paths.private_key')
+  assert_cert_key_match "$cert_path" "$key_path"
 }

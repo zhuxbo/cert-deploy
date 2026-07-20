@@ -26,6 +26,7 @@ type Site struct {
 	ContainerName   string     // Docker 容器名
 	HostCertPath    string     // 宿主机证书路径
 	HostKeyPath     string     // 宿主机私钥路径
+	HostChainPath   string     // 宿主机证书链路径（Apache SSLCertificateChainFile 的挂载映射）
 	VolumeMode      bool       // 是否挂载卷模式
 }
 

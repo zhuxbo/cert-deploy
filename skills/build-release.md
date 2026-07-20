@@ -47,9 +47,9 @@ bash build/build.sh <x.y.z[-prerelease]> <output-dir>
 
 manifest 固定记录：schema、product、version、channel、source_commit、dirty、created_at、build_time、Go 版本、三项资产的 size/SHA256/Ed25519 签名。main 的 `dirty` 必须为 false；dev 必须如实记录 `source_commit` 和 `dirty`。构建前、快照捕获后和构建签名后都会比较 HEAD、分支及完整工作区指纹；发生变化即丢弃未发布 bundle。
 
-`build/release.conf` 必须配置仓库外的 `BUNDLE_ROOT`。main 的唯一路径固定为 `<BUNDLE_ROOT>/main/v<version>-<source_commit>`。main prepare 与 abort 全程先取得全部发布节点的同一组排他锁；每个节点的 `<SERVER_DIR>/.release-state/main/` 以 version + commit 为键，原子记录 `preparing` / `prepared` / `aborted`、尝试次数和完整 bundle 摘要，作为跨 clone、跨工作区的权威 reservation。本地忽略的 `.release-state/main/` 只是镜像审计，丢失不解除远端门禁。`prepared` 永不允许再次 prepare；改变 `BUNDLE_ROOT`、清理工作树或移走 bundle 也不能绕过。tag 前未完成尝试只能经 `abort-main` 在同一组锁内显式转为 `aborted` 后重试，审计状态不会删除；tag 创建后严禁 abort、移除或重建。`stage-main`、`promote-main`、`verify-main`、`resume-main` 只接受远端 state 摘要一致的现有 bundle，均先重新校验 manifest、manifest 签名、精确资产集合、大小、SHA256、资产签名和产物内置版本，不调用构建。
+main 正式发布必须在 `build/release.conf` 配置仓库外的 `BUNDLE_ROOT`；dev 测试版不要求。main 的唯一路径固定为 `<BUNDLE_ROOT>/main/v<version>-<source_commit>`。main prepare 与 abort 全程先取得全部发布节点的同一组排他锁；每个节点的 `<SERVER_DIR>/.release-state/main/` 以 version + commit 为键，原子记录 `preparing` / `prepared` / `aborted`、尝试次数和完整 bundle 摘要，作为跨 clone、跨工作区的权威 reservation。本地忽略的 `.release-state/main/` 只是镜像审计，丢失不解除远端门禁。`prepared` 永不允许再次 prepare；改变 `BUNDLE_ROOT`、清理工作树或移走 bundle 也不能绕过。tag 前未完成尝试只能经 `abort-main` 在同一组锁内显式转为 `aborted` 后重试，审计状态不会删除；tag 创建后严禁 abort、移除或重建。`stage-main`、`promote-main`、`verify-main`、`resume-main` 只接受远端 state 摘要一致的现有 bundle，均先重新校验 manifest、manifest 签名、精确资产集合、大小、SHA256、资产签名和产物内置版本，不调用构建。
 
-本仓生产拓扑至少配置两个发布节点；脚本不提供单节点发布选项。节点名称、主机、端口和绝对发布目录必须通过安全字符校验。发布阶段先在所有节点取得同一发布锁；推进前在锁内基于最新公开索引重新生成候选，所有候选字节一致后才允许推进，避免 main/dev 并发时整份索引丢失更新。
+本仓生产拓扑至少配置两个发布节点；脚本不提供单节点发布选项。节点名称、主机、端口和绝对发布目录必须通过安全字符校验。发布阶段先在所有节点取得同一发布锁；各节点基于自己的最新公开索引生成候选，以原样保留旧客户端仍读取的兼容顶层字段。推进前对候选的 main/dev 规范安全视图计算确定性摘要，版本、校验和、签名、source commit 等任一差异都停止；旧顶层字段和历史 `released_at` 展示日期不参与安全摘要。这样既避免 main/dev 并发导致整份索引丢失更新，也不会把单节点未知旧数据传播到其他节点。
 
 ## 本地检查
 

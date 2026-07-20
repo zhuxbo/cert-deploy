@@ -32,7 +32,15 @@ cp build/release.conf.example build/release.conf
 chmod 600 build/release.conf
 ```
 
-配置全部发布节点、SSH、Ed25519 seed、key ID、HTTPS 公网入口，以及仓库外的持久 `BUNDLE_ROOT`。main bundle 必须使用脚本给出的 `<BUNDLE_ROOT>/main/v<version>-<source_commit>` 固定路径。全部发布节点的 `<SERVER_DIR>/.release-state/main/` 是跨 clone 的权威 prepare reservation；本地忽略的 `.release-state/` 只做镜像审计。改变 `BUNDLE_ROOT`、清理工作树或移走 bundle 都不能绕过重复构建门禁。`release.conf` 与 `build/keys/` 已忽略，不得提交。
+配置全部发布节点、SSH、Ed25519 seed 和 key ID；`BUNDLE_ROOT` 仅在 main 正式发布时必需，dev 测试版和节点检查不要求。发布脚本按每个节点域名组合 `https://<SERVER_HOST>/sslctl` 做公网验收，不向安装脚本注入地址。main bundle 必须使用脚本给出的 `<BUNDLE_ROOT>/main/v<version>-<source_commit>` 固定路径。全部发布节点的 `<SERVER_DIR>/.release-state/main/` 是跨 clone 的权威 prepare reservation；本地忽略的 `.release-state/` 只做镜像审计。改变 `BUNDLE_ROOT`、清理工作树或移走 bundle 都不能绕过重复构建门禁。`release.conf` 与 `build/keys/` 已忽略，不得提交。
+
+dev 测试版使用简单入口，脚本按预发布版本自动选择 dev，并在内部依次完成 bundle 构建与全节点发布；`publish-dev` 已包含 SSH 和公网验收：
+
+```bash
+bash build/release.sh 0.4.1-beta.3
+```
+
+稳定版本会自动识别为 main，但不会由服务器阶段脚本直接发布；正式版仍按 `skills/remote-release.md` 完成 PR、CI/E2E、不可变 tag 和 GitHub Release 编排。分阶段命令保留用于正式发布及 dev 失败恢复。
 
 ## 安全演练
 

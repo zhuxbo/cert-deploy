@@ -83,6 +83,32 @@ if python3 "$HELPER" update-index --index "$TEST_DIR/main-index.json" --bundle "
     exit 1
 fi
 
+python3 - "$TEST_DIR/main-index.json" "$TEST_DIR/reconcile-cn.json" "$TEST_DIR/reconcile-us.json" <<'PY'
+import copy, json, sys
+source = json.load(open(sys.argv[1], encoding="utf-8"))
+json.dump(source, open(sys.argv[2], "w", encoding="utf-8"), indent=2, sort_keys=True)
+other = copy.deepcopy(source)
+other["latest_main"] = "v0.3.1"
+other["versions"] = {"v0.3.1": {"legacy": True}}
+other["main"]["versions"][0]["released_at"] = "2026-07-18"
+json.dump(other, open(sys.argv[3], "w", encoding="utf-8"), indent=2, sort_keys=True)
+PY
+cn_safety_digest="$(python3 "$HELPER" index-safety-digest --index "$TEST_DIR/reconcile-cn.json")"
+us_safety_digest="$(python3 "$HELPER" index-safety-digest --index "$TEST_DIR/reconcile-us.json")"
+[[ "$cn_safety_digest" == "$us_safety_digest" ]]
+python3 - "$TEST_DIR/reconcile-us.json" <<'PY'
+import json, sys
+path = sys.argv[1]
+value = json.load(open(path, encoding="utf-8"))
+value["main"]["versions"][0]["checksums"]["sslctl-linux-amd64.gz"] = "sha256:" + "0" * 64
+json.dump(value, open(path, "w", encoding="utf-8"), indent=2, sort_keys=True)
+PY
+tampered_safety_digest="$(python3 "$HELPER" index-safety-digest --index "$TEST_DIR/reconcile-us.json")"
+if [[ "$cn_safety_digest" == "$tampered_safety_digest" ]]; then
+    echo "索引安全摘要未识别安全字段漂移" >&2
+    exit 1
+fi
+
 cp "$TEST_DIR/main-index.json" "$TEST_DIR/resume-index.json"
 python3 "$HELPER" update-index --allow-existing-main --index "$TEST_DIR/resume-index.json" --bundle "$main_bundle" --version 1.2.3 --output "$TEST_DIR/resumed.json"
 cmp "$TEST_DIR/resume-index.json" "$TEST_DIR/resumed.json"
@@ -148,6 +174,17 @@ dry_output="$(bash "$SCRIPT_DIR/release.sh" --dry-run resume-main 1.2.3 --bundle
 grep -Fq '只读 bundle' <<<"$dry_output"
 grep -Fq '不执行任何动作' <<<"$dry_output"
 
+simple_dev_output="$(bash "$SCRIPT_DIR/release.sh" --dry-run 1.2.3-beta.3)"
+grep -Fq '自动识别通道: dev' <<<"$simple_dev_output"
+grep -Fq 'prepare -> publish-dev（内含全节点验收）' <<<"$simple_dev_output"
+set +e
+simple_main_output="$(bash "$SCRIPT_DIR/release.sh" --dry-run 1.2.3 2>&1)"
+simple_main_status=$?
+set -e
+[[ "$simple_main_status" -ne 0 ]]
+grep -Fq '自动识别通道: main' <<<"$simple_main_output"
+grep -Fq '正式发布流程' <<<"$simple_main_output"
+
 grep -Fq 'workspace_fingerprint' "$SCRIPT_DIR/release.sh"
 grep -Fq 'snapshot_worktree' "$SCRIPT_DIR/release.sh"
 grep -Fq 'SSLCTL_SOURCE_DIR' "$SCRIPT_DIR/build.sh"
@@ -161,5 +198,28 @@ grep -Fq 'manifest.sig' "$SCRIPT_DIR/release.sh"
 grep -Fq 'verify_bundle_versions' "$SCRIPT_DIR/release.sh"
 grep -Fq 'verify_remote_asset_set' "$SCRIPT_DIR/release.sh"
 grep -Fq 'GOTOOLCHAIN=' "$SCRIPT_DIR/build.sh"
+
+grep -Fq 'if ((${#LOCKED_SERVERS[@]})); then' "$SCRIPT_DIR/release.sh"
+grep -Fq 'index-safety-digest' "$SCRIPT_DIR/release.sh"
+
+if grep -Fq 'PUBLIC_RELEASE_URL' "$SCRIPT_DIR/release.sh" "$SCRIPT_DIR/release.conf.example"; then
+    echo "发布脚本仍要求重复配置 PUBLIC_RELEASE_URL" >&2
+    exit 1
+fi
+grep -Fq 'server_public_url' "$SCRIPT_DIR/release.sh"
+grep -Fq "printf 'https://%s/sslctl\\n' \"\$SERVER_HOST\"" "$SCRIPT_DIR/release.sh"
+grep -Fq 'verify_public_server "$server"' "$SCRIPT_DIR/release.sh"
+grep -Fq 'load_bundle_root()' "$SCRIPT_DIR/release.sh"
+grep -Fq 'prepare) if [[ "$CHANNEL" == "main" ]]; then load_config; load_bundle_root;' "$SCRIPT_DIR/release.sh"
+if grep -F 'publish-dev)' "$SCRIPT_DIR/release.sh" | grep -Fq 'load_bundle_root'; then
+    echo "测试版发布仍被正式版 BUNDLE_ROOT 配置阻塞" >&2
+    exit 1
+fi
+grep -Fq 'rsync_file "$PROJECT_ROOT/deploy/install.sh"' "$SCRIPT_DIR/release.sh"
+grep -Fq 'rsync_file "$PROJECT_ROOT/deploy/install.ps1"' "$SCRIPT_DIR/release.sh"
+if grep -Eq '__RELEASE_URL__|sed .*install\.(sh|ps1)' "$SCRIPT_DIR/release.sh"; then
+    echo "发布脚本仍向安装脚本注入发布地址" >&2
+    exit 1
+fi
 
 echo "发布离线回归测试通过"

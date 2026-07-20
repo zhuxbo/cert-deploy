@@ -21,7 +21,11 @@ die() { printf '[release] 错误: %s\n' "$*" >&2; exit 1; }
 
 usage() {
     cat <<'EOF'
+用法: build/release.sh <version>
 用法: build/release.sh [--dry-run] <mode> <version> [--bundle <absolute-path>]
+
+简单入口：预发布版本自动执行 prepare、publish-dev；publish-dev 内含全节点验收。
+稳定版本自动识别为 main，但必须按 skills/remote-release.md 完成正式发布流程。
 
 mode:
   prepare       构建、签名并持久化唯一 bundle
@@ -37,6 +41,40 @@ mode:
 真实发布必须遵循 skills/remote-release.md；--dry-run 不联网、不构建、不修改 Git。
 EOF
 }
+
+SIMPLE_VERSION=""
+SIMPLE_DRY_RUN=false
+if (($# == 1)) && [[ "$1" != -* ]]; then
+    SIMPLE_VERSION="${1#v}"
+elif (($# == 2)) && [[ "$1" == "--dry-run" && "$2" != -* ]]; then
+    SIMPLE_DRY_RUN=true
+    SIMPLE_VERSION="${2#v}"
+fi
+
+if [[ -n "$SIMPLE_VERSION" ]]; then
+    if SIMPLE_CHANNEL="$(python3 "$HELPER" channel "$SIMPLE_VERSION" 2>/dev/null)"; then
+        log "自动识别通道: $SIMPLE_CHANNEL (version=$SIMPLE_VERSION)"
+        if [[ "$SIMPLE_CHANNEL" == "main" ]]; then
+            die "稳定版本必须按 skills/remote-release.md 的正式发布流程执行，不能由服务器阶段脚本绕过 Git/PR/CI/tag/GitHub Release 门禁"
+        fi
+        if [[ "$SIMPLE_DRY_RUN" == true ]]; then
+            log "将自动执行 prepare -> publish-dev（内含全节点验收）；不执行任何动作"
+            exit 0
+        fi
+
+        SIMPLE_PARENT="$(mktemp -d "${TMPDIR:-/tmp}/sslctl-dev-v${SIMPLE_VERSION}.XXXXXX")"
+        SIMPLE_BUNDLE="$SIMPLE_PARENT/bundle"
+        log "dev bundle: $SIMPLE_BUNDLE"
+        if ! bash "$SCRIPT_DIR/release.sh" prepare "$SIMPLE_VERSION" --bundle "$SIMPLE_BUNDLE"; then
+            die "dev bundle 构建失败；诊断后重新执行简单入口"
+        fi
+        if ! bash "$SCRIPT_DIR/release.sh" publish-dev "$SIMPLE_VERSION" --bundle "$SIMPLE_BUNDLE"; then
+            die "dev 发布失败；bundle 已保留，可修复后用 publish-dev/verify-dev 续跑: $SIMPLE_BUNDLE"
+        fi
+        log "dev 发布完成: $SIMPLE_VERSION"
+        exit 0
+    fi
+fi
 
 while (($#)); do
     case "$1" in
@@ -77,7 +115,7 @@ if [[ "$DRY_RUN" == true ]]; then
         stage-main) log "将只读现有 bundle 并暂存全部节点，正式目录与索引保持不变；不执行任何动作" ;;
         promote-main|resume-main) log "将校验不可变 tag 与 manifest commit，只读 bundle 并从 staging 恢复；不执行任何动作" ;;
         abort-main) log "将只在 tag 和正式目录不存在时显式废弃未完成 release-state 与残留 bundle；不执行任何动作" ;;
-        verify-dev|verify-main) log "将验收全部节点和统一公网入口；不执行任何动作" ;;
+        verify-dev|verify-main) log "将验收全部节点及各节点公网域名；不执行任何动作" ;;
         check-nodes) log "将检查配置中的全部节点；不执行任何动作" ;;
     esac
     exit 0
@@ -92,12 +130,6 @@ load_config() {
     ((${#SERVERS[@]} >= 2)) || die "本仓发布要求至少两个节点，禁止退化为单节点"
     [[ -n "${SSH_USER:-}" && -n "${SSH_KEY:-}" ]] || die "SSH_USER/SSH_KEY 未配置"
     [[ "$SSH_USER" =~ ^[0-9A-Za-z._-]+$ ]] || die "SSH_USER 格式无效"
-    [[ -n "${PUBLIC_RELEASE_URL:-}" ]] || die "PUBLIC_RELEASE_URL 未配置"
-    [[ "$PUBLIC_RELEASE_URL" == https://* ]] || die "PUBLIC_RELEASE_URL 必须使用 HTTPS"
-    PUBLIC_RELEASE_URL="${PUBLIC_RELEASE_URL%/}"
-    [[ -n "${BUNDLE_ROOT:-}" && "$BUNDLE_ROOT" == /* && "$BUNDLE_ROOT" != "/" ]] || die "BUNDLE_ROOT 必须是非根绝对路径"
-    BUNDLE_ROOT="${BUNDLE_ROOT%/}"
-    [[ "$BUNDLE_ROOT" != "$PROJECT_ROOT" && "$BUNDLE_ROOT" != "$PROJECT_ROOT/"* ]] || die "BUNDLE_ROOT 必须位于仓库外"
     SSH_KEY="${SSH_KEY/#\~/${HOME}}"
     [[ -f "$SSH_KEY" ]] || die "SSH 密钥不存在: $SSH_KEY"
     if [[ -n "${SIGN_KEY:-}" && "$SIGN_KEY" != /* ]]; then SIGN_KEY="$PROJECT_ROOT/$SIGN_KEY"; fi
@@ -111,6 +143,12 @@ load_config() {
         [[ ",$names," != *",$name,"* ]] || die "服务器名称重复: $name"
         names="${names:+$names,}$name"
     done
+}
+
+load_bundle_root() {
+    [[ -n "${BUNDLE_ROOT:-}" && "$BUNDLE_ROOT" == /* && "$BUNDLE_ROOT" != "/" ]] || die "main 发布要求 BUNDLE_ROOT 为非根绝对路径"
+    BUNDLE_ROOT="${BUNDLE_ROOT%/}"
+    [[ "$BUNDLE_ROOT" != "$PROJECT_ROOT" && "$BUNDLE_ROOT" != "$PROJECT_ROOT/"* ]] || die "BUNDLE_ROOT 必须位于仓库外"
 }
 
 workspace_fingerprint() {
@@ -281,13 +319,15 @@ acquire_release_locks() {
 
 release_release_locks() {
     local server owner
-    for server in "${LOCKED_SERVERS[@]}"; do
-        parse_server "$server"
-        owner="$(ssh_run "$SERVER_HOST" "$SERVER_PORT" "cat '$SERVER_DIR/.release-lock/owner' 2>/dev/null" || true)"
-        if [[ "$owner" == "$RELEASE_LOCK_TOKEN" ]]; then
-            ssh_run "$SERVER_HOST" "$SERVER_PORT" "rm -f '$SERVER_DIR/.release-lock/owner' && rmdir '$SERVER_DIR/.release-lock'" || true
-        fi
-    done
+    if ((${#LOCKED_SERVERS[@]})); then
+        for server in "${LOCKED_SERVERS[@]}"; do
+            parse_server "$server"
+            owner="$(ssh_run "$SERVER_HOST" "$SERVER_PORT" "cat '$SERVER_DIR/.release-lock/owner' 2>/dev/null" || true)"
+            if [[ "$owner" == "$RELEASE_LOCK_TOKEN" ]]; then
+                ssh_run "$SERVER_HOST" "$SERVER_PORT" "rm -f '$SERVER_DIR/.release-lock/owner' && rmdir '$SERVER_DIR/.release-lock'" || true
+            fi
+        done
+    fi
     LOCKED_SERVERS=()
 }
 
@@ -303,6 +343,10 @@ with_release_locks() {
 parse_server() {
     IFS=',' read -r SERVER_NAME SERVER_HOST SERVER_PORT SERVER_DIR <<<"$1"
     SERVER_PORT="${SERVER_PORT:-22}"
+}
+
+server_public_url() {
+    printf 'https://%s/sslctl\n' "$SERVER_HOST"
 }
 
 ssh_run() {
@@ -372,12 +416,12 @@ prepare_bundle() {
         [[ "$(git -C "$PROJECT_ROOT" rev-parse refs/remotes/origin/main)" == "$source_commit" ]] || die "本地 main 必须与 origin/main 一致"
         ! git -C "$PROJECT_ROOT" show-ref --verify --quiet "refs/tags/v$VERSION" || die "本地 tag 已存在: v$VERSION"
         [[ -z "$(git -C "$PROJECT_ROOT" ls-remote --tags origin "refs/tags/v$VERSION")" ]] || die "远端 tag 已存在: v$VERSION"
-        preflight_index="$(mktemp "${TMPDIR:-/tmp}/sslctl-main-index.XXXXXX")"
-        curl --fail --silent --show-error --location "$PUBLIC_RELEASE_URL/releases.json" >"$preflight_index"
-        python3 "$HELPER" check-new-main --index "$preflight_index" --version "$VERSION"
-        rm -f "$preflight_index"
         for server in "${SERVERS[@]}"; do
             parse_server "$server"
+            preflight_index="$(mktemp "${TMPDIR:-/tmp}/sslctl-main-index.XXXXXX")"
+            curl --fail --silent --show-error --location "$(server_public_url)/releases.json" >"$preflight_index"
+            python3 "$HELPER" check-new-main --index "$preflight_index" --version "$VERSION"
+            rm -f "$preflight_index"
             ssh_run "$SERVER_HOST" "$SERVER_PORT" "test ! -e '$SERVER_DIR/main/v$VERSION'" || die "$SERVER_NAME 已存在正式版本 v$VERSION"
         done
         source_epoch="$(git -C "$PROJECT_ROOT" show -s --format=%ct "$source_commit")"
@@ -502,13 +546,13 @@ chmod 700 \"\$temp\"
             done
         fi
     fi
-    local -a allow_existing=()
-    [[ "$MODE" == "resume-main" ]] && allow_existing+=(--allow-existing-main)
+    local allow_existing=""
+    [[ "$MODE" == "resume-main" ]] && allow_existing="--allow-existing-main"
     ssh_run "$SERVER_HOST" "$SERVER_PORT" \
-        "python3 '$stage/release_helper.py' update-index --index '$SERVER_DIR/releases.json' --bundle '$stage' --version '$VERSION' --output '$stage/releases.json' ${allow_existing[*]}"
+        "python3 '$stage/release_helper.py' update-index --index '$SERVER_DIR/releases.json' --bundle '$stage' --version '$VERSION' --output '$stage/releases.json' $allow_existing"
     ssh_run "$SERVER_HOST" "$SERVER_PORT" \
         "python3 '$stage/release_helper.py' verify-index --index '$stage/releases.json' --bundle '$stage' --version '$VERSION'"
-    STAGED_INDEX_SHA="$(ssh_run "$SERVER_HOST" "$SERVER_PORT" "sha256sum '$stage/releases.json' | cut -d' ' -f1")"
+    STAGED_INDEX_SHA="$(ssh_run "$SERVER_HOST" "$SERVER_PORT" "python3 '$stage/release_helper.py' index-safety-digest --index '$stage/releases.json'")"
 }
 
 stage_all() {
@@ -521,6 +565,7 @@ stage_all() {
         complete_remote_release_state "$commit" "$digest"
         verify_release_state "$commit"
     fi
+
     for server in "${SERVERS[@]}"; do
         stage_server "$server"
         if [[ -z "$candidate_sha" ]]; then candidate_sha="$STAGED_INDEX_SHA"; fi
@@ -585,27 +630,29 @@ verify_server() {
     log "节点验收通过: $SERVER_NAME"
 }
 
-verify_public() {
-    local temp_index temp_asset expected actual
+verify_public_server() {
+    local server="$1" public_url temp_index temp_asset expected actual
+    parse_server "$server"
+    public_url="$(server_public_url)"
     temp_index="$(mktemp "${TMPDIR:-/tmp}/sslctl-public.XXXXXX")"
     temp_asset="$(mktemp "${TMPDIR:-/tmp}/sslctl-public-asset.XXXXXX")"
     trap 'rm -f "$temp_index" "$temp_asset"' RETURN
-    curl --fail --silent --show-error --location "$PUBLIC_RELEASE_URL/releases.json" >"$temp_index"
+    curl --fail --silent --show-error --location "$public_url/releases.json" >"$temp_index"
     python3 "$HELPER" verify-index --index "$temp_index" --bundle "$BUNDLE" --version "$VERSION"
     curl --fail --silent --show-error --location \
-        "$PUBLIC_RELEASE_URL/$CHANNEL/v$VERSION/sslctl-linux-amd64.gz" >"$temp_asset"
+        "$public_url/$CHANNEL/v$VERSION/sslctl-linux-amd64.gz" >"$temp_asset"
     expected="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["assets"]["sslctl-linux-amd64.gz"]["sha256"].removeprefix("sha256:"))' "$BUNDLE/manifest.json")"
     actual="$(shasum -a 256 "$temp_asset" | awk '{print $1}')"
-    [[ "$actual" == "$expected" ]] || die "统一公网入口代表资产 SHA256 不一致"
+    [[ "$actual" == "$expected" ]] || die "$SERVER_NAME 公网代表资产 SHA256 不一致"
     rm -f "$temp_index" "$temp_asset"
     trap - RETURN
-    log "统一公网入口索引验收通过"
+    log "节点公网验收通过: $SERVER_NAME ($public_url)"
 }
 
 verify_all() {
     verify_local_bundle
     for server in "${SERVERS[@]}"; do verify_server "$server"; done
-    verify_public
+    for server in "${SERVERS[@]}"; do verify_public_server "$server"; done
 }
 
 cleanup_server() {
@@ -657,13 +704,13 @@ check_nodes() {
 }
 
 case "$MODE" in
-    prepare) if [[ "$CHANNEL" == "main" ]]; then load_config; with_release_locks prepare_bundle; else prepare_bundle; fi ;;
-    abort-main) load_config; with_release_locks abort_main_bundle ;;
+    prepare) if [[ "$CHANNEL" == "main" ]]; then load_config; load_bundle_root; with_release_locks prepare_bundle; else prepare_bundle; fi ;;
+    abort-main) load_config; load_bundle_root; with_release_locks abort_main_bundle ;;
     check-nodes) check_nodes ;;
     publish-dev) load_config; with_release_locks stage_all_and_promote ;;
     verify-dev) load_config; verify_all ;;
-    stage-main) load_config; validate_bundle_location "$(manifest_value source_commit)"; with_release_locks stage_all ;;
-    promote-main) load_config; validate_bundle_location "$(manifest_value source_commit)"; verify_local_bundle; require_main_tag; with_release_locks stage_all_and_promote ;;
-    verify-main) load_config; validate_bundle_location "$(manifest_value source_commit)"; verify_release_state "$(manifest_value source_commit)"; verify_all ;;
-    resume-main) load_config; validate_bundle_location "$(manifest_value source_commit)"; verify_local_bundle; require_main_tag; with_release_locks stage_all_and_promote ;;
+    stage-main) load_config; load_bundle_root; validate_bundle_location "$(manifest_value source_commit)"; with_release_locks stage_all ;;
+    promote-main) load_config; load_bundle_root; validate_bundle_location "$(manifest_value source_commit)"; verify_local_bundle; require_main_tag; with_release_locks stage_all_and_promote ;;
+    verify-main) load_config; load_bundle_root; validate_bundle_location "$(manifest_value source_commit)"; verify_release_state "$(manifest_value source_commit)"; verify_all ;;
+    resume-main) load_config; load_bundle_root; validate_bundle_location "$(manifest_value source_commit)"; verify_local_bundle; require_main_tag; with_release_locks stage_all_and_promote ;;
 esac

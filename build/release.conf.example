@@ -26,16 +26,14 @@ SSH_USER="release"
 SSH_KEY="~/.ssh/release"
 
 # ========================================
-# 签名与公网入口（必需）
+# 签名配置（必需）
 # ========================================
 # Ed25519 base64 seed 文件，权限必须为 600
 SIGN_KEY="build/keys/release-key.pem"
 SIGN_KEY_ID="key-1"
 
-# 统一公网入口，必须为 HTTPS；末尾不带 /releases.json
-PUBLIC_RELEASE_URL="https://release.example.com/sslctl"
-
-# 仓库外的持久 bundle 根目录。main bundle 路径由脚本固定为：
+# 正式版配置：仓库外的持久 bundle 根目录。dev 测试版不要求此项。
+# main bundle 路径由脚本固定为：
 # $BUNDLE_ROOT/main/v<version>-<source_commit>
 BUNDLE_ROOT="/srv/sslctl-release-bundles"
 

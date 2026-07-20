@@ -12,13 +12,15 @@
 
 dev 允许当前分支和脏工作区快照，禁止提交、推送、合并、切分支、tag、PR 或 GitHub Release。
 
+日常发布直接执行 `bash build/release.sh <version>`。脚本根据预发布 SemVer 自动选择 dev，创建新的临时 bundle，并依次执行 `prepare`、`publish-dev`；`publish-dev` 内部完成全节点 SSH 与公网验收。任一步失败都会输出并保留 bundle 路径。以下分阶段命令用于审计和失败恢复：
+
 1. 记录执行前分支、HEAD 和工作区状态。
 2. `bash build/release.sh prepare <version> --bundle <持久路径>`；manifest 必须为 `channel=dev`，并如实记录 `source_commit`、`dirty`。
 3. `bash build/release.sh publish-dev <version> --bundle <同一路径>`：把同一 bundle 暂存到所有配置节点，逐节点核对三项资产的 SHA256 后，再更新各节点 dev 目录和原子替换索引。
-4. `bash build/release.sh verify-dev <version> --bundle <同一路径>`：核对全部节点及统一公网入口的版本、资产数、SHA256、签名、`source_commit`、`dirty`。
+4. 需要在失败恢复后单独复验时，运行 `bash build/release.sh verify-dev <version> --bundle <同一路径>`：通过全部节点的 SSH 目录及各自公网域名核对版本、资产数、SHA256、签名、`source_commit`、`dirty`。
 5. 再次确认分支、HEAD 和工作区状态未被发布脚本改变；全部通过才可报告成功。
 
-同版本可重复发布并覆盖 dev 条目；每次必须使用新 bundle 刷新 `released_at`、checksums、signatures 和 latest。任一步失败保留 bundle，修复后重跑 `publish-dev` 与全节点验收。
+同版本可重复发布并覆盖 dev 条目；简单入口每次创建新 bundle，刷新 `released_at`、checksums、signatures 和 latest。任一步失败保留 bundle，修复后重跑 `publish-dev` 与全节点验收。
 
 ## main 正式版
 
@@ -81,6 +83,6 @@ git push origin dev
 
 ## 正式完成验收
 
-逐项记录证据：三个阶段的 required checks 与 E2E 均绑定精确 commit；本地/远端 main、dev、版本 tag、latest 和 GitHub target 同 commit；工作区干净；全部节点与统一公网入口 `main.latest` 正确；三项资产在节点和 GitHub 字节一致且与索引/manifest 匹配；Release 公开、非 draft、非 prerelease、为 latest；三个产物的 `--version` 与 Ed25519 验证通过；至少从公网入口下载一个代表资产并校验 SHA256。
+逐项记录证据：三个阶段的 required checks 与 E2E 均绑定精确 commit；本地/远端 main、dev、版本 tag、latest 和 GitHub target 同 commit；工作区干净；全部节点经各自公网域名读取的 `main.latest` 正确；三项资产在节点和 GitHub 字节一致且与索引/manifest 匹配；Release 公开、非 draft、非 prerelease、为 latest；三个产物的 `--version` 与 Ed25519 验证通过；至少从每个发布节点的公网域名下载一个代表资产并校验 SHA256。
 
 真实发布涉及外部写入，必须在用户明确授权后执行。本仓日常 finish-check 和本次规范治理只允许 `--dry-run`、临时目录或 mock。

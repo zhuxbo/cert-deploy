@@ -209,6 +209,44 @@ def update_index(args: argparse.Namespace) -> None:
     write_json(Path(args.output), index)
 
 
+def canonical_index(index: dict, source: str) -> dict:
+    canonical: dict[str, dict] = {}
+    for channel in ("main", "dev"):
+        info = index.get(channel, {"latest": "", "versions": []})
+        if not isinstance(info, dict) or not isinstance(info.get("latest"), str) or not isinstance(info.get("versions"), list):
+            fail(f"索引通道结构无效: {source}:{channel}")
+        versions = info["versions"]
+        if any(not isinstance(item, dict) or not isinstance(item.get("version"), str) for item in versions):
+            fail(f"索引版本条目无效: {source}:{channel}")
+        version_names = [item["version"] for item in versions]
+        if len(version_names) != len(set(version_names)):
+            fail(f"索引版本重复: {source}:{channel}")
+        if info["latest"] and info["latest"] not in version_names:
+            fail(f"索引 latest 不在版本列表中: {source}:{channel}")
+        canonical[channel] = {"latest": info["latest"], "versions": versions}
+    return canonical
+
+
+def index_safety_view(index: dict) -> dict:
+    return {
+        channel: {
+            "latest": info["latest"],
+            "versions": [
+                {key: value for key, value in item.items() if key != "released_at"}
+                for item in info["versions"]
+            ],
+        }
+        for channel, info in index.items()
+    }
+
+
+def index_safety_digest(args: argparse.Namespace) -> None:
+    path = Path(args.index)
+    canonical = canonical_index(load_json(path), str(path))
+    encoded = json.dumps(index_safety_view(canonical), ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode()
+    print(hashlib.sha256(encoded).hexdigest())
+
+
 def verify_index(args: argparse.Namespace) -> None:
     bundle = Path(args.bundle)
     manifest = load_json(bundle / "manifest.json")
@@ -372,6 +410,9 @@ def main() -> None:
     update_parser.add_argument("--output", required=True)
     update_parser.add_argument("--allow-existing-main", action="store_true")
 
+    digest_parser = sub.add_parser("index-safety-digest")
+    digest_parser.add_argument("--index", required=True)
+
     index_parser = sub.add_parser("verify-index")
     index_parser.add_argument("--index", required=True)
     index_parser.add_argument("--bundle", required=True)
@@ -399,6 +440,8 @@ def main() -> None:
         verify_manifest(args)
     elif args.command == "update-index":
         update_index(args)
+    elif args.command == "index-safety-digest":
+        index_safety_digest(args)
     elif args.command == "verify-index":
         verify_index(args)
     elif args.command == "check-new-main":

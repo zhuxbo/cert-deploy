@@ -56,7 +56,7 @@ func Run(args []string, debug bool) {
 	webroot := fs.String("webroot", "", "文件验证的 Web 根目录（隐含 --file-validation）")
 	yes := fs.Bool("yes", false, "跳过确认提示")
 	noService := fs.Bool("no-service", false, "不安装守护服务")
-	nginxPrefix := fs.String("nginx-prefix", "", "显式指定 nginx 相对路径解析基准（仅本次生效，不写入配置）")
+	nginxPrefix := fs.String("nginx-prefix", "", "显式指定 nginx 普通相对路径的 prefix（不影响证书路径，仅本次生效）")
 	apachePrefix := fs.String("apache-prefix", "", "显式指定 Apache ServerRoot 解析基准（仅本次生效，不写入配置）")
 
 	fs.Usage = func() {

@@ -5,7 +5,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -17,7 +16,6 @@ import (
 	"time"
 
 	"github.com/zhuxbo/sslctl/internal/executor"
-	sslerrors "github.com/zhuxbo/sslctl/pkg/errors"
 	"github.com/zhuxbo/sslctl/pkg/matcher"
 	"github.com/zhuxbo/sslctl/pkg/util"
 )
@@ -35,10 +33,10 @@ type SSLSite struct {
 
 // HTTPSite 扫描到的 HTTP 站点信息（未启用 SSL）
 type HTTPSite struct {
-	ConfigFile  string // 配置文件路径
-	ServerName  string // 服务器名称（域名）
-	ListenPort  string // 监听端口
-	Webroot     string // Web 根目录 (root)
+	ConfigFile string // 配置文件路径
+	ServerName string // 服务器名称（域名）
+	ListenPort string // 监听端口
+	Webroot    string // Web 根目录 (root)
 }
 
 // Site 通用站点信息（合并 SSL 和非 SSL）
@@ -61,10 +59,10 @@ const maxScanFiles = 1000
 
 // Scanner Nginx 配置扫描器
 type Scanner struct {
-	mainConfigPath string            // 主配置文件路径
-	configRoot     string            // 配置根目录
-	scannedFiles   map[string]bool   // 已扫描的文件（避免循环）
-	debug          bool              // 调试模式
+	mainConfigPath string                       // 主配置文件路径
+	configRoot     string                       // 配置根目录
+	scannedFiles   map[string]bool              // 已扫描的文件（避免循环）
+	debug          bool                         // 调试模式
 	debugLog       func(string, ...interface{}) // 调试日志函数
 }
 
@@ -91,9 +89,16 @@ func (s *Scanner) logDebug(format string, args ...interface{}) {
 func NewWithConfig(configPath string) *Scanner {
 	return &Scanner{
 		mainConfigPath: configPath,
-		configRoot:     filepath.Dir(configPath),
+		configRoot:     mainConfigRoot(configPath),
 		scannedFiles:   make(map[string]bool),
 	}
+}
+
+func mainConfigRoot(configPath string) string {
+	if absolute, err := filepath.Abs(configPath); err == nil {
+		return filepath.Dir(absolute)
+	}
+	return filepath.Dir(configPath)
 }
 
 // DetectNginx 检测 Nginx 是否安装并获取配置路径
@@ -135,16 +140,30 @@ func getNginxConfigFromTest() (string, error) {
 	}
 
 	// nginx -t 输出: nginx: the configuration file /etc/nginx/nginx.conf syntax is ok
-	re := regexp.MustCompile(`configuration file (.+?) `)
-	matches := re.FindSubmatch(output)
-	if len(matches) > 1 {
-		configPath := string(matches[1])
+	if configPath := parseMainConfigPath(output); configPath != "" {
 		if _, err := os.Stat(configPath); err == nil {
 			return configPath, nil
 		}
 	}
 
 	return "", fmt.Errorf("无法从 nginx -t 获取配置路径")
+}
+
+// parseMainConfigPath 从 nginx -t/-T 输出中提取实际使用的主配置文件。
+// ssl_certificate、ssl_certificate_key 和 include 的相对路径均以该文件所在目录为基准。
+func parseMainConfigPath(output []byte) string {
+	re := regexp.MustCompile(`(?m)configuration file (.+?) (?:syntax is ok|test is successful|test failed)`)
+	if matches := re.FindSubmatch(output); len(matches) > 1 {
+		return strings.TrimSpace(string(matches[1]))
+	}
+
+	// nginx -T 还会用此格式标记每个配置文件；首个标记是主配置文件。
+	re = regexp.MustCompile(`(?m)^# configuration file (.+):\r?$`)
+	if matches := re.FindSubmatch(output); len(matches) > 1 {
+		return strings.TrimSpace(string(matches[1]))
+	}
+
+	return ""
 }
 
 // getNginxConfigFromVersion 通过 nginx -V 获取配置路径
@@ -256,12 +275,35 @@ func (s *Scanner) Scan() ([]*SSLSite, error) {
 			return nil, err
 		}
 		s.mainConfigPath = configPath
-		s.configRoot = filepath.Dir(configPath)
+		s.configRoot = mainConfigRoot(configPath)
 	}
 
 	// 从主配置文件开始递归扫描
 	s.scannedFiles = make(map[string]bool)
-	return s.scanConfigFile(s.mainConfigPath, 0)
+	sites, err := s.scanConfigFile(s.mainConfigPath, 0)
+	if err != nil {
+		return nil, err
+	}
+	configRoot := s.configRoot
+	if configRoot == "" {
+		configRoot = mainConfigRoot(s.mainConfigPath)
+	}
+	for _, site := range sites {
+		site.CertificatePath = resolveNginxPath(configRoot, site.CertificatePath)
+		site.PrivateKeyPath = resolveNginxPath(configRoot, site.PrivateKeyPath)
+	}
+	for _, site := range sites {
+		if site.Webroot != "" && !filepath.IsAbs(site.Webroot) {
+			prefix, _, ok := getNginxPrefix(findNginxBinary())
+			if ok && prefix != "" {
+				for _, target := range sites {
+					target.Webroot = resolveNginxPath(prefix, target.Webroot)
+				}
+			}
+			break
+		}
+	}
+	return sites, nil
 }
 
 // ScanFile 扫描单个配置文件
@@ -330,7 +372,10 @@ func (s *Scanner) findIncludes(configPath string) ([]string, error) {
 		return nil, err
 	}
 
-	configDir := filepath.Dir(configPath)
+	configRoot := s.configRoot
+	if configRoot == "" {
+		configRoot = mainConfigRoot(configPath)
+	}
 	var includes []string
 
 	// 匹配 include 指令（支持行内注释之前的内容）
@@ -353,9 +398,10 @@ func (s *Scanner) findIncludes(configPath string) ([]string, error) {
 
 			originalPattern := pattern
 
-			// 处理相对路径（始终基于当前配置文件目录）
+			// Nginx 的 include 相对路径以主 nginx.conf 所在目录为基准，
+			// 而不是当前被 include 文件所在目录。
 			if !filepath.IsAbs(pattern) {
-				pattern = filepath.Join(configDir, pattern)
+				pattern = filepath.Join(configRoot, pattern)
 			}
 
 			// 展开 glob 模式
@@ -400,16 +446,16 @@ type rawBlock struct {
 
 // 编译一次正则表达式，避免每次解析重复编译
 var (
-	serverBlockRe  = regexp.MustCompile(`^\s*server\s*\{`)
-	serverOnlyRe   = regexp.MustCompile(`^\s*server\s*$`)
+	serverBlockRe   = regexp.MustCompile(`^\s*server\s*\{`)
+	serverOnlyRe    = regexp.MustCompile(`^\s*server\s*$`)
 	openBraceOnlyRe = regexp.MustCompile(`^\s*\{\s*$`)
-	serverNameRe   = regexp.MustCompile(`^\s*server_name\s+([^;]+);`)
-	listenRe       = regexp.MustCompile(`^\s*listen\s+([^;]+);`)
-	sslCertRe      = regexp.MustCompile(`^\s*ssl_certificate\s+([^;]+);`)
-	sslKeyRe       = regexp.MustCompile(`^\s*ssl_certificate_key\s+([^;]+);`)
-	rootRe         = regexp.MustCompile(`^\s*root\s+([^;]+);`)
-	locationRe     = regexp.MustCompile(`^\s*location\s+`)
-	configFileRe   = regexp.MustCompile(`# configuration file (.+):`)
+	serverNameRe    = regexp.MustCompile(`^\s*server_name\s+([^;]+);`)
+	listenRe        = regexp.MustCompile(`^\s*listen\s+([^;]+);`)
+	sslCertRe       = regexp.MustCompile(`^\s*ssl_certificate\s+([^;]+);`)
+	sslKeyRe        = regexp.MustCompile(`^\s*ssl_certificate_key\s+([^;]+);`)
+	rootRe          = regexp.MustCompile(`^\s*root\s+([^;]+);`)
+	locationRe      = regexp.MustCompile(`^\s*location\s+`)
+	configFileRe    = regexp.MustCompile(`# configuration file (.+):`)
 )
 
 // parseServerBlocks 统一的 server 块解析引擎
@@ -665,7 +711,7 @@ func (s *Scanner) ScanHTTPSites() ([]*HTTPSite, error) {
 			return nil, err
 		}
 		s.mainConfigPath = configPath
-		s.configRoot = filepath.Dir(configPath)
+		s.configRoot = mainConfigRoot(configPath)
 	}
 
 	// 重置已扫描文件记录
@@ -807,11 +853,6 @@ func (s *Scanner) ScanAll() ([]*Site, error) {
 			s.logDebug("使用 nginx -T 扫描成功，发现 %d 个站点", len(sites))
 			return sites, nil
 		}
-		// PrefixUnknownError 是硬错误，不回退到文件扫描（回退会丢失相对路径信息）
-		var prefixErr *sslerrors.PrefixUnknownError
-		if errors.As(err, &prefixErr) {
-			return nil, err
-		}
 		if err != nil {
 			s.logDebug("nginx -T 扫描失败: %v，回退到文件扫描", err)
 		}
@@ -824,7 +865,7 @@ func (s *Scanner) ScanAll() ([]*Site, error) {
 			return nil, err
 		}
 		s.mainConfigPath = configPath
-		s.configRoot = filepath.Dir(configPath)
+		s.configRoot = mainConfigRoot(configPath)
 	}
 
 	// 重置已扫描文件记录
@@ -835,44 +876,35 @@ func (s *Scanner) ScanAll() ([]*Site, error) {
 	if err != nil {
 		return nil, err
 	}
-	return resolveSitePaths(allSites)
+	return s.resolveSitePaths(allSites)
 }
 
-// resolveSitePaths 将站点中相对的证书/私钥路径解析为绝对路径
-// prefix 未知且存在相对路径时返回 *sslerrors.PrefixUnknownError
-func resolveSitePaths(sites []*Site) ([]*Site, error) {
-	var affected []sslerrors.AffectedSite
+// resolveSitePaths 按 Nginx 的两类路径基准解析站点路径：
+// 证书和私钥相对于主 nginx.conf 所在目录，root 相对于 nginx prefix。
+func (s *Scanner) resolveSitePaths(sites []*Site) ([]*Site, error) {
+	configRoot := s.configRoot
+	if configRoot == "" && s.mainConfigPath != "" {
+		configRoot = mainConfigRoot(s.mainConfigPath)
+	}
 	for _, site := range sites {
-		if hasRelativeCertPath(site) {
-			affected = append(affected, sslerrors.AffectedSite{
-				ServerName:      site.ServerName,
-				ConfigFile:      site.ConfigFile,
-				CertificatePath: site.CertificatePath,
-				PrivateKeyPath:  site.PrivateKeyPath,
-			})
+		if hasRelativeCertPath(site) && configRoot == "" {
+			return nil, fmt.Errorf("无法确定 nginx 主配置文件目录，不能解析站点 %s 的相对证书路径", site.ServerName)
 		}
-	}
-	if len(affected) == 0 {
-		return sites, nil
-	}
-
-	nginxPath := findNginxBinary()
-	prefix, candidates, ok := getNginxPrefix(nginxPath)
-
-	if !ok {
-		return nil, &sslerrors.PrefixUnknownError{
-			ServerKind: sslerrors.ServerKindNginx,
-			BinaryPath: nginxPath,
-			Candidates: candidates,
-			Sites:      affected,
-		}
+		site.CertificatePath = resolveNginxPath(configRoot, site.CertificatePath)
+		site.PrivateKeyPath = resolveNginxPath(configRoot, site.PrivateKeyPath)
 	}
 
-	if prefix != "" {
-		for _, site := range sites {
-			site.CertificatePath = resolveNginxPath(prefix, site.CertificatePath)
-			site.PrivateKeyPath = resolveNginxPath(prefix, site.PrivateKeyPath)
-			site.Webroot = resolveNginxPath(prefix, site.Webroot)
+	// root 属于普通路径，仍使用 nginx prefix；探测失败时保持原值，
+	// 不影响已经能够准确解析的证书和私钥路径。
+	for _, site := range sites {
+		if site.Webroot != "" && !filepath.IsAbs(site.Webroot) {
+			prefix, _, ok := getNginxPrefix(findNginxBinary())
+			if ok && prefix != "" {
+				for _, target := range sites {
+					target.Webroot = resolveNginxPath(prefix, target.Webroot)
+				}
+			}
+			break
 		}
 	}
 	return sites, nil
@@ -1262,6 +1294,10 @@ func (s *Scanner) scanWithNginxT() ([]*Site, error) {
 			return nil, fmt.Errorf("nginx -T 执行失败: %w", err)
 		}
 	}
+	if configPath := parseMainConfigPath(output); configPath != "" {
+		s.mainConfigPath = configPath
+		s.configRoot = mainConfigRoot(configPath)
+	}
 
 	lines := strings.Split(string(output), "\n")
 	blocks := parseServerBlocks(lines, "", parseOptions{
@@ -1271,8 +1307,7 @@ func (s *Scanner) scanWithNginxT() ([]*Site, error) {
 
 	sites := rawBlocksToSites(blocks)
 
-	// 解析相对路径：配置中的相对路径需基于 prefix 目录转为绝对路径
-	return resolveSitePaths(sites)
+	return s.resolveSitePaths(sites)
 }
 
 // hasRelativeCertPath 判断站点的证书/私钥路径是否有相对路径

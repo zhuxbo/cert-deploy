@@ -67,11 +67,12 @@ type Site struct {
 
 // Scanner Apache 配置扫描器
 type Scanner struct {
-	mainConfigPath string            // 主配置文件路径
-	serverRoot     string            // ServerRoot 路径
-	scannedFiles   map[string]bool   // 已扫描的文件（避免循环）
-	debug          bool              // 调试模式
-	debugLog       func(string, ...interface{}) // 调试日志函数
+	mainConfigPath      string                       // 主配置文件路径
+	serverRoot          string                       // ServerRoot 路径
+	serverRootEffective bool                         // 是否来自配置解析或 apachectl 的最终有效值
+	scannedFiles        map[string]bool              // 已扫描的文件（避免循环）
+	debug               bool                         // 调试模式
+	debugLog            func(string, ...interface{}) // 调试日志函数
 }
 
 // New 创建扫描器（自动检测配置路径）
@@ -344,14 +345,24 @@ func (s *Scanner) Scan() ([]*SSLSite, error) {
 		s.mainConfigPath = configPath
 		s.serverRoot = serverRoot
 	}
+	s.prepareServerRoot(s.mainConfigPath)
 
 	// 从主配置文件开始递归扫描
-	return s.scanConfigFile(s.mainConfigPath)
+	sites, err := s.scanConfigFile(s.mainConfigPath)
+	if err != nil {
+		return nil, err
+	}
+	return s.resolveSSLSitePaths(sites)
 }
 
 // ScanFile 扫描单个配置文件
 func (s *Scanner) ScanFile(filePath string) ([]*SSLSite, error) {
-	return s.parseConfigFile(filePath)
+	s.prepareServerRoot(filePath)
+	sites, err := s.parseConfigFile(filePath)
+	if err != nil {
+		return nil, err
+	}
+	return s.resolveSSLSitePaths(sites)
 }
 
 // scanConfigFile 扫描配置文件（递归处理 Include）
@@ -643,12 +654,17 @@ func (s *Scanner) ScanHTTPSites() ([]*HTTPSite, error) {
 		s.mainConfigPath = configPath
 		s.serverRoot = serverRoot
 	}
+	s.prepareServerRoot(s.mainConfigPath)
 
 	// 重置已扫描文件记录
 	s.scannedFiles = make(map[string]bool)
 
 	// 从主配置文件开始递归扫描
-	return s.scanHTTPConfigFile(s.mainConfigPath)
+	sites, err := s.scanHTTPConfigFile(s.mainConfigPath)
+	if err != nil {
+		return nil, err
+	}
+	return s.resolveHTTPSitePaths(sites)
 }
 
 // scanHTTPConfigFile 扫描配置文件中的 HTTP 站点（递归处理 Include）
@@ -836,6 +852,9 @@ func (s *Scanner) HasSSLConfig(configPath string) bool {
 
 // ScanAll 扫描所有站点（包括 SSL 和非 SSL）
 func (s *Scanner) ScanAll() ([]*Site, error) {
+	if s.mainConfigPath != "" {
+		s.prepareServerRoot(s.mainConfigPath)
+	}
 	// 优先尝试使用 apachectl -S 获取虚拟主机列表（更可靠）
 	sites, err := s.scanWithApacheCtl()
 	if err == nil && len(sites) > 0 {
@@ -855,6 +874,7 @@ func (s *Scanner) ScanAll() ([]*Site, error) {
 		s.mainConfigPath = configPath
 		s.serverRoot = serverRoot
 	}
+	s.prepareServerRoot(s.mainConfigPath)
 
 	// 重置已扫描文件记录
 	s.scannedFiles = make(map[string]bool)
@@ -873,7 +893,7 @@ func (s *Scanner) resolveSitePaths(sites []*Site) ([]*Site, error) {
 	// 先收集使用相对路径的站点
 	var affected []sslerrors.AffectedSite
 	for _, site := range sites {
-		if hasRelativeCertPath(site) {
+		if hasRelativeSitePath(site) {
 			affected = append(affected, sslerrors.AffectedSite{
 				ServerName:      site.ServerName,
 				ConfigFile:      site.ConfigFile,
@@ -920,6 +940,50 @@ func (s *Scanner) resolveSitePaths(sites []*Site) ([]*Site, error) {
 	return sites, nil
 }
 
+func (s *Scanner) resolveSSLSitePaths(sites []*SSLSite) ([]*SSLSite, error) {
+	generic := make([]*Site, 0, len(sites))
+	for _, site := range sites {
+		generic = append(generic, &Site{
+			ConfigFile:      site.ConfigFile,
+			ServerName:      site.ServerName,
+			CertificatePath: site.CertificatePath,
+			PrivateKeyPath:  site.PrivateKeyPath,
+			ChainPath:       site.ChainPath,
+			Webroot:         site.Webroot,
+		})
+	}
+	resolved, err := s.resolveSitePaths(generic)
+	if err != nil {
+		return nil, err
+	}
+	for i, site := range resolved {
+		sites[i].CertificatePath = site.CertificatePath
+		sites[i].PrivateKeyPath = site.PrivateKeyPath
+		sites[i].ChainPath = site.ChainPath
+		sites[i].Webroot = site.Webroot
+	}
+	return sites, nil
+}
+
+func (s *Scanner) resolveHTTPSitePaths(sites []*HTTPSite) ([]*HTTPSite, error) {
+	generic := make([]*Site, 0, len(sites))
+	for _, site := range sites {
+		generic = append(generic, &Site{
+			ConfigFile: site.ConfigFile,
+			ServerName: site.ServerName,
+			Webroot:    site.Webroot,
+		})
+	}
+	resolved, err := s.resolveSitePaths(generic)
+	if err != nil {
+		return nil, err
+	}
+	for i, site := range resolved {
+		sites[i].Webroot = site.Webroot
+	}
+	return sites, nil
+}
+
 // findApacheBinary 查找 Apache 可执行文件路径
 func findApacheBinary() string {
 	// 方法1: 从运行中的进程获取准确路径（最可靠）
@@ -958,8 +1022,8 @@ func findApacheBinary() string {
 			"/usr/local/apache2/bin/httpd",
 			"/usr/local/apache2/bin/apachectl",
 			"/opt/apache/bin/httpd",
-			"/www/server/apache/bin/httpd",       // 宝塔面板
-			"/www/server/apache/bin/apachectl",   // 宝塔面板
+			"/www/server/apache/bin/httpd",     // 宝塔面板
+			"/www/server/apache/bin/apachectl", // 宝塔面板
 		}
 	}
 
@@ -1078,6 +1142,9 @@ func (s *Scanner) scanWithApacheCtl() ([]*Site, error) {
 
 	content := string(output)
 	s.logDebug("apachectl -S 输出:\n%s", content)
+	if root := parseServerRootFromApacheCtlOutput(content); root != "" {
+		s.setEffectiveServerRoot(root)
+	}
 
 	// 解析输出
 	// 格式示例:

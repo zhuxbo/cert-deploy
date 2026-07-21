@@ -112,3 +112,84 @@ func TestResolveHostPaths_NoChainFullMount(t *testing.T) {
 		t.Error("无证书链且证书/私钥挂载时 VolumeMode 应为 true")
 	}
 }
+
+func TestResolveHostPaths_RelativePathsUseServerRoot(t *testing.T) {
+	client := NewClient("apache123")
+	s := &Scanner{
+		client:       client,
+		scannedFiles: make(map[string]bool),
+		serverRoot:   "/usr/local/apache2",
+		mounts: []MountInfo{
+			{Type: "bind", Source: "/host/apache", Destination: "/usr/local/apache2", RW: true},
+		},
+	}
+
+	site := &SSLSite{
+		CertificatePath: "ssl/cert.pem",
+		PrivateKeyPath:  "ssl/key.pem",
+		ChainPath:       "ssl/chain.pem",
+		Webroot:         "htdocs",
+	}
+
+	s.resolveHostPaths(site)
+
+	if site.CertificatePath != "/usr/local/apache2/ssl/cert.pem" {
+		t.Errorf("CertificatePath = %q", site.CertificatePath)
+	}
+	if site.PrivateKeyPath != "/usr/local/apache2/ssl/key.pem" {
+		t.Errorf("PrivateKeyPath = %q", site.PrivateKeyPath)
+	}
+	if site.ChainPath != "/usr/local/apache2/ssl/chain.pem" {
+		t.Errorf("ChainPath = %q", site.ChainPath)
+	}
+	if site.Webroot != "/usr/local/apache2/htdocs" {
+		t.Errorf("Webroot = %q", site.Webroot)
+	}
+	if site.HostCertPath != "/host/apache/ssl/cert.pem" ||
+		site.HostKeyPath != "/host/apache/ssl/key.pem" ||
+		site.HostChainPath != "/host/apache/ssl/chain.pem" ||
+		site.HostWebroot != "/host/apache/htdocs" {
+		t.Errorf("宿主机路径解析错误: cert=%q key=%q chain=%q webroot=%q",
+			site.HostCertPath, site.HostKeyPath, site.HostChainPath, site.HostWebroot)
+	}
+	if !site.VolumeMode {
+		t.Error("相对证书路径正确映射挂载后应为卷模式")
+	}
+}
+
+func TestServerRootFromContainerConfig(t *testing.T) {
+	got, ok := serverRootFromConfigContent("ServerRoot \"/custom/apache\"\n", "/compiled/root")
+	if !ok || got != "/custom/apache" {
+		t.Fatalf("serverRootFromConfigContent() = %q, %v", got, ok)
+	}
+}
+
+func TestParseConfig_RelativePathsUseConfiguredServerRoot(t *testing.T) {
+	client := NewClient("apache123")
+	s := &Scanner{
+		client:       client,
+		scannedFiles: make(map[string]bool),
+		serverRoot:   "/compiled/root",
+		mounts: []MountInfo{
+			{Type: "bind", Source: "/host/apache", Destination: "/custom/apache", RW: true},
+		},
+	}
+	content := `ServerRoot "/custom/apache"
+<VirtualHost *:443>
+    ServerName example.com
+    SSLCertificateFile ssl/cert.pem
+    SSLCertificateKeyFile ssl/key.pem
+</VirtualHost>`
+	if root, ok := serverRootFromConfigContent(content, s.serverRoot); ok {
+		s.serverRoot = root
+	}
+
+	sites := s.parseConfig(content, "/custom/apache/conf/httpd.conf", &ContainerInfo{ID: "id", Name: "apache"})
+	if len(sites) != 1 {
+		t.Fatalf("站点数 = %d", len(sites))
+	}
+	if sites[0].CertificatePath != "/custom/apache/ssl/cert.pem" ||
+		sites[0].HostCertPath != "/host/apache/ssl/cert.pem" || !sites[0].VolumeMode {
+		t.Fatalf("相对路径或挂载映射错误: %+v", sites[0])
+	}
+}

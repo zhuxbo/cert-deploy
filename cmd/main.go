@@ -187,7 +187,7 @@ func runWindowsService() {
 func runScan(args []string, debug bool) {
 	fs := flag.NewFlagSet("scan", flag.ExitOnError)
 	sslOnly := fs.Bool("ssl-only", false, "仅扫描 SSL 站点")
-	nginxPrefix := fs.String("nginx-prefix", "", "显式指定 nginx 相对路径解析基准（仅本次生效，不写入配置）")
+	nginxPrefix := fs.String("nginx-prefix", "", "显式指定 nginx 普通相对路径的 prefix（不影响证书路径，仅本次生效）")
 	apachePrefix := fs.String("apache-prefix", "", "显式指定 Apache ServerRoot 解析基准（仅本次生效，不写入配置）")
 
 	fs.Usage = func() {

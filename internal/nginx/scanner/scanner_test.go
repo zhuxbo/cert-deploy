@@ -677,6 +677,72 @@ func TestResolveNginxPath(t *testing.T) {
 	}
 }
 
+func TestResolveSitePaths_RelativeCertificatesUseMainConfigDirectory(t *testing.T) {
+	configRoot := filepath.Join(t.TempDir(), "conf")
+	s := NewWithConfig(filepath.Join(configRoot, "nginx.conf"))
+	sites := []*Site{
+		{
+			ServerName:      "example.com",
+			ConfigFile:      filepath.Join(configRoot, "sites", "example.conf"),
+			CertificatePath: filepath.Join("ssl", "cert.pem"),
+			PrivateKeyPath:  filepath.Join("ssl", "key.pem"),
+		},
+	}
+
+	got, err := s.resolveSitePaths(sites)
+	if err != nil {
+		t.Fatalf("resolveSitePaths() 错误: %v", err)
+	}
+	if got[0].CertificatePath != filepath.Join(configRoot, "ssl", "cert.pem") {
+		t.Errorf("CertificatePath = %q", got[0].CertificatePath)
+	}
+	if got[0].PrivateKeyPath != filepath.Join(configRoot, "ssl", "key.pem") {
+		t.Errorf("PrivateKeyPath = %q", got[0].PrivateKeyPath)
+	}
+}
+
+func TestMainConfigRoot_RelativeConfigBecomesAbsolute(t *testing.T) {
+	root := mainConfigRoot(filepath.Join("conf", "nginx.conf"))
+	if !filepath.IsAbs(root) {
+		t.Fatalf("mainConfigRoot() = %q，不是绝对路径", root)
+	}
+	if filepath.Base(root) != "conf" {
+		t.Fatalf("mainConfigRoot() = %q，期望以 conf 结尾", root)
+	}
+}
+
+func TestParseMainConfigPath(t *testing.T) {
+	tests := []struct {
+		name   string
+		output string
+		want   string
+	}{
+		{
+			name:   "nginx test 输出",
+			output: "nginx: the configuration file /opt/nginx/conf/nginx.conf syntax is ok\n",
+			want:   "/opt/nginx/conf/nginx.conf",
+		},
+		{
+			name:   "nginx T 配置标记",
+			output: "# configuration file /custom/nginx.conf:\nuser nginx;\n",
+			want:   "/custom/nginx.conf",
+		},
+		{
+			name:   "配置测试失败仍识别主配置",
+			output: "nginx: configuration file /custom/nginx.conf test failed\n",
+			want:   "/custom/nginx.conf",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := parseMainConfigPath([]byte(tt.output)); got != tt.want {
+				t.Errorf("parseMainConfigPath() = %q，期望 %q", got, tt.want)
+			}
+		})
+	}
+}
+
 // TestGetNginxConfigFromTestRegex 测试 getNginxConfigFromTest 中使用的正则匹配逻辑
 func TestGetNginxConfigFromTestRegex(t *testing.T) {
 	re := regexp.MustCompile(`configuration file (.+?) `)
@@ -1588,6 +1654,37 @@ func TestFindIncludes_RelativePath(t *testing.T) {
 	}
 }
 
+func TestFindIncludes_NestedFileUsesMainConfigDirectory(t *testing.T) {
+	configRoot := t.TempDir()
+	sitesDir := filepath.Join(configRoot, "sites")
+	snippetsDir := filepath.Join(configRoot, "snippets")
+	if err := os.MkdirAll(sitesDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(snippetsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	mainFile := filepath.Join(configRoot, "nginx.conf")
+	nestedFile := filepath.Join(sitesDir, "site.conf")
+	want := filepath.Join(snippetsDir, "tls.conf")
+	if err := os.WriteFile(nestedFile, []byte("include snippets/tls.conf;"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(want, []byte("# tls"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	s := NewWithConfig(mainFile)
+	includes, err := s.findIncludes(nestedFile)
+	if err != nil {
+		t.Fatalf("findIncludes 错误: %v", err)
+	}
+	if len(includes) != 1 || includes[0] != want {
+		t.Fatalf("includes = %v，期望 [%s]", includes, want)
+	}
+}
+
 // TestScanAll_WithInclude 测试 ScanAll 含 include 的递归扫描
 func TestScanAll_WithInclude(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "nginx-test-*")
@@ -1626,6 +1723,45 @@ include ` + confDir + `/*.conf;`
 
 	if len(sites) != 2 {
 		t.Errorf("期望 2 个站点，实际 %d", len(sites))
+	}
+}
+
+func TestScanAll_RelativeCertificatesInIncludedFileUseMainConfigDirectory(t *testing.T) {
+	configRoot := t.TempDir()
+	sitesDir := filepath.Join(configRoot, "sites")
+	if err := os.MkdirAll(sitesDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	includeContent := `
+server {
+    listen 443 ssl;
+    server_name relative.example.com;
+    ssl_certificate ssl/cert.pem;
+    ssl_certificate_key ssl/key.pem;
+}`
+	includeFile := filepath.Join(sitesDir, "relative.conf")
+	if err := os.WriteFile(includeFile, []byte(includeContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	mainFile := filepath.Join(configRoot, "nginx.conf")
+	if err := os.WriteFile(mainFile, []byte("include sites/relative.conf;"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	sites, err := NewWithConfig(mainFile).ScanAll()
+	if err != nil {
+		t.Fatalf("ScanAll 失败: %v", err)
+	}
+	if len(sites) != 1 {
+		t.Fatalf("期望 1 个站点，实际 %d", len(sites))
+	}
+	if sites[0].CertificatePath != filepath.Join(configRoot, "ssl", "cert.pem") {
+		t.Errorf("CertificatePath = %q", sites[0].CertificatePath)
+	}
+	if sites[0].PrivateKeyPath != filepath.Join(configRoot, "ssl", "key.pem") {
+		t.Errorf("PrivateKeyPath = %q", sites[0].PrivateKeyPath)
 	}
 }
 

@@ -2,6 +2,7 @@
 package setup
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -211,12 +212,12 @@ func TestCreateBinding_Apache(t *testing.T) {
 	cfgManager, _ := config.NewConfigManagerWithDir(tmpDir)
 
 	site := &matcher.ScannedSiteInfo{
-		ServerName:  "example.com",
-		ConfigFile:  "/etc/apache2/sites-available/example.conf",
-		HasSSL:      true,
-		CertPath:    "/etc/ssl/certs/example.pem",
-		KeyPath:     "/etc/ssl/private/example.key",
-		ServerType:  config.ServerTypeApache,
+		ServerName: "example.com",
+		ConfigFile: "/etc/apache2/sites-available/example.conf",
+		HasSSL:     true,
+		CertPath:   "/etc/ssl/certs/example.pem",
+		KeyPath:    "/etc/ssl/private/example.key",
+		ServerType: config.ServerTypeApache,
 	}
 
 	binding := createBinding(site, cfgManager)
@@ -250,12 +251,12 @@ func TestCreateBinding_NoSSL(t *testing.T) {
 	cfgManager, _ := config.NewConfigManagerWithDir(tmpDir)
 
 	site := &matcher.ScannedSiteInfo{
-		ServerName:  "example.com",
-		ConfigFile:  "/etc/nginx/conf.d/example.conf",
-		HasSSL:      false,
-		CertPath:    "", // 无 SSL 配置
-		KeyPath:     "",
-		ServerType:  config.ServerTypeNginx,
+		ServerName: "example.com",
+		ConfigFile: "/etc/nginx/conf.d/example.conf",
+		HasSSL:     false,
+		CertPath:   "", // 无 SSL 配置
+		KeyPath:    "",
+		ServerType: config.ServerTypeNginx,
 	}
 
 	binding := createBinding(site, cfgManager)
@@ -523,10 +524,137 @@ func TestConfirm(t *testing.T) {
 	_ = confirm
 }
 
-// TestScanSites 测试站点扫描（仅验证函数签名）
-func TestScanSites(t *testing.T) {
-	// scanSites 依赖系统环境，这里只验证函数存在
-	_ = scanSites
+// TestScanSites_DockerOnly 复现宿主机未安装 Web 服务、仅 Docker 容器运行 Web 服务的场景。
+// 不同服务器中同域名的站点是两个独立部署目标，不能只按域名合并。
+func TestScanSites_DockerOnly(t *testing.T) {
+	factory := func(serverType webserver.ServerType) (webserver.Scanner, error) {
+		switch serverType {
+		case webserver.TypeNginx:
+			return &staticScanner{
+				serverType: webserver.TypeNginx,
+				sites: []webserver.Site{{
+					ServerName:    "example.com",
+					ServerType:    webserver.TypeDockerNginx,
+					ContainerID:   "container-id",
+					ContainerName: "openresty",
+				}},
+			}, nil
+		case webserver.TypeApache:
+			return &staticScanner{
+				serverType: webserver.TypeApache,
+				sites: []webserver.Site{{
+					ServerName:    "example.com",
+					ServerType:    webserver.TypeDockerApache,
+					ContainerID:   "apache-container-id",
+					ContainerName: "apache",
+				}},
+			}, nil
+		default:
+			return &staticScanner{serverType: serverType}, nil
+		}
+	}
+
+	sites := scanSitesWithFactory(logger.NewNopLogger(), factory)
+	if len(sites) != 2 {
+		t.Fatalf("scanSitesWithFactory() 返回 %d 个站点，期望 2 个", len(sites))
+	}
+	if sites[0].ServerType != config.ServerTypeDockerNginx {
+		t.Fatalf("ServerType = %s，期望 %s", sites[0].ServerType, config.ServerTypeDockerNginx)
+	}
+	if sites[0].ContainerName != "openresty" {
+		t.Fatalf("ContainerName = %s，期望 openresty", sites[0].ContainerName)
+	}
+	if sites[1].ServerType != config.ServerTypeDockerApache || sites[1].ContainerName != "apache" {
+		t.Fatalf("第二个站点 = %+v，期望 Docker Apache 站点", sites[1])
+	}
+}
+
+func TestSummarizeScannedSites_DockerOnly(t *testing.T) {
+	sites := []*matcher.ScannedSiteInfo{
+		{ServerType: config.ServerTypeDockerNginx, ContainerName: "openresty"},
+		{ServerType: config.ServerTypeDockerNginx, ContainerName: "openresty"},
+	}
+
+	environment, serverTypes := summarizeScannedSites(sites)
+	if environment != "Docker" {
+		t.Fatalf("environment = %q，期望 Docker", environment)
+	}
+	if len(serverTypes) != 1 || serverTypes[0] != config.ServerTypeDockerNginx {
+		t.Fatalf("serverTypes = %v，期望 [%s]", serverTypes, config.ServerTypeDockerNginx)
+	}
+}
+
+func TestSummarizeScannedSites_Mixed(t *testing.T) {
+	sites := []*matcher.ScannedSiteInfo{
+		{ServerType: config.ServerTypeNginx},
+		{ServerType: config.ServerTypeDockerApache, ContainerName: "apache"},
+	}
+
+	environment, serverTypes := summarizeScannedSites(sites)
+	if environment != "宿主机 + Docker" {
+		t.Fatalf("environment = %q，期望 宿主机 + Docker", environment)
+	}
+	if len(serverTypes) != 2 || serverTypes[0] != config.ServerTypeNginx || serverTypes[1] != config.ServerTypeDockerApache {
+		t.Fatalf("serverTypes = %v，期望 [nginx docker-apache]", serverTypes)
+	}
+}
+
+func TestDeploymentStatusHint(t *testing.T) {
+	want := "\n查看部署状态:\n  sslctl status\n"
+	if got := deploymentStatusHint(); got != want {
+		t.Fatalf("deploymentStatusHint() = %q，期望 %q", got, want)
+	}
+}
+
+func TestWebServersNotFoundMessage(t *testing.T) {
+	want := "Nginx 和 Apache 服务均未检测到（已检查宿主机和 Docker）"
+	if got := webServersNotFoundMessage(); got != want {
+		t.Fatalf("webServersNotFoundMessage() = %q，期望 %q", got, want)
+	}
+}
+
+func TestDeployableSitesNotFoundMessage(t *testing.T) {
+	want := "未发现可部署站点"
+	if got := deployableSitesNotFoundMessage(); got != want {
+		t.Fatalf("deployableSitesNotFoundMessage() = %q，期望 %q", got, want)
+	}
+}
+
+func TestScanWebServersAndSites_ServerWithoutSites(t *testing.T) {
+	factory := func(serverType webserver.ServerType) (webserver.Scanner, error) {
+		if serverType == webserver.TypeNginx {
+			return &staticScanner{serverType: serverType}, nil
+		}
+		return &staticScanner{serverType: serverType, scanErr: errors.New("未检测到 Apache")}, nil
+	}
+
+	result := scanWebServersAndSitesWithFactory(logger.NewNopLogger(), factory)
+	if len(result.ServerTypes) != 1 || result.ServerTypes[0] != config.ServerTypeNginx {
+		t.Fatalf("ServerTypes = %v，期望 [nginx]", result.ServerTypes)
+	}
+	if len(result.Sites) != 0 {
+		t.Fatalf("Sites = %+v，期望没有可部署站点", result.Sites)
+	}
+}
+
+func TestScanSites_OneServerAvailable(t *testing.T) {
+	factory := func(serverType webserver.ServerType) (webserver.Scanner, error) {
+		if serverType == webserver.TypeNginx {
+			return &staticScanner{
+				serverType: serverType,
+				sites: []webserver.Site{{
+					ServerName: "example.com",
+					ServerType: webserver.TypeDockerNginx,
+				}},
+			}, nil
+		}
+		return &staticScanner{serverType: serverType, scanErr: errors.New("未检测到 Apache")}, nil
+	}
+
+	sites := scanSitesWithFactory(logger.NewNopLogger(), factory)
+	if len(sites) != 1 || sites[0].ServerType != config.ServerTypeDockerNginx {
+		t.Fatalf("sites = %+v，期望仅保留可用的 Docker Nginx 站点", sites)
+	}
 }
 
 // TestInstallService 测试服务安装（仅验证函数签名）

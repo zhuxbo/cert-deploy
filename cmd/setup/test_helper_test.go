@@ -54,6 +54,17 @@ func (m *mockScanner) ScanLocal() ([]webserver.Site, error)  { return nil, nil }
 func (m *mockScanner) ScanDocker() ([]webserver.Site, error) { return nil, nil }
 func (m *mockScanner) ServerType() webserver.ServerType      { return m.serverType }
 
+type staticScanner struct {
+	serverType webserver.ServerType
+	sites      []webserver.Site
+	scanErr    error
+}
+
+func (s *staticScanner) Scan() ([]webserver.Site, error)       { return s.sites, s.scanErr }
+func (s *staticScanner) ScanLocal() ([]webserver.Site, error)  { return nil, nil }
+func (s *staticScanner) ScanDocker() ([]webserver.Site, error) { return s.sites, nil }
+func (s *staticScanner) ServerType() webserver.ServerType      { return s.serverType }
+
 // mockInstaller 测试用 mock 安装器
 type mockInstaller struct {
 	configPath string

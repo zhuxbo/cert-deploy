@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"time"
 
@@ -16,7 +15,6 @@ import (
 	"github.com/zhuxbo/sslctl/pkg/matcher"
 	"github.com/zhuxbo/sslctl/pkg/util"
 	"github.com/zhuxbo/sslctl/pkg/validator"
-	"github.com/zhuxbo/sslctl/pkg/webserver"
 )
 
 // certDeployPlan 单个证书的部署计划
@@ -39,17 +37,25 @@ type siteCandidate struct {
 
 // runBatch 批量部署
 func runBatch(p *setupParams, query string) {
-	// 1/8: 检测 Web 服务器
-	fmt.Println("步骤 1/8: 检测 Web 服务器...")
-	serverType := webserver.DetectWebServerType()
-	if serverType == "" {
-		fmt.Fprintln(os.Stderr, "未检测到 Nginx 或 Apache 服务")
+	// 1/7: 检测 Web 服务并扫描站点（宿主机 + Docker）
+	fmt.Println("步骤 1/7: 检测 Web 服务并扫描站点...")
+	scanResult := scanWebServersAndSites(p.log)
+	if len(scanResult.ServerTypes) == 0 {
+		fmt.Fprintln(os.Stderr, webServersNotFoundMessage())
 		os.Exit(1)
 	}
-	fmt.Printf("  检测到: %s\n", serverType)
+	fmt.Printf("  ✓ 检测到 Web 服务: %s\n", strings.Join(scanResult.ServerTypes, ", "))
+	if len(scanResult.Sites) == 0 {
+		fmt.Fprintln(os.Stderr, deployableSitesNotFoundMessage())
+		os.Exit(1)
+	}
+	sites := scanResult.Sites
+	environment, _ := summarizeScannedSites(sites)
+	fmt.Printf("  ✓ 发现 %d 个可部署站点\n", len(sites))
+	fmt.Printf("  环境: %s\n", environment)
 
-	// 2/8: 查询证书
-	fmt.Println("\n步骤 2/8: 查询证书...")
+	// 2/7: 查询证书
+	fmt.Println("\n步骤 2/7: 查询证书...")
 	f := fetcher.New(30 * time.Second)
 	certList, renewBeforeDays, err := f.QueryBatch(p.ctx, p.apiURL, p.token, query)
 	if err != nil {
@@ -108,17 +114,8 @@ func runBatch(p *setupParams, query string) {
 	}
 	fmt.Printf("\n  共 %d 个证书可部署\n", len(plans))
 
-	// 3/8: 扫描站点
-	fmt.Println("\n步骤 3/8: 扫描站点...")
-	sites := scanSites(serverType, p.log)
-	if len(sites) == 0 {
-		fmt.Fprintln(os.Stderr, "未发现站点配置")
-		os.Exit(1)
-	}
-	fmt.Printf("  发现 %d 个站点\n", len(sites))
-
-	// 4/8: 匹配站点 + 冲突解决
-	fmt.Println("\n步骤 4/8: 匹配站点...")
+	// 3/7: 匹配站点 + 冲突解决
+	fmt.Println("\n步骤 3/7: 匹配证书与站点...")
 	resolveSiteConflicts(plans, sites, p.cfgManager)
 
 	// 统计有绑定的计划
@@ -136,8 +133,8 @@ func runBatch(p *setupParams, query string) {
 		os.Exit(1)
 	}
 
-	// 5/8: 确认部署计划
-	fmt.Println("\n步骤 5/8: 确认部署计划...")
+	// 4/7: 确认部署计划
+	fmt.Println("\n步骤 4/7: 确认部署计划...")
 	printDeployPlan(plans)
 	fmt.Printf("\n  共 %d 个证书，%d 个站点\n", activePlans, totalBindings)
 
@@ -148,8 +145,8 @@ func runBatch(p *setupParams, query string) {
 		}
 	}
 
-	// 6/8: 验证私钥 + 部署
-	fmt.Println("\n步骤 6/8: 部署证书...")
+	// 5/7: 验证私钥 + 部署
+	fmt.Println("\n步骤 5/7: 部署证书...")
 	var certSuccess, certFail int
 	var totalSiteSuccess, totalSiteFail int
 	var needKeyNames []string
@@ -201,8 +198,8 @@ func runBatch(p *setupParams, query string) {
 		os.Exit(1)
 	}
 
-	// 7/8: 保存配置
-	fmt.Println("\n步骤 7/8: 保存配置...")
+	// 6/7: 保存配置
+	fmt.Println("\n步骤 6/7: 保存配置...")
 	for _, plan := range plans {
 		if len(plan.Bindings) == 0 {
 			continue
@@ -291,9 +288,9 @@ func runBatch(p *setupParams, query string) {
 		notifyAutoReissue(p, f, certConfig.OrderID, certConfig.RenewMode)
 	}
 
-	// 8/8: 安装守护服务
+	// 7/7: 安装守护服务
 	if !p.noService {
-		fmt.Println("\n步骤 8/8: 安装守护服务...")
+		fmt.Println("\n步骤 7/7: 安装守护服务...")
 		if err := installService(); err != nil {
 			fmt.Fprintf(os.Stderr, "  安装服务失败: %v\n", err)
 			fmt.Println("  可稍后使用 'sslctl service repair' 修复")
@@ -301,7 +298,7 @@ func runBatch(p *setupParams, query string) {
 			fmt.Println("  ✓ 服务已安装并启动")
 		}
 	} else {
-		fmt.Println("\n步骤 8/8: 跳过服务安装 (--no-service)")
+		fmt.Println("\n步骤 7/7: 跳过服务安装 (--no-service)")
 	}
 
 	// 汇总
@@ -322,16 +319,7 @@ func runBatch(p *setupParams, query string) {
 	fmt.Printf("\n配置文件: %s\n", p.cfgManager.GetConfigPath())
 	fmt.Printf("证书目录: %s\n", p.cfgManager.GetCertsDir())
 
-	if !p.noService {
-		fmt.Println("\n守护服务命令:")
-		if runtime.GOOS == "windows" {
-			fmt.Println("  sc query sslctl              # 查看状态")
-			fmt.Println("  sslctl status                # 查看证书状态")
-		} else {
-			fmt.Println("  systemctl status sslctl    # 查看状态")
-			fmt.Println("  journalctl -u sslctl -f    # 查看日志")
-		}
-	}
+	fmt.Print(deploymentStatusHint())
 
 	// 检查 Docker 非卷挂载站点
 	if totalSiteSuccess > 0 {

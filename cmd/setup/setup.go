@@ -173,14 +173,22 @@ func Run(args []string, debug bool) {
 func runSingle(p *setupParams, orderID int) {
 	p.log.Info("开始 setup: order_id=%d, api_url=%s", orderID, p.apiURL)
 
-	// 1. 检测 Web 服务器
-	fmt.Println("步骤 1/7: 检测 Web 服务器...")
-	serverType := webserver.DetectWebServerType()
-	if serverType == "" {
-		fmt.Fprintln(os.Stderr, "未检测到 Nginx 或 Apache 服务")
+	// 1. 检测 Web 服务并扫描站点（宿主机 + Docker）
+	fmt.Println("步骤 1/7: 检测 Web 服务并扫描站点...")
+	scanResult := scanWebServersAndSites(p.log)
+	if len(scanResult.ServerTypes) == 0 {
+		fmt.Fprintln(os.Stderr, webServersNotFoundMessage())
 		os.Exit(1)
 	}
-	fmt.Printf("  检测到: %s\n", serverType)
+	fmt.Printf("  ✓ 检测到 Web 服务: %s\n", strings.Join(scanResult.ServerTypes, ", "))
+	if len(scanResult.Sites) == 0 {
+		fmt.Fprintln(os.Stderr, deployableSitesNotFoundMessage())
+		os.Exit(1)
+	}
+	sites := scanResult.Sites
+	environment, _ := summarizeScannedSites(sites)
+	fmt.Printf("  ✓ 发现 %d 个可部署站点\n", len(sites))
+	fmt.Printf("  环境: %s\n", environment)
 
 	// 2. 获取证书信息
 	fmt.Println("\n步骤 2/7: 获取证书信息...")
@@ -236,16 +244,8 @@ func runSingle(p *setupParams, orderID int) {
 	fmt.Printf("  订单 ID: %d\n", certData.OrderID)
 	fmt.Printf("  证书域名: %s\n", strings.Join(certDomains, ", "))
 
-	// 3. 扫描站点并匹配
-	fmt.Println("\n步骤 3/7: 扫描站点...")
-	sites := scanSites(serverType, p.log)
-	if len(sites) == 0 {
-		fmt.Fprintln(os.Stderr, "未发现站点配置")
-		os.Exit(1)
-	}
-	fmt.Printf("  发现 %d 个站点\n", len(sites))
-
-	// 匹配域名
+	// 3. 匹配证书与站点
+	fmt.Println("\n步骤 3/7: 匹配证书与站点...")
 	m := matcher.New(certDomains)
 	fullMatch, partialMatch, _ := m.MatchSites(sites)
 
@@ -493,16 +493,7 @@ func runSingle(p *setupParams, orderID int) {
 	fmt.Printf("\n配置文件: %s\n", p.cfgManager.GetConfigPath())
 	fmt.Printf("证书目录: %s\n", p.cfgManager.GetCertsDir())
 
-	if !p.noService {
-		fmt.Println("\n守护服务命令:")
-		if runtime.GOOS == "windows" {
-			fmt.Println("  sc query sslctl              # 查看状态")
-			fmt.Println("  sslctl status                # 查看证书状态")
-		} else {
-			fmt.Println("  systemctl status sslctl    # 查看状态")
-			fmt.Println("  journalctl -u sslctl -f    # 查看日志")
-		}
-	}
+	fmt.Print(deploymentStatusHint())
 
 	if hasDockerNonVolume && successCount > 0 {
 		fmt.Println("\n[!] 检测到 Docker 容器站点的证书路径未挂载为卷")
@@ -526,71 +517,134 @@ func deriveRenewPolicy(certDomains []string, localKey, fileValidation bool) (use
 	return localKey, fileValidation
 }
 
-// scanSites 扫描站点（使用 webserver 抽象层）
-func scanSites(serverType string, log *logger.Logger) []*matcher.ScannedSiteInfo {
+func scanSitesWithFactory(log *logger.Logger, newScanner func(webserver.ServerType) (webserver.Scanner, error)) []*matcher.ScannedSiteInfo {
+	return scanWebServersAndSitesWithFactory(log, newScanner).Sites
+}
+
+type webServerSiteScanResult struct {
+	ServerTypes []string
+	Sites       []*matcher.ScannedSiteInfo
+}
+
+func scanWebServersAndSites(log *logger.Logger) webServerSiteScanResult {
+	return scanWebServersAndSitesWithFactory(log, webserver.NewScanner)
+}
+
+func scanWebServersAndSitesWithFactory(log *logger.Logger, newScanner func(webserver.ServerType) (webserver.Scanner, error)) webServerSiteScanResult {
 	var sites []*matcher.ScannedSiteInfo
-
-	// 确定服务器类型
-	wsType := webserver.TypeNginx
-	if serverType == "apache" {
-		wsType = webserver.TypeApache
-	}
-
-	// 使用抽象层创建扫描器
-	scanner, err := webserver.NewScanner(wsType)
-	if err != nil {
-		log.Error("创建扫描器失败: %v", err)
-		return sites
-	}
-
-	// 扫描站点
-	allSites, err := scanner.Scan()
-	if err != nil {
-		// Prefix 未知是阻塞性错误：打印修复指引并中止，避免写入错误位置
-		var prefixErr *sslerrors.PrefixUnknownError
-		if errors.As(err, &prefixErr) {
-			log.Error("%s prefix 未知，部署中止", serverType)
-			fmt.Fprint(os.Stderr, prefixErr.RenderHint())
-			os.Exit(1)
+	var serverTypes []string
+	seenServerTypes := make(map[string]struct{})
+	addServerType := func(serverType string) {
+		if serverType == "" {
+			return
 		}
-		log.Error("扫描 %s 失败: %v", serverType, err)
-		return sites
+		if _, exists := seenServerTypes[serverType]; exists {
+			return
+		}
+		serverTypes = append(serverTypes, serverType)
+		seenServerTypes[serverType] = struct{}{}
 	}
 
-	// 转换为 matcher.ScannedSiteInfo
-	for _, site := range allSites {
-		sites = append(sites, &matcher.ScannedSiteInfo{
-			ServerName:    site.ServerName,
-			ServerAlias:   site.ServerAlias,
-			ConfigFile:    site.ConfigFile,
-			HasSSL:        site.CertificatePath != "",
-			CertPath:      site.CertificatePath,
-			KeyPath:       site.PrivateKeyPath,
-			ChainPath:     site.ChainFile,
-			ServerType:    string(site.ServerType),
-			ContainerID:   site.ContainerID,
-			ContainerName: site.ContainerName,
-			HostCertPath:  site.HostCertPath,
-			HostKeyPath:   site.HostKeyPath,
-			HostChainPath: site.HostChainPath,
-			VolumeMode:    site.VolumeMode,
-		})
+	for _, wsType := range []webserver.ServerType{webserver.TypeNginx, webserver.TypeApache} {
+		scanner, err := newScanner(wsType)
+		if err != nil {
+			log.Error("创建 %s 扫描器失败: %v", wsType, err)
+			continue
+		}
+
+		allSites, err := scanner.Scan()
+		if err != nil {
+			// Prefix 未知是阻塞性错误：打印修复指引并中止，避免写入错误位置
+			var prefixErr *sslerrors.PrefixUnknownError
+			if errors.As(err, &prefixErr) {
+				log.Error("%s prefix 未知，部署中止", wsType)
+				fmt.Fprint(os.Stderr, prefixErr.RenderHint())
+				os.Exit(1)
+			}
+			continue
+		}
+		if len(allSites) == 0 {
+			addServerType(string(wsType))
+		}
+
+		for _, site := range allSites {
+			addServerType(string(site.ServerType))
+			sites = append(sites, &matcher.ScannedSiteInfo{
+				ServerName:    site.ServerName,
+				ServerAlias:   site.ServerAlias,
+				ConfigFile:    site.ConfigFile,
+				HasSSL:        site.CertificatePath != "",
+				CertPath:      site.CertificatePath,
+				KeyPath:       site.PrivateKeyPath,
+				ChainPath:     site.ChainFile,
+				ServerType:    string(site.ServerType),
+				ContainerID:   site.ContainerID,
+				ContainerName: site.ContainerName,
+				HostCertPath:  site.HostCertPath,
+				HostKeyPath:   site.HostKeyPath,
+				HostChainPath: site.HostChainPath,
+				VolumeMode:    site.VolumeMode,
+			})
+		}
 	}
 
 	// 合并同域名站点（处理 80/443 分开的 server block）
 	sites = mergeSameNameSites(sites)
 
-	return sites
+	return webServerSiteScanResult{
+		ServerTypes: serverTypes,
+		Sites:       sites,
+	}
+}
+
+func summarizeScannedSites(sites []*matcher.ScannedSiteInfo) (string, []string) {
+	var hasLocal, hasDocker bool
+	var serverTypes []string
+	seenTypes := make(map[string]struct{})
+
+	for _, site := range sites {
+		if config.IsDockerType(site.ServerType) || site.ContainerID != "" || site.ContainerName != "" {
+			hasDocker = true
+		} else {
+			hasLocal = true
+		}
+		if _, exists := seenTypes[site.ServerType]; !exists && site.ServerType != "" {
+			serverTypes = append(serverTypes, site.ServerType)
+			seenTypes[site.ServerType] = struct{}{}
+		}
+	}
+
+	environment := "宿主机"
+	switch {
+	case hasLocal && hasDocker:
+		environment = "宿主机 + Docker"
+	case hasDocker:
+		environment = "Docker"
+	}
+	return environment, serverTypes
+}
+
+func deploymentStatusHint() string {
+	return "\n查看部署状态:\n  sslctl status\n"
+}
+
+func webServersNotFoundMessage() string {
+	return "Nginx 和 Apache 服务均未检测到（已检查宿主机和 Docker）"
+}
+
+func deployableSitesNotFoundMessage() string {
+	return "未发现可部署站点"
 }
 
 // mergeSameNameSites 合并同域名的站点
 // 同一域名有多个 server block 时（如 80 和 443 分开），合并为一条，优先保留 SSL 条目的信息
 func mergeSameNameSites(sites []*matcher.ScannedSiteInfo) []*matcher.ScannedSiteInfo {
-	seen := make(map[string]int) // ServerName -> result 中的索引
+	seen := make(map[string]int) // 服务器实例 + ServerName -> result 中的索引
 	var result []*matcher.ScannedSiteInfo
 
 	for _, site := range sites {
-		if idx, exists := seen[site.ServerName]; exists {
+		mergeKey := siteMergeKey(site)
+		if idx, exists := seen[mergeKey]; exists {
 			existing := result[idx]
 			if site.HasSSL && !existing.HasSSL {
 				// 当前条目有 SSL，替换已有的非 SSL 条目
@@ -607,12 +661,20 @@ func mergeSameNameSites(sites []*matcher.ScannedSiteInfo) []*matcher.ScannedSite
 			}
 			// 两个都有 SSL：保持已有条目（先出现的优先）
 		} else {
-			seen[site.ServerName] = len(result)
+			seen[mergeKey] = len(result)
 			result = append(result, site)
 		}
 	}
 
 	return result
+}
+
+func siteMergeKey(site *matcher.ScannedSiteInfo) string {
+	container := site.ContainerID
+	if container == "" {
+		container = site.ContainerName
+	}
+	return site.ServerType + "\x00" + container + "\x00" + site.ServerName
 }
 
 // createBinding 创建站点绑定

@@ -157,6 +157,9 @@ func printUsage() {
   sslctl upgrade --check                     检查更新
   sslctl service repair                      修复 systemd 服务
 
+诊断命令:
+%s
+
 一键部署:
   sslctl setup --url <url> --token <token> --order <order_id>
   sslctl setup --url <url> --token <token> --order <order_id> --local-key
@@ -169,7 +172,14 @@ func printUsage() {
   sslctl scan
   sslctl --debug deploy --cert example.com
   sslctl setup --url https://api.example.com --token abc123 --order 12345
-`, version)
+`, version, diagnosticCommandsHelp())
+}
+
+func diagnosticCommandsHelp() string {
+	return `  sslctl status                              查看 sslctl、证书及 Web 服务器状态
+  systemctl status sslctl                    查看 Linux 服务状态
+  journalctl -u sslctl -f                    跟踪 Linux 服务日志
+  sc query sslctl                            查看 Windows 服务状态`
 }
 
 // runWindowsService 以 Windows 服务方式运行
@@ -269,13 +279,15 @@ func runStatus() {
 	fmt.Printf("版本: %s (编译时间: %s)\n", version, buildTime)
 	fmt.Printf("系统: %s/%s\n", runtime.GOOS, runtime.GOARCH)
 
-	// 2. Web 服务器检测
-	serverType := webserver.DetectWebServerType()
-	if serverType != "" {
-		fmt.Printf("Web 服务器: %s\n", serverType)
-	} else {
-		fmt.Println("Web 服务器: 未检测到")
+	// 提前读取配置，让纯 Docker 环境也能展示 setup 保存的站点绑定。
+	var cfg *config.Config
+	cfgManager, cfgManagerErr := config.NewConfigManager()
+	if cfgManagerErr == nil {
+		cfg, _ = cfgManager.Load()
 	}
+
+	// 2. Web 服务器检测
+	fmt.Printf("Web 服务器: %s\n", webServerStatusSummary(webserver.DetectWebServerType(), cfg))
 
 	// 3. 服务状态（使用跨平台服务模块）
 	fmt.Printf("\n服务管理: %s\n", service.GetInitSystemName())
@@ -302,13 +314,7 @@ func runStatus() {
 	}
 
 	// 4. 证书详情
-	cfgManager, err := config.NewConfigManager()
-	if err != nil {
-		return
-	}
-
-	cfg, err := cfgManager.Load()
-	if err != nil {
+	if cfg == nil {
 		return
 	}
 
@@ -381,6 +387,49 @@ func runStatus() {
 			fmt.Printf("    上次部署: %s\n", cert.Metadata.LastDeployAt.Format("2006-01-02 15:04:05"))
 		}
 	}
+}
+
+func webServerStatusSummary(localServerType string, cfg *config.Config) string {
+	var servers []string
+	seen := make(map[string]struct{})
+	if localServerType != "" {
+		servers = append(servers, localServerType)
+		seen[localServerType+"\x00"] = struct{}{}
+	}
+
+	if cfg != nil {
+		for _, cert := range cfg.Certificates {
+			if !cert.Enabled {
+				continue
+			}
+			for _, binding := range cert.Bindings {
+				if !binding.Enabled || binding.ServerType == "" {
+					continue
+				}
+
+				containerName := ""
+				if binding.Docker != nil {
+					containerName = binding.Docker.ContainerName
+				}
+				key := binding.ServerType + "\x00" + containerName
+				if _, exists := seen[key]; exists {
+					continue
+				}
+
+				label := binding.ServerType + "（已配置）"
+				if containerName != "" {
+					label = fmt.Sprintf("%s（已配置，容器: %s）", binding.ServerType, containerName)
+				}
+				servers = append(servers, label)
+				seen[key] = struct{}{}
+			}
+		}
+	}
+
+	if len(servers) == 0 {
+		return "未检测到"
+	}
+	return strings.Join(servers, ", ")
 }
 
 // runService 管理服务

@@ -182,14 +182,29 @@ type UpdateResponse struct {
 	RenewBeforeDays int `json:"renew_before_days"`
 }
 
-// CallbackResponse 回调响应
+// CallbackResponse 回调响应。
+// data 用 RawMessage 承接：服务端在不同分支下可能返回对象、null 或空数组，
+// 直接声明为结构体时非对象形状会让整条响应解析失败——回调其实已被受理，
+// 却被记成失败并丢掉 renew_before_days。形状不符时忽略 data，不影响成功判定。
 type CallbackResponse struct {
-	Code            int    `json:"code"`
-	Message         string `json:"msg"`
-	RenewBeforeDays int    `json:"renew_before_days"`
-	Data            struct {
+	Code            int             `json:"code"`
+	Message         string          `json:"msg"`
+	RenewBeforeDays int             `json:"renew_before_days"`
+	Data            json.RawMessage `json:"data"`
+}
+
+// renewBeforeDaysFromData 从 data 对象中提取 renew_before_days，形状不符或缺失返回 0
+func renewBeforeDaysFromData(data json.RawMessage) int {
+	if len(data) == 0 {
+		return 0
+	}
+	var payload struct {
 		RenewBeforeDays int `json:"renew_before_days"`
-	} `json:"data"`
+	}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return 0
+	}
+	return payload.RenewBeforeDays
 }
 
 // Fetcher 证书获取器
@@ -480,7 +495,7 @@ func (f *Fetcher) Callback(ctx context.Context, callbackURL, token string, callb
 	if callbackResp.Code != APICodeSuccess {
 		return 0, errors.NewNetworkError(fmt.Sprintf("callback failed: %s", callbackResp.Message), nil)
 	}
-	renewBeforeDays := callbackResp.Data.RenewBeforeDays
+	renewBeforeDays := renewBeforeDaysFromData(callbackResp.Data)
 	if renewBeforeDays == 0 {
 		// 兼容旧服务端把 renew_before_days 放在顶层的响应。
 		renewBeforeDays = callbackResp.RenewBeforeDays

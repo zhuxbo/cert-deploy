@@ -219,18 +219,18 @@ chown root:root /opt/sslctl/certs/
 setup 流程为**未启用 SSL** 的站点安装 HTTPS 配置（需用户确认），备份原配置、配置测试失败自动回滚。
 
 - 支持 `server\n{` 多行格式；SSL 指令仅插入 server 块顶层，兼容 `root` 写在 `location` 内的 SPA / 反代配置。
-- **nginx**：仅向 `server_name` 匹配目标站点、且尚未配置 SSL 的 `:80` 块注入证书（已配 SSL 的块跳过防 duplicate listen）。"已配置 SSL"检测与注入共用同一匹配谓词（lower + 通配符），避免同文件多域名块被统一注入。
+- **nginx**：先按 nginx 自身的名字优先级选出服务目标站点的**唯一** server 块（`selectTargetBlock`：精确名优先于通配符名），再只向该块注入。匹配必须是单向的——"块的 `server_name` 覆盖目标域名"，反向不成立；双向匹配会把目标站点的证书一并写进 `*.example.com` 块，使通配符站点被换上只覆盖单域名的证书、其余子域名 HTTPS 证书不匹配。同优先级内已配 SSL 的块优先选中，使常见的"`:80` 跳转块 + `:443 ssl` 块"同名布局判定为"已有 HTTPS"而不产生 duplicate listen 443。"已配置 SSL"检测（`hasSSLConfig`）与注入基于同一选块结果，两趟解析共用 `scanServerBlocks` 的块编号，不各自重复判定。
 - **Apache**：生成 `:443` VirtualHost 时按地址 token 精确替换端口，仅端口恰为 80 才换，`*:8080` 等自定义端口不受污染。
 
 ### 安装器失败语义
 
 - SSL 配置安装失败的绑定标记 `Enabled=false` 后跳过部署并计入失败（单证书与批量模式一致），不误报"部署成功"。
-- nginx 安装器在非 80 端口 / 无可处理 HTTP server 块时返回明确错误而非静默跳过，与 Apache 一致；安装器"无可注入块"必须报错而非返回 `Modified=false`。
+- nginx 安装器在非 80 端口 / 无可处理 HTTP server 块时返回明确错误而非静默跳过，与 Apache 一致；安装器"无可注入块"必须报错而非返回 `Modified=false`。判定只看**选中的目标块**是否已配 SSL：同域族的其他块（如通配符块）已有 SSL 不得让目标站点短路成"无需安装"，否则 setup/deploy 会误以为无需安装继续部署并报成功，而目标站点 HTTPS 实际未生效。
 
 ## Docker 站点部署（setup/deploy）
 
 - 证书写入**宿主机侧挂载路径**（`HostCertPath`，非容器内路径）。
-- test/reload 使用容器化命令：`docker exec <容器> nginx -t` / `nginx -s reload`（apache 用 `apachectl`）；executor 放行 `docker exec <容器> <固定命令>`（容器名字符白名单 + 内层命令白名单）；base deployer 对 docker exec 命令跳过宿主机 SIGUSR1 / 进程重启回退。
+- test/reload 使用容器化命令：`docker exec <容器> nginx -t` / `nginx -s reload`（apache 用 `apachectl`）；executor 放行 `docker exec <容器> <固定命令>`（容器名字符白名单 + 内层命令白名单）；命令构建方（`webserver.DetectDockerCommands`）用 `executor.IsValidDockerContainerName` 前置校验容器名，非法即返回空命令，不拼出必然被执行期白名单拒绝的命令（那样错误指向白名单，掩盖真实原因）；base deployer 对 docker exec 命令跳过宿主机 SIGUSR1 / 进程重启回退。
 - 非挂载卷（copy 模式）或缺容器重载命令时 `config.ValidateDockerBinding` 返回明确错误、如实计为失败，不再静默写错位置报成功。旧版本 setup 创建的存量绑定升级后持续报失败属预期，需重跑 setup 补齐容器命令与卷校验（见根 `README.md`「存量 Docker 绑定升级说明」）。
 - Apache 容器内仅 `httpd`/`apache2ctl` 时 reload 明确报错，自动探测待后续支持。
 - **挂载路径精确匹配**：Docker 挂载路径按精确匹配，防止 `/etc/nginx` 匹配到 `/etc/nginx-backup`。

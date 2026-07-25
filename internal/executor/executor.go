@@ -46,6 +46,13 @@ func IsDockerExecCommand(cmdStr string) bool {
 	return ok && dockerContainerNameRe.MatchString(container) && allowedDockerInnerCommands[inner]
 }
 
+// IsValidDockerContainerName 校验容器名是否符合 docker 命名规则。
+// 供命令构建方前置校验，使非法容器名在构建时就被发现，
+// 而不是拼成命令后在执行期被白名单拒绝（错误指向白名单，掩盖真实原因）。
+func IsValidDockerContainerName(name string) bool {
+	return dockerContainerNameRe.MatchString(name)
+}
+
 // AllowedCommands 允许的命令白名单（支持多发行版和 Windows）
 var AllowedCommands = map[string]bool{
 	// ========== Nginx 扫描命令 ==========

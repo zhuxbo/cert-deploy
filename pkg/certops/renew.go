@@ -157,11 +157,31 @@ func (s *Service) willMakeAPICall(cert *config.CertConfig, schedule *config.Sche
 		return false
 	}
 	// 计数触顶：静默
-	if (cert.GetRenewMode(schedule) == config.RenewModeLocal && cert.Metadata.IssueRetryCount >= MaxIssueRetryCount) ||
-		cert.Metadata.DeployAttemptCount >= MaxDeployAttemptCount {
+	if cappedPhaseFor(cert, schedule) != "" {
 		return false
 	}
 	return cert.NeedsRenewal(schedule) || len(cert.Metadata.FailedBindings) > 0
+}
+
+// cappedPhaseFor 返回证书当前应进入 CAPPED 的阶段，未触顶返回 ""。
+//
+// 签发触顶仅拦截"即将提交新 CSR"的情形；已在途（processing）或已秒签待部署（active）的证书
+// 不受签发触顶影响——其继续推进由部署触顶（DeployAttemptCount）约束，避免已签发证书被误判
+// 停机而白白过期。
+//
+// 编排层（processCertRenewal）与延迟预估（willMakeAPICall）共用本判定：两处各写一份时，
+// 预估会把仍需查询的在途证书算作"不发请求"，且未来改一处漏一处就会变成真实的停机误判。
+func cappedPhaseFor(cert *config.CertConfig, schedule *config.ScheduleConfig) string {
+	entryState := normalizeIssueState(cert.Metadata.LastIssueState)
+	if cert.GetRenewMode(schedule) == config.RenewModeLocal &&
+		cert.Metadata.IssueRetryCount >= MaxIssueRetryCount &&
+		entryState != config.IssueStateProcessing && entryState != config.IssueStateActive {
+		return config.CappedPhaseIssue
+	}
+	if cert.Metadata.DeployAttemptCount >= MaxDeployAttemptCount {
+		return config.CappedPhaseDeploy
+	}
+	return ""
 }
 
 // isTerminalIssueState 判断是否为终止态（静默跳过，等待人工处理）
@@ -254,16 +274,8 @@ func (s *Service) processCertRenewal(ctx context.Context, cfg *config.Config, ce
 
 	// 计数触顶：签发与部署分别判断，静默进入 CAPPED（不发回调）
 	mode := cert.GetRenewMode(&cfg.Schedule)
-	entryState := normalizeIssueState(cert.Metadata.LastIssueState)
-	// 签发触顶仅拦截"即将提交新 CSR"的情形；已在途（processing）或已秒签待部署（active）的证书
-	// 不受签发触顶影响——其继续推进由部署触顶（DeployAttemptCount）约束，避免已签发证书被误判停机而白白过期。
-	if mode == config.RenewModeLocal && cert.Metadata.IssueRetryCount >= MaxIssueRetryCount &&
-		entryState != config.IssueStateProcessing && entryState != config.IssueStateActive {
-		s.markCapped(&cert, config.CappedPhaseIssue)
-		return nil, madeAPICall
-	}
-	if cert.Metadata.DeployAttemptCount >= MaxDeployAttemptCount {
-		s.markCapped(&cert, config.CappedPhaseDeploy)
+	if phase := cappedPhaseFor(&cert, &cfg.Schedule); phase != "" {
+		s.markCapped(&cert, phase)
 		return nil, madeAPICall
 	}
 
@@ -523,6 +535,10 @@ func (s *Service) retryFailedBindings(ctx context.Context, cert *config.CertConf
 	}
 
 	cert.Metadata.FailedBindings = stillFailed
+	// 本轮重试也是一次产生了明确结果的部署尝试：清除崩溃安全标记。
+	// 残留标记会让之后一次真正的 runDeployAttempt 被当成"重放同一意图"而不递增计数，
+	// 削弱部署触顶保护。
+	cert.Metadata.DeployStartedAt = time.Time{}
 	if len(stillFailed) == 0 {
 		cert.Metadata.LastDeployAt = time.Now()
 		cert.Metadata.FailedBindingsAt = time.Time{}

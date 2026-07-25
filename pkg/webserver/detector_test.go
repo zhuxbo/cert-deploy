@@ -517,6 +517,11 @@ func TestDetectDockerCommands(t *testing.T) {
 		{"docker-nginx", TypeDockerNginx, "my-nginx", "docker exec my-nginx nginx -t", "docker exec my-nginx nginx -s reload"},
 		{"docker-apache", TypeDockerApache, "web_1", "docker exec web_1 apachectl -t", "docker exec web_1 apachectl graceful"},
 		{"空容器名返回空命令", TypeDockerNginx, "", "", ""},
+		// 非法容器名在构建时就返回空命令，而不是拼成命令后在执行期被 executor 白名单拒绝
+		// （那样错误指向"白名单"，掩盖了容器名非法这个真实原因）
+		{"含空格的容器名", TypeDockerNginx, "my nginx", "", ""},
+		{"以连字符开头的容器名", TypeDockerNginx, "-rm", "", ""},
+		{"含分号的容器名", TypeDockerNginx, "web;rm", "", ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -212,14 +212,24 @@ func (b *Base) reloadFallbackLinux() error {
 	// SIGUSR1 只负责通知 master，信号发送成功不代表 graceful reload 已完成。
 	// 必须等到新一代 worker 出现后再允许下一绑定改写另一组证书文件；否则
 	// Apache 可能在读取配置时撞上“新私钥 + 旧证书”的瞬时状态并退出。
-	if err := waitForApacheReload(pid, childrenBefore, 5*time.Second); err != nil {
+	if err := waitForApacheReload(pid, childrenBefore, apacheReloadTimeout); err != nil {
 		return fmt.Errorf("wait for apache reload: %w", err)
 	}
 	return nil
 }
 
+// Apache graceful reload 等待参数。
+// graceful 会立即 fork 新一代 worker，正常情况下毫秒级完成；期限取得宽裕些，
+// 避免负载高的机器上把"只是慢"误判成 reload 失败而触发回滚——回滚会再改写一次
+// 证书文件，比多等一会儿更容易制造错配。
+const (
+	apacheReloadTimeout      = 15 * time.Second
+	apacheReloadPollInterval = 50 * time.Millisecond
+)
+
 // waitForApacheReload 等待 Apache master 创建至少一个新 worker，证明 graceful
-// reload 已读取完配置并进入新 generation。master 退出或超时均按 reload 失败处理。
+// reload 已读取完配置并进入新 generation。master 退出或超时均按 reload 失败处理
+// （静默放行会掩盖真正没 reload 成功的情况，让站点挂着旧证书却报部署成功）。
 func waitForApacheReload(masterPID int, childrenBefore map[int]struct{}, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for {
@@ -232,7 +242,7 @@ func waitForApacheReload(masterPID int, childrenBefore map[int]struct{}, timeout
 		if time.Now().After(deadline) {
 			return fmt.Errorf("apache master %d did not create a new worker within %s", masterPID, timeout)
 		}
-		time.Sleep(25 * time.Millisecond)
+		time.Sleep(apacheReloadPollInterval)
 	}
 }
 
@@ -245,7 +255,34 @@ func hasNewPID(before, after map[int]struct{}) bool {
 	return false
 }
 
+// childPIDs 返回 parentPID 的直接子进程集合。
+// 优先读 /proc/<pid>/task/<pid>/children：内核直接给出子进程列表，一次读取即可；
+// 该文件需要 CONFIG_PROC_CHILDREN，不可用时回退到扫描整个 /proc——后者要逐个读取
+// 所有进程的 status，在进程数多的机器上每轮轮询开销显著，仅作兜底。
 func childPIDs(parentPID int) map[int]struct{} {
+	if children, ok := childPIDsFromProcChildren(parentPID); ok {
+		return children
+	}
+	return childPIDsByScan(parentPID)
+}
+
+// childPIDsFromProcChildren 读取 /proc/<pid>/task/<pid>/children（空格分隔的 PID 列表）
+func childPIDsFromProcChildren(parentPID int) (map[int]struct{}, bool) {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/task/%d/children", parentPID, parentPID))
+	if err != nil {
+		return nil, false
+	}
+	children := make(map[int]struct{})
+	for _, field := range strings.Fields(string(data)) {
+		if pid, err := strconv.Atoi(field); err == nil {
+			children[pid] = struct{}{}
+		}
+	}
+	return children, true
+}
+
+// childPIDsByScan 扫描 /proc 逐个比对 PPid（兜底路径）
+func childPIDsByScan(parentPID int) map[int]struct{} {
 	children := make(map[int]struct{})
 	entries, err := os.ReadDir("/proc")
 	if err != nil {

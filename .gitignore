@@ -45,6 +45,7 @@ docker/test/mock-api/mock-api
 docker/test/mock-api/mock-api-*
 docker/test/reports/*.md
 docker/test/reports/*.tap
+docker/test/reports/*.log
 
 # 签名密钥（由 build/generate-keys.sh 生成）
 release-key.pem

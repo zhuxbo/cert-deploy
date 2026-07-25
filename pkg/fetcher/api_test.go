@@ -1471,3 +1471,41 @@ func TestToggleAutoReissue_HTTPError(t *testing.T) {
 		t.Fatal("ToggleAutoReissue() should return error for HTTP 401")
 	}
 }
+
+// TestCallbackToleratesNonObjectData 回归：服务端在不同分支下 data 可能是空数组、null 或字符串。
+// 这些形状不得让整条响应解析失败——回调已被服务端受理，若报错会被记成部署失败回调丢失。
+func TestCallbackToleratesNonObjectData(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want int
+	}{
+		{"空数组 data", `{"code":1,"msg":"ok","data":[]}`, 0},
+		{"null data", `{"code":1,"msg":"ok","data":null}`, 0},
+		{"字符串 data", `{"code":1,"msg":"ok","data":""}`, 0},
+		{"无 data 键顶层字段", `{"code":1,"msg":"ok","renew_before_days":14}`, 14},
+		{"空数组 data 回退顶层", `{"code":1,"msg":"ok","data":[],"renew_before_days":21}`, 21},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, tt.body)
+			}))
+			defer server.Close()
+
+			f := New(30 * time.Second)
+			got, err := f.Callback(context.Background(), server.URL, "token", &CallbackRequest{
+				OrderID: 12345,
+				Status:  "success",
+			})
+			if err != nil {
+				t.Fatalf("data 形状不符不应导致回调失败: %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("renew_before_days = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}

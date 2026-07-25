@@ -388,9 +388,11 @@ func DetectApacheCommands() ServerCommands {
 // DetectDockerCommands 构建 Docker 容器内的测试/重载命令
 // 命令通过 `docker exec <容器名> <Web 服务器命令>` 在容器内执行，
 // 容器内 nginx/apache 二进制在标准 PATH 中，无需宿主机路径探测。
-// containerName 为空时返回空命令，表示无法构建（调用方据此判定绑定不可部署）。
+// containerName 为空或不符合 docker 命名规则时返回空命令，表示无法构建
+// （调用方据此判定绑定不可部署）——与 executor 共用同一套容器名规则，
+// 避免拼出必然被执行期白名单拒绝的命令。
 func DetectDockerCommands(serverType ServerType, containerName string) ServerCommands {
-	if containerName == "" {
+	if !executor.IsValidDockerContainerName(containerName) {
 		return ServerCommands{}
 	}
 	prefix := "docker exec " + containerName + " "

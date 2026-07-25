@@ -47,7 +47,7 @@ func mockPaginatedData(certData ...map[string]interface{}) map[string]interface{
 
 // TestNew 测试创建 Fetcher
 func TestNew(t *testing.T) {
-	f := New(30 * time.Second)
+	f := New()
 	if f == nil {
 		t.Fatal("New() returned nil")
 	}
@@ -64,7 +64,7 @@ func TestNewWithRetry(t *testing.T) {
 		MaxWait:     10 * time.Second,
 		Multiplier:  2.0,
 	}
-	f := NewWithRetry(30*time.Second, retryConfig)
+	f := NewWithRetry(retryConfig)
 
 	if f.retryConfig.MaxRetries != 5 {
 		t.Errorf("MaxRetries = %d, want 5", f.retryConfig.MaxRetries)
@@ -93,7 +93,7 @@ func TestInfo(t *testing.T) {
 	}))
 	defer server.Close()
 
-	f := New(30 * time.Second)
+	f := New()
 	ctx := context.Background()
 
 	// 使用 localhost HTTP 应该被允许
@@ -122,7 +122,7 @@ func TestQueryOrder_APIError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	f := New(30 * time.Second)
+	f := New()
 	ctx := context.Background()
 
 	_, _, err := f.QueryOrder(ctx, server.URL, "bad-token", 1)
@@ -142,7 +142,7 @@ func TestQueryOrder_HTTPError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	f := New(30 * time.Second)
+	f := New()
 	ctx := context.Background()
 
 	_, _, err := f.QueryOrder(ctx, server.URL, "token", 1)
@@ -168,7 +168,7 @@ func TestQuery(t *testing.T) {
 	}))
 	defer server.Close()
 
-	f := New(30 * time.Second)
+	f := New()
 	ctx := context.Background()
 
 	data, _, err := f.Query(ctx, server.URL, "token", "test.example.com")
@@ -198,7 +198,7 @@ func TestQueryOrder(t *testing.T) {
 	}))
 	defer server.Close()
 
-	f := New(30 * time.Second)
+	f := New()
 	ctx := context.Background()
 
 	data, _, err := f.QueryOrder(ctx, server.URL, "token", 12345)
@@ -238,7 +238,7 @@ func TestUpdate(t *testing.T) {
 	}))
 	defer server.Close()
 
-	f := New(30 * time.Second)
+	f := New()
 	ctx := context.Background()
 
 	data, _, err := f.Update(ctx, server.URL, "token", 12345, "new-csr", "", "")
@@ -278,7 +278,7 @@ func TestCallback(t *testing.T) {
 	}))
 	defer server.Close()
 
-	f := New(30 * time.Second)
+	f := New()
 	ctx := context.Background()
 
 	req := &CallbackRequest{
@@ -300,7 +300,7 @@ func TestCallbackReadsRenewBeforeDaysFromData(t *testing.T) {
 	}))
 	defer server.Close()
 
-	f := New(30 * time.Second)
+	f := New()
 	got, err := f.Callback(context.Background(), server.URL, "token", &CallbackRequest{
 		OrderID: 12345,
 		Status:  "success",
@@ -324,7 +324,7 @@ func TestCallback_Error(t *testing.T) {
 	}))
 	defer server.Close()
 
-	f := New(30 * time.Second)
+	f := New()
 	ctx := context.Background()
 
 	req := &CallbackRequest{OrderID: 12345, Status: "success"}
@@ -477,7 +477,7 @@ func TestRetry(t *testing.T) {
 		MaxWait:     50 * time.Millisecond,
 		Multiplier:  1.0,
 	}
-	f := NewWithRetry(30*time.Second, retryConfig)
+	f := NewWithRetry(retryConfig)
 	ctx := context.Background()
 
 	_, _, err := f.QueryOrder(ctx, server.URL, "token", 1)
@@ -505,7 +505,7 @@ func TestRetry_ExhaustedRetries(t *testing.T) {
 		MaxWait:     50 * time.Millisecond,
 		Multiplier:  1.0,
 	}
-	f := NewWithRetry(30*time.Second, retryConfig)
+	f := NewWithRetry(retryConfig)
 	ctx := context.Background()
 
 	_, _, err := f.QueryOrder(ctx, server.URL, "token", 1)
@@ -528,7 +528,7 @@ func TestContextCancellation(t *testing.T) {
 	}))
 	defer server.Close()
 
-	f := New(30 * time.Second)
+	f := New()
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 
@@ -584,7 +584,7 @@ func TestResponseSizeLimit(t *testing.T) {
 	}))
 	defer server.Close()
 
-	f := New(30 * time.Second)
+	f := New()
 	ctx := context.Background()
 
 	// 正常响应应该成功
@@ -620,7 +620,7 @@ func TestQueryOrder_Retry(t *testing.T) {
 		MaxWait:     50 * time.Millisecond,
 		Multiplier:  1.0,
 	}
-	f := NewWithRetry(30*time.Second, retryConfig)
+	f := NewWithRetry(retryConfig)
 	ctx := context.Background()
 
 	data, _, err := f.QueryOrder(ctx, server.URL, "token", 12345)
@@ -696,7 +696,7 @@ func TestQueryOrder_RetryBoundary(t *testing.T) {
 				MaxWait:     20 * time.Millisecond,
 				Multiplier:  1.0,
 			}
-			f := NewWithRetry(30*time.Second, retryConfig)
+			f := NewWithRetry(retryConfig)
 			ctx := context.Background()
 
 			_, _, err := f.QueryOrder(ctx, server.URL, "token", 12345)
@@ -713,7 +713,88 @@ func TestQueryOrder_RetryBoundary(t *testing.T) {
 	}
 }
 
-// TestFetcher_Timeout 测试请求超时
+// roundTripperFunc 便于在不发起真实连接的情况下观察 doAttempt 套用的 deadline
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) { return fn(req) }
+
+// TestFetcher_DefaultTimeouts 默认单次请求超时须与 deploy-spec §11 一致，
+// 且不得依赖 client.Timeout（它无法按方法区分，会把 POST 一并压到 GET 的时长）
+func TestFetcher_DefaultTimeouts(t *testing.T) {
+	f := New()
+	if f.getTimeout != 30*time.Second {
+		t.Errorf("getTimeout = %v, 期望 30s", f.getTimeout)
+	}
+	if f.postTimeout != 60*time.Second {
+		t.Errorf("postTimeout = %v, 期望 60s", f.postTimeout)
+	}
+	if f.client.Timeout != 0 {
+		t.Errorf("client.Timeout = %v, 期望 0（超时改由 doAttempt 按方法套用）", f.client.Timeout)
+	}
+}
+
+// TestFetcher_PerRequestDeadline 单次尝试按方法套用超时；父 ctx 更早时以父为准
+func TestFetcher_PerRequestDeadline(t *testing.T) {
+	const okBody = `{"code":1,"msg":"ok","data":{}}`
+
+	newProbe := func(observed *time.Duration) *Fetcher {
+		f := NewWithRetry(RetryConfig{MaxRetries: 0})
+		f.client.Transport = roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			dl, ok := req.Context().Deadline()
+			if !ok {
+				return nil, fmt.Errorf("请求 ctx 没有 deadline")
+			}
+			*observed = time.Until(dl)
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(okBody)),
+				Header:     make(http.Header),
+			}, nil
+		})
+		return f
+	}
+
+	tests := []struct {
+		name       string
+		parent     time.Duration // 0 表示父 ctx 无 deadline
+		post       bool
+		wantBudget time.Duration
+	}{
+		{"GET 无父 deadline 用 30s", 0, false, 30 * time.Second},
+		{"POST 无父 deadline 用 60s", 0, true, 60 * time.Second},
+		{"GET 父 deadline 更早时以父为准", 5 * time.Second, false, 5 * time.Second},
+		{"POST 父 deadline 更早时以父为准", 5 * time.Second, true, 5 * time.Second},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var observed time.Duration
+			f := newProbe(&observed)
+
+			ctx := context.Background()
+			if tt.parent > 0 {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, tt.parent)
+				defer cancel()
+			}
+
+			if tt.post {
+				_, _ = f.Callback(ctx, "http://127.0.0.1:9", "token", &CallbackRequest{OrderID: 1, Status: "success"})
+			} else {
+				_, _, _ = f.QueryOrder(ctx, "http://127.0.0.1:9", "token", 1)
+			}
+
+			if observed == 0 {
+				t.Fatal("transport 未被调用，无法观察 deadline")
+			}
+			if diff := observed - tt.wantBudget; diff > 2*time.Second || diff < -2*time.Second {
+				t.Errorf("单次请求预算 = %v, 期望约 %v", observed.Round(time.Second), tt.wantBudget)
+			}
+		})
+	}
+}
+
+// TestFetcher_Timeout 单次请求超时到期时请求失败（GET 用 getTimeout）
 func TestFetcher_Timeout(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// 模拟慢响应
@@ -723,13 +804,80 @@ func TestFetcher_Timeout(t *testing.T) {
 	}))
 	defer server.Close()
 
-	// 设置很短的超时
-	f := New(100 * time.Millisecond)
-	ctx := context.Background()
+	f := NewWithRetry(RetryConfig{MaxRetries: 0})
+	f.getTimeout = 100 * time.Millisecond
 
-	_, _, err := f.QueryOrder(ctx, server.URL, "token", 1)
+	_, _, err := f.QueryOrder(context.Background(), server.URL, "token", 1)
 	if err == nil {
-		t.Error("QueryOrder() 应因超时而失败")
+		t.Error("QueryOrder() 应因单次请求超时而失败")
+	}
+}
+
+// TestFetcher_PostUsesPostTimeout POST 不受 GET 超时约束（项 K：此前 60s 是死代码，
+// client.Timeout=30s 覆盖整个请求，POST 实际只有 30s）
+func TestFetcher_PostUsesPostTimeout(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(300 * time.Millisecond)
+		_, _ = io.WriteString(w, `{"code":1,"msg":"ok"}`)
+	}))
+	defer server.Close()
+
+	f := NewWithRetry(RetryConfig{MaxRetries: 0})
+	f.getTimeout = 50 * time.Millisecond
+	f.postTimeout = 10 * time.Second
+
+	if _, err := f.Callback(context.Background(), server.URL, "token",
+		&CallbackRequest{OrderID: 1, Status: "success"}); err != nil {
+		t.Errorf("POST 应使用 postTimeout 而非 getTimeout，实际失败: %v", err)
+	}
+}
+
+// TestFetcher_SlowBodyReadWithinBudget 分块慢速返回的响应体必须在单次预算内完整读出。
+// 项 M 回归：此前 per-request ctx 的 cancel 在 doWithRetry 返回时触发，
+// 而调用方在返回之后才读 body，大响应会间歇性 context canceled。
+func TestFetcher_SlowBodyReadWithinBudget(t *testing.T) {
+	// 4 × 8KB 合计 32KB，低于回调响应 64KB 上限，只为让读取跨越多个网络往返
+	padding := strings.Repeat("A", 8*1024)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		flusher, _ := w.(http.Flusher)
+		_, _ = io.WriteString(w, `{"code":1,"msg":"`)
+		for i := 0; i < 4; i++ {
+			_, _ = io.WriteString(w, padding)
+			if flusher != nil {
+				flusher.Flush()
+			}
+			time.Sleep(30 * time.Millisecond)
+		}
+		_, _ = io.WriteString(w, `","data":{}}`)
+	}))
+	defer server.Close()
+
+	f := NewWithRetry(RetryConfig{MaxRetries: 0})
+	if _, err := f.Callback(context.Background(), server.URL, "token",
+		&CallbackRequest{OrderID: 1, Status: "success"}); err != nil {
+		t.Errorf("分块响应体应在单次预算内完整读出，实际失败: %v", err)
+	}
+}
+
+// TestFetcher_ErrorBodyTruncated 可重试失败的响应体只取 1KB，
+// 避免批量查询的 5MB 上限 × 4 次尝试把错误信息本身变成 MB 级字符串
+func TestFetcher_ErrorBodyTruncated(t *testing.T) {
+	huge := strings.Repeat("E", 256*1024)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, huge)
+	}))
+	defer server.Close()
+
+	f := NewWithRetry(RetryConfig{MaxRetries: 0})
+	_, _, err := f.QueryOrder(context.Background(), server.URL, "token", 1)
+	if err == nil {
+		t.Fatal("5xx 应返回错误")
+	}
+	if len(err.Error()) > 4096 {
+		t.Errorf("错误信息长度 = %d，响应体未被截断到 1KB", len(err.Error()))
 	}
 }
 
@@ -742,7 +890,7 @@ func TestFetcher_TimeoutWithContext(t *testing.T) {
 	}))
 	defer server.Close()
 
-	f := New(30 * time.Second)
+	f := New()
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 
@@ -774,7 +922,7 @@ func TestFetcher_LargeResponse(t *testing.T) {
 	}))
 	defer server.Close()
 
-	f := New(30 * time.Second)
+	f := New()
 	ctx := context.Background()
 
 	data, _, err := f.QueryOrder(ctx, server.URL, "token", 1)
@@ -807,7 +955,7 @@ func TestRetry_429TooManyRequests(t *testing.T) {
 		MaxWait:     50 * time.Millisecond,
 		Multiplier:  1.0,
 	}
-	f := NewWithRetry(30*time.Second, retryConfig)
+	f := NewWithRetry(retryConfig)
 	ctx := context.Background()
 
 	_, _, err := f.QueryOrder(ctx, server.URL, "token", 1)
@@ -847,7 +995,7 @@ func TestRetry_NonRetryableErrors(t *testing.T) {
 				MaxWait:     50 * time.Millisecond,
 				Multiplier:  1.0,
 			}
-			f := NewWithRetry(30*time.Second, retryConfig)
+			f := NewWithRetry(retryConfig)
 			ctx := context.Background()
 
 			_, _, err := f.QueryOrder(ctx, server.URL, "token", 1)
@@ -897,7 +1045,7 @@ func TestCertData_Fields(t *testing.T) {
 	}))
 	defer server.Close()
 
-	f := New(30 * time.Second)
+	f := New()
 	ctx := context.Background()
 
 	data, _, err := f.QueryOrder(ctx, server.URL, "token", 1)
@@ -935,7 +1083,7 @@ func TestCallbackNew(t *testing.T) {
 	}))
 	defer server.Close()
 
-	f := New(30 * time.Second)
+	f := New()
 	ctx := context.Background()
 
 	req := &CallbackRequest{
@@ -969,7 +1117,7 @@ func TestUpdate_WithDomains(t *testing.T) {
 	}))
 	defer server.Close()
 
-	f := New(30 * time.Second)
+	f := New()
 	ctx := context.Background()
 
 	_, _, err := f.Update(ctx, server.URL, "token", 12345, "csr", "example.com,www.example.com", "http")
@@ -1084,7 +1232,7 @@ func TestQueryBatch(t *testing.T) {
 	}))
 	defer server.Close()
 
-	f := New(30 * time.Second)
+	f := New()
 	ctx := context.Background()
 
 	// 测试无参数查询
@@ -1148,7 +1296,7 @@ func TestQueryBatch_Pagination(t *testing.T) {
 	}))
 	defer server.Close()
 
-	f := New(30 * time.Second)
+	f := New()
 	ctx := context.Background()
 
 	certs, _, err := f.QueryBatch(ctx, server.URL, "token", "")
@@ -1171,7 +1319,7 @@ func TestQueryBatch_APIError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	f := NewWithRetry(30*time.Second, RetryConfig{MaxRetries: 0})
+	f := NewWithRetry(RetryConfig{MaxRetries: 0})
 	ctx := context.Background()
 
 	_, _, err := f.QueryBatch(ctx, server.URL, "bad-token", "")
@@ -1185,7 +1333,7 @@ func TestQueryBatch_APIError(t *testing.T) {
 
 // TestQueryBatch_ExceedsLimit 批量查询超过 100 项上限
 func TestQueryBatch_ExceedsLimit(t *testing.T) {
-	f := NewWithRetry(30*time.Second, RetryConfig{MaxRetries: 0})
+	f := NewWithRetry(RetryConfig{MaxRetries: 0})
 	ctx := context.Background()
 
 	// 构造 101 项查询
@@ -1302,7 +1450,7 @@ func TestQueryOrder_RenewBeforeDays(t *testing.T) {
 	}))
 	defer server.Close()
 
-	f := New(30 * time.Second)
+	f := New()
 	ctx := context.Background()
 
 	_, renewBeforeDays, err := f.QueryOrder(ctx, server.URL, "token", 12345)
@@ -1331,7 +1479,7 @@ func TestQuery_RenewBeforeDays(t *testing.T) {
 	}))
 	defer server.Close()
 
-	f := New(30 * time.Second)
+	f := New()
 	ctx := context.Background()
 
 	_, renewBeforeDays, err := f.Query(ctx, server.URL, "token", "example.com")
@@ -1360,7 +1508,7 @@ func TestQueryBatch_RenewBeforeDays(t *testing.T) {
 	}))
 	defer server.Close()
 
-	f := New(30 * time.Second)
+	f := New()
 	ctx := context.Background()
 
 	_, renewBeforeDays, err := f.QueryBatch(ctx, server.URL, "token", "")
@@ -1422,7 +1570,7 @@ func TestToggleAutoReissue(t *testing.T) {
 			}))
 			defer server.Close()
 
-			f := New(30 * time.Second)
+			f := New()
 			ctx := context.Background()
 
 			renewBeforeDays, err := f.ToggleAutoReissue(ctx, server.URL, "test-token", tt.orderID, tt.autoReissue)
@@ -1444,7 +1592,7 @@ func TestToggleAutoReissue_APIError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	f := NewWithRetry(30*time.Second, RetryConfig{MaxRetries: 0})
+	f := NewWithRetry(RetryConfig{MaxRetries: 0})
 	ctx := context.Background()
 
 	_, err := f.ToggleAutoReissue(ctx, server.URL, "token", 12345, true)
@@ -1463,7 +1611,7 @@ func TestToggleAutoReissue_HTTPError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	f := NewWithRetry(30*time.Second, RetryConfig{MaxRetries: 0})
+	f := NewWithRetry(RetryConfig{MaxRetries: 0})
 	ctx := context.Background()
 
 	_, err := f.ToggleAutoReissue(ctx, server.URL, "bad-token", 12345, true)
@@ -1495,7 +1643,7 @@ func TestCallbackToleratesNonObjectData(t *testing.T) {
 			}))
 			defer server.Close()
 
-			f := New(30 * time.Second)
+			f := New()
 			got, err := f.Callback(context.Background(), server.URL, "token", &CallbackRequest{
 				OrderID: 12345,
 				Status:  "success",

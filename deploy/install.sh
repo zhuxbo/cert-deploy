@@ -550,8 +550,16 @@ install_service() {
     case "$INIT_SYSTEM" in
         systemd)
             if [ -f /etc/systemd/system/sslctl.service ]; then
-                # 升级：重启服务加载新二进制
-                systemctl restart sslctl 2>/dev/null && echo_info "已重启 systemd 服务" || true
+                # 升级：先重载 unit（本次升级可能改了 unit 内容），再重启加载新二进制。
+                # 失败必须可见：静默吞掉会让用户以为升级成功，实际仍跑着旧二进制。
+                if ! systemctl daemon-reload; then
+                    echo_warn "systemctl daemon-reload 失败，unit 变更可能未生效"
+                fi
+                if systemctl restart sslctl; then
+                    echo_info "已重启 systemd 服务"
+                else
+                    echo_warn "重启 systemd 服务失败，新版本尚未生效，请执行 systemctl status sslctl 查看原因"
+                fi
             else
                 cat > /etc/systemd/system/sslctl.service << EOF
 [Unit]
@@ -584,7 +592,11 @@ EOF
             ;;
         openrc)
             if [ -f /etc/init.d/sslctl ]; then
-                rc-service sslctl restart 2>/dev/null && echo_info "已重启 OpenRC 服务" || true
+                if rc-service sslctl restart; then
+                    echo_info "已重启 OpenRC 服务"
+                else
+                    echo_warn "重启 OpenRC 服务失败，新版本尚未生效，请执行 rc-service sslctl status 查看原因"
+                fi
             else
                 cat > /etc/init.d/sslctl << 'EOF'
 #!/sbin/openrc-run
@@ -610,7 +622,11 @@ EOF
             ;;
         sysvinit)
             if [ -f /etc/init.d/sslctl ]; then
-                /etc/init.d/sslctl restart 2>/dev/null && echo_info "已重启 SysVinit 服务" || true
+                if /etc/init.d/sslctl restart; then
+                    echo_info "已重启 SysVinit 服务"
+                else
+                    echo_warn "重启 SysVinit 服务失败，新版本尚未生效，请执行 /etc/init.d/sslctl status 查看原因"
+                fi
             else
                 cat > /etc/init.d/sslctl << 'EOF'
 #!/bin/sh

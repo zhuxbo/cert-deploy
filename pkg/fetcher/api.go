@@ -207,10 +207,19 @@ func renewBeforeDaysFromData(data json.RawMessage) int {
 	return payload.RenewBeforeDays
 }
 
+// 单次请求超时（deploy-spec §11）：GET 30s、POST 60s。
+// 不再使用 http.Client.Timeout——它是覆盖整个请求的单一上限，
+// 无法按方法区分，且会把 POST 一并压到 GET 的时长上。
+const (
+	defaultGetTimeout  = 30 * time.Second
+	defaultPostTimeout = 60 * time.Second
+)
+
 // Fetcher 证书获取器
 type Fetcher struct {
 	client      *http.Client
-	postTimeout time.Duration // POST 请求超时（默认 60s），GET 使用 client.Timeout（默认 30s）
+	getTimeout  time.Duration
+	postTimeout time.Duration
 	retryConfig RetryConfig
 }
 
@@ -219,7 +228,10 @@ type Fetcher struct {
 // - 连接池复用与 HTTP/2
 // - 合理的连接/空闲超时
 // - DNS Rebinding 防护：在 TCP 连接时二次校验目标 IP
-func New(timeout time.Duration) *Fetcher {
+//
+// 超时统一在 doAttempt 内按方法套用（含响应体读取），client 本身不设 Timeout；
+// 新增的请求路径必须走 doWithRetry，直连 f.client.Do 将完全没有超时保护。
+func New() *Fetcher {
 	dialer := &net.Dialer{
 		Timeout:   10 * time.Second,
 		KeepAlive: 30 * time.Second,
@@ -236,8 +248,9 @@ func New(timeout time.Duration) *Fetcher {
 		ForceAttemptHTTP2:   true,
 	}
 	return &Fetcher{
-		client:      &http.Client{Timeout: timeout, Transport: transport},
-		postTimeout: 60 * time.Second,
+		client:      &http.Client{Transport: transport},
+		getTimeout:  defaultGetTimeout,
+		postTimeout: defaultPostTimeout,
 		retryConfig: DefaultRetryConfig,
 	}
 }
@@ -309,8 +322,8 @@ func validateIPForSSRF(ip net.IP) error {
 }
 
 // NewWithRetry 创建带自定义重试配置的 Fetcher
-func NewWithRetry(timeout time.Duration, retryConfig RetryConfig) *Fetcher {
-	f := New(timeout)
+func NewWithRetry(retryConfig RetryConfig) *Fetcher {
+	f := New()
 	f.retryConfig = retryConfig
 	return f
 }
@@ -342,47 +355,73 @@ func isRetryable(err error, statusCode int) bool {
 	return false
 }
 
-// doWithRetry 带重试的 HTTP 请求
-func (f *Fetcher) doWithRetry(ctx context.Context, newRequest func() (*http.Request, error)) (*http.Response, error) {
+// errorBodyLimit 非 200 响应体的读取上限。
+// 这类响应体只用于拼错误信息：批量查询的 5MB 上限 × 最多 4 次尝试会让 lastErr
+// 本身变成 MB 级字符串，一路流进日志与回调 message 的脱敏正则。
+const errorBodyLimit = 1024
+
+// attemptTimeout 返回单次尝试的超时（deploy-spec §11）
+func (f *Fetcher) attemptTimeout(method string) time.Duration {
+	if method == http.MethodPost {
+		return f.postTimeout
+	}
+	return f.getTimeout
+}
+
+// doAttempt 执行单次请求，并在同一超时作用域内读完响应体。
+// per-request 超时覆盖连接、首字节与响应体读取全过程，与父 ctx deadline 取更早者
+// （context.WithTimeout 语义）。返回时响应体已关闭，调用方不再持有 *http.Response。
+func (f *Fetcher) doAttempt(req *http.Request, maxBodySize int64) (int, []byte, error) {
+	ctx, cancel := context.WithTimeout(req.Context(), f.attemptTimeout(req.Method))
+	defer cancel()
+
+	resp, err := f.client.Do(req.WithContext(ctx))
+	if err != nil {
+		// Go http.Client.Do 规范保证 err != nil 时 resp == nil
+		return 0, nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	limit := maxBodySize
+	if resp.StatusCode != http.StatusOK {
+		limit = errorBodyLimit
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, limit))
+	if err != nil {
+		return resp.StatusCode, nil, err
+	}
+	return resp.StatusCode, body, nil
+}
+
+// doWithRetry 带重试的 HTTP 请求，返回状态码与已读取的响应体。
+// 响应体在 per-request 超时到期前读完（否则 deadline 会在调用方读 body 时才触发），
+// 且由本函数负责关闭——调用方不再持有 *http.Response。
+func (f *Fetcher) doWithRetry(ctx context.Context, newRequest func() (*http.Request, error), maxBodySize int64) (int, []byte, error) {
 	var lastErr error
 
 	for attempt := 0; attempt <= f.retryConfig.MaxRetries; attempt++ {
 		req, err := newRequest()
 		if err != nil {
-			return nil, err
+			return 0, nil, err
 		}
 
-		// POST 请求使用更长超时（spec: GET 30s, POST 60s）
-		if req.Method == http.MethodPost && f.postTimeout > 0 {
-			if _, hasDeadline := req.Context().Deadline(); !hasDeadline {
-				postCtx, cancel := context.WithTimeout(req.Context(), f.postTimeout)
-				req = req.WithContext(postCtx)
-				defer cancel()
-			}
+		statusCode, body, err := f.doAttempt(req, maxBodySize)
+
+		// 请求成功且不需要重试，返回状态码与响应体
+		if err == nil && !isRetryable(nil, statusCode) {
+			return statusCode, body, nil
 		}
 
-		resp, err := f.client.Do(req)
-
-		// 请求成功且不需要重试，返回响应（由调用者关闭 Body）
-		if err == nil && !isRetryable(nil, resp.StatusCode) {
-			return resp, nil
-		}
-
-		// 记录错误并确保关闭响应体
-		var statusCode int
 		if err != nil {
-			// 网络错误：Go http.Client.Do 规范保证 err != nil 时 resp == nil
+			// 网络错误或响应体读取中断：读取失败同样按可重试处理，
+			// 否则一次连接中断就会变成 JSON 解析失败并终止整条链路
 			lastErr = err
-		} else {
+			statusCode = 0
+		} else if len(body) > 0 {
 			// HTTP 错误但需要重试（5xx、429 等）
-			statusCode = resp.StatusCode
-			body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-			_ = resp.Body.Close() // 必须关闭，防止连接泄漏
-			if len(body) > 0 {
-				lastErr = fmt.Errorf("HTTP %d: %s", statusCode, string(body))
-			} else {
-				lastErr = fmt.Errorf("HTTP %d", statusCode)
-			}
+			lastErr = fmt.Errorf("HTTP %d: %s", statusCode, string(body))
+		} else {
+			lastErr = fmt.Errorf("HTTP %d", statusCode)
 		}
 
 		// 最后一次尝试不等待
@@ -413,27 +452,22 @@ func (f *Fetcher) doWithRetry(ctx context.Context, newRequest func() (*http.Requ
 
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return 0, nil, ctx.Err()
 		case <-time.After(sleepTime):
 		}
 	}
 
-	return nil, lastErr
+	return 0, nil, lastErr
 }
 
 // doAPICallBatch 批量查询的 API 调用流程，返回证书列表、总数和 renewBeforeDays
 func (f *Fetcher) doAPICallBatch(ctx context.Context, newRequest func() (*http.Request, error), errMsg string) ([]CertData, int, int, error) {
-	resp, err := f.doWithRetry(ctx, newRequest)
+	statusCode, body, err := f.doWithRetry(ctx, newRequest, batchMaxResponseSize)
 	if err != nil {
 		return nil, 0, 0, errors.NewNetworkError(errMsg, err)
 	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return nil, 0, 0, errors.NewNetworkError(fmt.Sprintf("unexpected status code: %d", resp.StatusCode), nil)
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, batchMaxResponseSize))
-	if err != nil {
-		return nil, 0, 0, errors.NewNetworkError("failed to read response body", err)
+	if statusCode != http.StatusOK {
+		return nil, 0, 0, errors.NewNetworkError(fmt.Sprintf("unexpected status code: %d", statusCode), nil)
 	}
 	var apiResp APIResponse
 	if err := json.Unmarshal(body, &apiResp); err != nil {
@@ -475,18 +509,13 @@ func (f *Fetcher) Callback(ctx context.Context, callbackURL, token string, callb
 		return httpReq, nil
 	}
 
-	resp, err := f.doWithRetry(ctx, newRequest)
+	const maxResponseSize = 64 * 1024 // 64KB 足够回调响应
+	statusCode, body, err := f.doWithRetry(ctx, newRequest, maxResponseSize)
 	if err != nil {
 		return 0, errors.NewNetworkError("failed to send callback", err)
 	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return 0, errors.NewNetworkError(fmt.Sprintf("callback returned unexpected status: %d", resp.StatusCode), nil)
-	}
-	const maxResponseSize = 64 * 1024 // 64KB 足够回调响应
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseSize))
-	if err != nil {
-		return 0, errors.NewNetworkError("failed to read callback response", err)
+	if statusCode != http.StatusOK {
+		return 0, errors.NewNetworkError(fmt.Sprintf("callback returned unexpected status: %d", statusCode), nil)
 	}
 	var callbackResp CallbackResponse
 	if err := json.Unmarshal(body, &callbackResp); err != nil {
@@ -588,17 +617,12 @@ func (f *Fetcher) Update(ctx context.Context, baseURL, token string, orderID int
 		return req, nil
 	}
 
-	resp, err := f.doWithRetry(ctx, newRequest)
+	statusCode, body, err := f.doWithRetry(ctx, newRequest, defaultMaxResponseSize)
 	if err != nil {
 		return nil, 0, errors.NewNetworkError("failed to update certificate", err)
 	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return nil, 0, errors.NewNetworkError(fmt.Sprintf("unexpected status code: %d", resp.StatusCode), nil)
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, defaultMaxResponseSize))
-	if err != nil {
-		return nil, 0, errors.NewNetworkError("failed to read response body", err)
+	if statusCode != http.StatusOK {
+		return nil, 0, errors.NewNetworkError(fmt.Sprintf("unexpected status code: %d", statusCode), nil)
 	}
 	var apiResp APIResponse
 	if err := json.Unmarshal(body, &apiResp); err != nil {
@@ -707,17 +731,12 @@ func (f *Fetcher) ToggleAutoReissue(ctx context.Context, baseURL, token string, 
 		return req, nil
 	}
 
-	resp, err := f.doWithRetry(ctx, newRequest)
+	statusCode, body, err := f.doWithRetry(ctx, newRequest, defaultMaxResponseSize)
 	if err != nil {
 		return 0, errors.NewNetworkError("failed to toggle auto reissue", err)
 	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return 0, errors.NewNetworkError(fmt.Sprintf("unexpected status code: %d", resp.StatusCode), nil)
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, defaultMaxResponseSize))
-	if err != nil {
-		return 0, errors.NewNetworkError("failed to read response body", err)
+	if statusCode != http.StatusOK {
+		return 0, errors.NewNetworkError(fmt.Sprintf("unexpected status code: %d", statusCode), nil)
 	}
 	var apiResp APIResponse
 	if err := json.Unmarshal(body, &apiResp); err != nil {

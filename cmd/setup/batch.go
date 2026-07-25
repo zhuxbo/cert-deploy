@@ -56,7 +56,7 @@ func runBatch(p *setupParams, query string) {
 
 	// 2/7: 查询证书
 	fmt.Println("\n步骤 2/7: 查询证书...")
-	f := fetcher.New(30 * time.Second)
+	f := fetcher.New()
 	certList, renewBeforeDays, err := f.QueryBatch(p.ctx, p.apiURL, p.token, query)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "查询证书失败: %v\n", err)

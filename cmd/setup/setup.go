@@ -192,7 +192,7 @@ func runSingle(p *setupParams, orderID int) {
 
 	// 2. 获取证书信息
 	fmt.Println("\n步骤 2/7: 获取证书信息...")
-	f := fetcher.New(30 * time.Second)
+	f := fetcher.New()
 	certData, renewBeforeDays, err := f.QueryOrder(p.ctx, p.apiURL, p.token, orderID)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "查询订单失败: %v\n", err)

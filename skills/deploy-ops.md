@@ -197,6 +197,17 @@ sudo journalctl -u sslctl -f
 
 认证：`Authorization: Bearer {deploy_token}`
 
+### 超时与重试（`pkg/fetcher`）
+
+- **单次尝试超时按方法套用**（deploy-spec §11）：GET 30s、POST 60s，与父 ctx deadline 取更早者。
+  不使用 `http.Client.Timeout`——它是覆盖整个请求的单一上限、无法按方法区分，会把 POST 一并压到 GET 的时长。
+- **超时作用域覆盖响应体读取**：`doAttempt` 在同一超时内读完 body 并关闭响应，`doWithRetry` 返回 `(statusCode, body, error)`，
+  调用方**不再持有 `*http.Response`**。新增请求路径必须走 `doWithRetry`，直连 `f.client.Do` 将完全没有超时保护。
+- **响应体上限分级**：仅 `200` 按调用方给定的 `maxBodySize` 读（批量 5MB / 一般 512KB / 回调 64KB）；
+  非 200 一律限 1KB，避免 5MB × 最多 4 次尝试让错误信息本身变成 MB 级字符串流进日志与回调 `message` 的脱敏正则。
+- **响应体读取中断按可重试处理**：一次连接中断不应直接变成 JSON 解析失败并终止整条链路。
+- 退避：最多 3 次重试，指数退避 1s→2s→4s，带 ±25% 抖动。
+
 ### POST 请求参数
 
 ```json
@@ -287,6 +298,7 @@ sslctl                    Manager API                    CA
 - **幽灵失败绑定不上报**：`failed_bindings` 与启用绑定交集为空时一个绑定都未重试，不报 success、不发回调。
 - **绑定重试触顶**：仅"确实发生了部署且仍失败"的出口上报一次带「绑定重试已达上限」标注的 failure；查询失败、私钥不可读等未发生部署的出口按 deploy-spec §2.8 触顶静默；证书处于 `processing` 不计入配额也不上报。
 - **手动 `sslctl deploy` 上报一次部署结果**（deploy-spec §5.1 步骤 6）：CLI 无 deadline，回调显式限定 `certops.CallbackFallbackBudget`（90s）。
+- **回调脱离取消传播**（`certops.callbackContext`）：回调是部署结果的唯一出口，父 ctx 取消（daemon SIGTERM、检查超时）时沿用会让整轮结果凭空消失，因此基于 `context.WithoutCancel` 重建，并按四条分支定预算——已取消 → 90s 兜底（**必须先于余量判断**，`cancel()` 不改变 deadline，此时父预算余量可能仍有几十分钟）；余量 ≤90s → 90s 兜底；余量充裕 → 保留父 deadline；无 deadline → 不设限，由单次请求超时与重试上限兜底。90s ≈ 一次完整 POST + 约 1s 退避 + 被截断的第二次尝试，daemon 60s 关停预算可能将其截断。
 - **已知偏离**：`retryFailedBindings` 的 `QueryOrder` 失败出口在未发生部署时仍报 failure（查询失败不是部署结果，与 deploy-spec §2.8 不符），本次维持现状不扩大——触顶后停止；`cmd/setup` 目前不发部署回调，待项 I-b 落地后移除本条。
 
 ### 部署链语义（setup/deploy/续签）
@@ -411,6 +423,8 @@ sslctl                    Manager API                    CA
 - **单证书 panic 隔离**：续签循环中单证书处理 panic 记为该证书 failure（Error 日志 + 计入统计），不拖垮整轮。
 - **多证书续签间隔**：每个证书处理后随机延迟 30~90 秒，分散 API 请求压力。
 - **证书过期告警**（守护进程 `CheckExpiry` 周期检查）：剩余不足 7 天输出 Error，不足 13 天输出 Warn，已过期输出 Error（阈值来自 `pkg/certops/service.go` 的 `7*24h`/`13*24h`）。
+  该告警以 `defer` 覆盖 `checkAndDeploy` 的**全部**出口——未取到续签锁、`CheckAndRenewAll` 出错时同样告警，否则"另一个进程在跑"与"API 持续失败"会连告警一起静默，恰是最需要告警的场景。
+  `CheckAndRenewAll` 被取消时会连同已完成证书的结果一起返回，daemon 先输出统计再报错，不丢这批结果。
 - **尝试次数上限**：签发与部署分别计数，各自达到 10 次即进入 `CAPPED`，静默停止并等待人工处理（不发送回调；部署成功——含手动 `sslctl deploy`——会清零计数并解除停机）。
 - **零启用绑定阻断**（`no_binding_blocked_at`，metadata 平台扩展字段）：证书 enabled 却无任何启用绑定（站点被改绑到其它证书、人工禁用、改名孤儿条目）时退出自动流程——**不发起任何 API 请求**、不部署、不计数、不回调，落标记等待人工处理；恢复启用绑定或重跑 setup 后自动解除，**计数不复位**。闸门内部先跑纯本地判定：已过期仍转 `EXPIRED`、部署触顶仍转 `CAPPED`（deploy-spec §3.2）。
 - **零绑定 + 在途签发无终止态**：闸门命中且 `last_issue_state` 为 `processing`/`active` 时不会进入任何终止态，在途订单与 `pending-keys/` 私钥会滞留至人工处理（日志会额外标注）。

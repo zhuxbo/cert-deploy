@@ -218,6 +218,11 @@ func checkAndDeploy(parentCtx context.Context, svc *certops.Service, cfgManager 
 		}
 	}()
 
+	// 过期告警必须覆盖全部早退路径：未取到锁、续签出错时同样要告警。
+	// 否则"另一个进程在跑"或"API 持续失败"会连同过期告警一起静默——
+	// 恰是最需要告警的场景。注册在锁之前，出口顺序为 release → CheckExpiry。
+	defer svc.CheckExpiry()
+
 	// 进程级文件锁：防止 cron 重叠、手动 deploy/setup 与 daemon 并发（共享同一把锁）
 	release, acquired, lockErr := config.AcquireRenewalLock(cfgManager.GetWorkDir())
 	if lockErr != nil {
@@ -242,12 +247,9 @@ func checkAndDeploy(parentCtx context.Context, svc *certops.Service, cfgManager 
 	log.Info("开始检查证书...")
 
 	results, err := svc.CheckAndRenewAll(ctx)
-	if err != nil {
-		log.Error("检查证书失败: %v", err)
-		return
-	}
 
-	// 输出结果统计
+	// 先输出统计再报错：CheckAndRenewAll 在检查超时/被取消时会连同
+	// 已完成证书的结果一起返回，直接 return 会把这批结果丢掉
 	var successCount, failedCount, pendingCount int
 	for _, r := range results {
 		switch r.Status {
@@ -269,6 +271,7 @@ func checkAndDeploy(parentCtx context.Context, svc *certops.Service, cfgManager 
 		log.Info("检查完成: 无需续签的证书")
 	}
 
-	// 检查证书过期告警
-	svc.CheckExpiry()
+	if err != nil {
+		log.Error("检查证书失败: %v", err)
+	}
 }

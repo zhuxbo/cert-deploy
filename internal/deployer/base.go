@@ -2,6 +2,7 @@
 package deployer
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -461,9 +462,17 @@ func (b *Base) TestAndReloadForRollback() error {
 	return nil
 }
 
+// processProbeTimeout 单次进程探测超时。
+// tasklist 在 WMI 异常或域环境下可能长时间不返回，而它被重载等待循环反复调用，
+// 无超时会让整个部署卡死在这里。
+const processProbeTimeout = 5 * time.Second
+
 // isProcessRunning 检测指定名称的进程是否仍在运行（Windows）
 func isProcessRunning(name string) bool {
-	out, err := exec.Command("tasklist", "/FI", fmt.Sprintf("IMAGENAME eq %s", name), "/NH").Output()
+	ctx, cancel := context.WithTimeout(context.Background(), processProbeTimeout)
+	defer cancel()
+
+	out, err := exec.CommandContext(ctx, "tasklist", "/FI", fmt.Sprintf("IMAGENAME eq %s", name), "/NH").Output()
 	if err != nil {
 		return false
 	}

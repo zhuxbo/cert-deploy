@@ -25,9 +25,32 @@ type Service struct {
 func NewService(cfgManager *config.ConfigManager, log *logger.Logger) *Service {
 	return &Service{
 		cfgManager: cfgManager,
-		fetcher:    fetcher.New(30 * time.Second),
+		fetcher:    fetcher.New(),
 		backupMgr:  backup.NewManager(cfgManager.GetBackupDir(), 5),
 		log:        log,
+	}
+}
+
+// callbackContext 返回发送回调用的上下文。
+// 回调是部署结果的唯一出口：父 ctx 被取消（daemon 收到 SIGTERM、检查超时）时
+// 直接沿用会让整轮部署结果凭空消失，服务端停留在上一次状态。
+// 因此脱离取消传播，但仍保留一个有界预算，避免关停时无限期挂住。
+func callbackContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	base := context.WithoutCancel(ctx)
+	dl, hasDeadline := ctx.Deadline()
+	switch {
+	case ctx.Err() != nil:
+		// 已取消：cancel() 不改变 deadline，此时父预算余量可能仍很大，
+		// 必须先于余量判断，否则会落进"保留父预算"分支
+		return context.WithTimeout(base, CallbackFallbackBudget)
+	case hasDeadline && time.Until(dl) <= CallbackFallbackBudget:
+		return context.WithTimeout(base, CallbackFallbackBudget)
+	case hasDeadline:
+		// 父预算充裕：不缩小，按原 deadline 走
+		return context.WithDeadline(base, dl)
+	default:
+		// 无 deadline（CLI 场景）：由 fetcher 的单次请求超时与重试上限兜底
+		return context.WithCancel(base)
 	}
 }
 
@@ -39,7 +62,10 @@ func (s *Service) sendCallback(ctx context.Context, api config.APIConfig, req *f
 		return 0
 	}
 
-	renewBeforeDays, err := s.fetcher.CallbackNew(ctx, api.URL, api.Token, req)
+	cbCtx, cancel := callbackContext(ctx)
+	defer cancel()
+
+	renewBeforeDays, err := s.fetcher.CallbackNew(cbCtx, api.URL, api.Token, req)
 
 	if err != nil {
 		s.log.Warn("回调发送失败（不影响结果）: %v", err)

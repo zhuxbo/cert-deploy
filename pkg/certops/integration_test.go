@@ -203,7 +203,7 @@ func matchDomain(expect, candidate string) bool {
 func TestIntegration_FetcherInfo(t *testing.T) {
 	apiURL, token := getTestAPIConfig(t)
 
-	f := fetcher.New(30 * time.Second)
+	f := fetcher.New()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
@@ -229,7 +229,7 @@ func TestIntegration_DomainMatch(t *testing.T) {
 	apiURL, token := getTestAPIConfig(t)
 	expectDomain := getTestAPIDomain(t)
 
-	f := fetcher.New(30 * time.Second)
+	f := fetcher.New()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
@@ -252,7 +252,7 @@ func TestIntegration_QueryByDomain(t *testing.T) {
 	apiURL, token := getTestAPIConfig(t)
 	expectDomain := getTestAPIDomain(t)
 
-	f := fetcher.New(30 * time.Second)
+	f := fetcher.New()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
@@ -278,7 +278,7 @@ func TestIntegration_UpdateWithCSR(t *testing.T) {
 	apiURL, token := getTestAPIConfig(t)
 	expectDomain := getTestAPIDomain(t)
 
-	f := fetcher.New(30 * time.Second)
+	f := fetcher.New()
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
@@ -327,7 +327,7 @@ func TestIntegration_CallbackNew(t *testing.T) {
 	requireCallbackAccess(t)
 	apiURL, token := getTestAPIConfig(t)
 
-	f := fetcher.New(30 * time.Second)
+	f := fetcher.New()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
@@ -354,7 +354,7 @@ func TestIntegration_CallbackNew(t *testing.T) {
 func TestIntegration_QueryOrder(t *testing.T) {
 	apiURL, token := getTestAPIConfig(t)
 
-	f := fetcher.New(30 * time.Second)
+	f := fetcher.New()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
@@ -393,7 +393,7 @@ func TestIntegration_QueryOrder(t *testing.T) {
 func TestIntegration_DeployToLocal(t *testing.T) {
 	apiURL, token := getTestAPIConfig(t)
 
-	f := fetcher.New(30 * time.Second)
+	f := fetcher.New()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
@@ -502,7 +502,7 @@ func TestIntegration_FullDeployWorkflow(t *testing.T) {
 	// API 配置直接写入证书级别（见下方 cert 定义）
 
 	// 获取证书信息确定 OrderID
-	f := fetcher.New(30 * time.Second)
+	f := fetcher.New()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
@@ -610,7 +610,7 @@ func TestIntegration_ScanAndDeploy(t *testing.T) {
 func TestIntegration_APIResponseParsing(t *testing.T) {
 	apiURL, token := getTestAPIConfig(t)
 
-	f := fetcher.New(30 * time.Second)
+	f := fetcher.New()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
@@ -661,7 +661,7 @@ func TestIntegration_APIResponseParsing(t *testing.T) {
 func TestIntegration_DeployWithBackup(t *testing.T) {
 	apiURL, token := getTestAPIConfig(t)
 
-	f := fetcher.New(30 * time.Second)
+	f := fetcher.New()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
@@ -736,7 +736,7 @@ func TestIntegration_PreparePullRenew(t *testing.T) {
 	svc := NewService(cm, log)
 
 	// 先获取订单信息
-	f := fetcher.New(30 * time.Second)
+	f := fetcher.New()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
@@ -804,7 +804,7 @@ func TestIntegration_CheckAndRenewAll(t *testing.T) {
 	// API 配置在证书级别设置
 
 	// 先获取订单信息
-	f := fetcher.New(30 * time.Second)
+	f := fetcher.New()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
@@ -884,7 +884,7 @@ func TestIntegration_RenewWithLocalKey(t *testing.T) {
 	_ = cm.Save(cfg)
 
 	// 先获取订单信息
-	f := fetcher.New(30 * time.Second)
+	f := fetcher.New()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 

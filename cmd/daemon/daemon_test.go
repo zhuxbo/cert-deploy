@@ -4,6 +4,9 @@ package daemon
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -48,6 +51,66 @@ func TestCheckAndDeploy_WithContext(t *testing.T) {
 
 	// 应该能够处理取消的上下文
 	checkAndDeploy(ctx, svc, cfgManager, log)
+}
+
+// TestCheckAndDeploy_ExpiryAlertOnLockContention 未取到续签锁时仍必须输出过期告警。
+// 改动前 CheckExpiry 只在正常结束路径调用，"另一个进程在跑"与"续签出错"
+// 这两条早退会连过期告警一起静默——恰是最需要告警的场景。
+func TestCheckAndDeploy_ExpiryAlertOnLockContention(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgManager, err := config.NewConfigManagerWithDir(tmpDir)
+	if err != nil {
+		t.Fatalf("创建配置管理器失败: %v", err)
+	}
+
+	cfg, err := cfgManager.Load()
+	if err != nil {
+		t.Fatalf("加载配置失败: %v", err)
+	}
+	cfg.Certificates = []config.CertConfig{{
+		CertName: "expiring-cert",
+		OrderID:  1,
+		Enabled:  true,
+		Bindings: []config.SiteBinding{{ServerName: "example.com", Enabled: true}},
+		Metadata: config.CertMetadata{CertExpiresAt: time.Now().Add(3 * 24 * time.Hour)},
+	}}
+	if err := cfgManager.Save(cfg); err != nil {
+		t.Fatalf("保存配置失败: %v", err)
+	}
+
+	// 先占住续签锁，模拟另一个进程正在续签
+	release, acquired, err := config.AcquireRenewalLock(tmpDir)
+	if err != nil || !acquired {
+		t.Fatalf("测试无法先占住续签锁: acquired=%v err=%v", acquired, err)
+	}
+	defer release()
+
+	logDir := filepath.Join(tmpDir, "logs")
+	log, err := logger.New(logDir, "daemon-test")
+	if err != nil {
+		t.Fatalf("创建日志器失败: %v", err)
+	}
+	svc := certops.NewService(cfgManager, log)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	checkAndDeploy(ctx, svc, cfgManager, log)
+
+	entries, err := os.ReadDir(logDir)
+	if err != nil {
+		t.Fatalf("读取日志目录失败: %v", err)
+	}
+	var combined string
+	for _, e := range entries {
+		data, readErr := os.ReadFile(filepath.Join(logDir, e.Name()))
+		if readErr != nil {
+			t.Fatalf("读取日志文件失败: %v", readErr)
+		}
+		combined += string(data)
+	}
+	if !strings.Contains(combined, "expiring-cert") {
+		t.Errorf("未取到锁的早退路径缺少过期告警，日志内容:\n%s", combined)
+	}
 }
 
 // TestNextRandomDaily 测试随机每日延迟

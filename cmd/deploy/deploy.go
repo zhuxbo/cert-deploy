@@ -96,7 +96,7 @@ func Run(args []string, version, buildTime string, debug bool) {
 	}
 
 	ctx := context.Background()
-	f := fetcher.New(30 * time.Second)
+	f := fetcher.New()
 	backupMgr := backup.NewManager(cfgManager.GetBackupDir(), 5)
 
 	if *all {

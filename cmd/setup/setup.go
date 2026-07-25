@@ -425,7 +425,12 @@ func runSingle(p *setupParams, orderID int) {
 
 	// 部署到每个绑定（跳过因 SSL 配置安装失败而被禁用的绑定，计为失败而非误报成功）
 	svc := certops.NewService(p.cfgManager, p.log)
-	successCount, failCount, failedSites := deploySingleBindings(p.ctx, svc, bindings, certData, privateKey)
+	successCount, failedSites, retryableSites := deploySingleBindings(p.ctx, svc, bindings, certData, privateKey)
+	failCount := len(failedSites) + len(retryableSites)
+
+	// 上报部署结果（deploy-spec §5.1 步骤 6）。必须在全失败退出之前——
+	// 全失败恰是服务端最需要知道的情形，放到保存之后会被 os.Exit(1) 整个跳过。
+	sendSetupDeployCallback(p, f, orderID, successCount, failCount)
 
 	// 全部失败时退出
 	if successCount == 0 && failCount > 0 {
@@ -443,6 +448,11 @@ func runSingle(p *setupParams, orderID int) {
 	certConfig.Metadata.CertExpiresAt = parsedCert.NotAfter
 	certConfig.Metadata.CertSerial = fmt.Sprintf("%X", parsedCert.SerialNumber)
 	certConfig.Metadata.LastDeployAt = time.Now()
+	// 可重试失败的站点交给 daemon 自愈：不写入就没人接手，绑定虽启用却永远不会被重试
+	if len(retryableSites) > 0 {
+		certConfig.Metadata.FailedBindings = retryableSites
+		certConfig.Metadata.FailedBindingsAt = time.Now()
+	}
 
 	if useLocalKey {
 		certConfig.RenewMode = config.RenewModeLocal
@@ -485,7 +495,12 @@ func runSingle(p *setupParams, orderID int) {
 	fmt.Println("\n========================================")
 	if failCount > 0 {
 		fmt.Printf("一键部署部分完成! 成功 %d 个，失败 %d 个\n", successCount, failCount)
-		fmt.Printf("失败站点: %s\n", strings.Join(failedSites, ", "))
+		if len(failedSites) > 0 {
+			fmt.Printf("失败站点（已禁用，需修正配置后重新 setup）: %s\n", strings.Join(failedSites, ", "))
+		}
+		if len(retryableSites) > 0 {
+			fmt.Printf("失败站点（保留绑定，守护进程将自动重试）: %s\n", strings.Join(retryableSites, ", "))
+		}
 	} else {
 		fmt.Printf("一键部署完成! 共 %d 个站点\n", successCount)
 	}
@@ -773,23 +788,32 @@ func deployToSiteBinding(ctx context.Context, svc *certops.Service, binding *con
 }
 
 // deploySingleBindings 部署单证书模式的所有绑定，返回成功数、失败数和失败站点列表。
-func deploySingleBindings(ctx context.Context, svc *certops.Service, bindings []config.SiteBinding, certData *fetcher.CertData, privateKey string) (success, fail int, failedSites []string) {
+// 返回值中 failedSites 与 retryableSites 不重叠，失败总数为二者之和：
+//   - failedSites：绑定已被禁用（SSL 配置安装失败、或永久性部署错误），daemon 不再接手
+//   - retryableSites：绑定保持启用，写入 FailedBindings 交给 daemon 每日重试
+//
+// 此前所有部署失败一律 Enabled=false，而 nginx -t 失败恰恰是最典型的可修复情形——
+// 被禁用后 daemon 永不接手，站点一路静默到真实过期。
+func deploySingleBindings(ctx context.Context, svc *certops.Service, bindings []config.SiteBinding, certData *fetcher.CertData, privateKey string) (success int, failedSites, retryableSites []string) {
 	for i := range bindings {
 		binding := &bindings[i]
 		if !binding.Enabled {
 			// SSL 配置安装失败等已禁用该绑定：计为失败，避免误报部署成功
 			fmt.Fprintf(os.Stderr, "    %s: 跳过部署（SSL 配置安装失败）\n", binding.ServerName)
-			fail++
 			failedSites = append(failedSites, binding.ServerName)
 			continue
 		}
 		fmt.Printf("  部署到: %s\n", binding.ServerName)
 
 		if err := deployToSiteBinding(ctx, svc, binding, certData, privateKey); err != nil {
-			fmt.Fprintf(os.Stderr, "    部署失败: %v\n", err)
-			fail++
-			failedSites = append(failedSites, binding.ServerName)
-			binding.Enabled = false
+			if sslerrors.IsPermanentDeployError(err) {
+				fmt.Fprintf(os.Stderr, "    部署失败（需修正该站点配置后重新 setup）: %v\n", err)
+				binding.Enabled = false
+				failedSites = append(failedSites, binding.ServerName)
+				continue
+			}
+			fmt.Fprintf(os.Stderr, "    部署失败（保留绑定，将由守护进程重试）: %v\n", err)
+			retryableSites = append(retryableSites, binding.ServerName)
 			continue
 		}
 		fmt.Printf("    ✓ 部署成功\n")
@@ -1045,6 +1069,36 @@ func extractDomainsFromCert(cert *x509.Certificate) []string {
 
 // notifyAutoReissue 通知服务端是否自动续签（非关键路径，失败仅记录警告）
 // pull 模式 → autoReissue=true；local 模式 → autoReissue=false
+// sendSetupDeployCallback 上报一次 setup 的部署结果（deploy-spec §5.1 步骤 6）。
+// 非关键路径，失败仅记日志。CLI 无 deadline，显式限定兜底预算，
+// 避免部署已完成却让命令再挂几分钟。
+//
+// 调用位置有硬性要求：必须紧跟部署循环，早于任何 os.Exit 与保存门禁。
+// 放到保存阶段会同时被两道关卡吃掉——全失败时 os.Exit(1) 直接结束，
+// 保存门禁又会跳过没有成功绑定的证书，而这两类恰恰是最该上报的。
+func sendSetupDeployCallback(p *setupParams, f *fetcher.Fetcher, orderID, successCount, failCount int) {
+	req := &fetcher.CallbackRequest{
+		OrderID:    orderID,
+		Status:     "success",
+		DeployedAt: time.Now().Format(time.RFC3339),
+	}
+	if failCount > 0 {
+		req.Status = "failure"
+		req.Message = certops.CallbackMessage(
+			fmt.Errorf("%d 个站点部署失败，%d 个成功", failCount, successCount))
+	}
+
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(p.ctx), certops.CallbackFallbackBudget)
+	defer cancel()
+
+	renewBeforeDays, err := f.CallbackNew(ctx, p.apiURL, p.token, req)
+	if err != nil {
+		p.log.Warn("上报 setup 部署结果失败（不影响部署结果）: %v", err)
+		return
+	}
+	applyRenewBeforeDays(p.cfgManager, p.log, renewBeforeDays)
+}
+
 func notifyAutoReissue(p *setupParams, f *fetcher.Fetcher, orderID int, renewMode string) {
 	autoReissue := renewMode != config.RenewModeLocal
 	renewBeforeDays, err := f.ToggleAutoReissue(p.ctx, p.apiURL, p.token, orderID, autoReissue)

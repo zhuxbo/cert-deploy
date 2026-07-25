@@ -142,10 +142,25 @@ func (e *StructuredDeployError) Unwrap() error {
 	return e.Cause
 }
 
-// Retryable 判断错误是否可重试
-func (e *StructuredDeployError) Retryable() bool {
-	switch e.Type {
-	case DeployErrorNetwork, DeployErrorReload:
+// IsPermanentDeployError 判断部署错误是否为"重试不可能自愈、必须重新 setup"的永久性错误。
+//
+// 只有绑定配置本身有问题才算永久：
+//   - Config@write_cert —— Docker 绑定校验不通过 / 创建部署器失败
+//   - Validation@validate —— 证书或私钥根本不匹配
+//
+// 其余一律按可重试处理，交给 daemon 每日重试并上报，触顶后转入 stale 告警。
+// 注意这不等于"一定会自愈"：Permission 类错误多半要人工介入，但禁用绑定会让
+// daemon 永不接手、站点静默过期，保持可重试至少能持续暴露问题。
+// 非结构化错误无法判定根因，同样按可重试处理（宁可多重试，不可静默丢弃）。
+func IsPermanentDeployError(err error) bool {
+	var se *StructuredDeployError
+	if !stderrors.As(err, &se) {
+		return false
+	}
+	switch {
+	case se.Type == DeployErrorConfig && se.Phase == PhaseWriteCert:
+		return true
+	case se.Type == DeployErrorValidation && se.Phase == PhaseValidate:
 		return true
 	default:
 		return false

@@ -349,16 +349,20 @@ func TestDeploySingleBindings_SkipDisabled(t *testing.T) {
 
 	certData := &fetcher.CertData{OrderID: 1, Cert: testCert.CertPEM}
 	svc := newTestDeployService(t, tmpDir)
-	success, fail, failedSites := deploySingleBindings(t.Context(), svc, bindings, certData, testCert.KeyPEM)
+	success, failedSites, retryableSites := deploySingleBindings(t.Context(), svc, bindings, certData, testCert.KeyPEM)
 
 	if success != 1 {
 		t.Errorf("success = %d, 期望 1（仅 enabled 站点）", success)
 	}
-	if fail != 1 {
-		t.Errorf("fail = %d, 期望 1（disabled 站点计为失败）", fail)
+	if len(failedSites)+len(retryableSites) != 1 {
+		t.Errorf("失败总数 = %d, 期望 1（disabled 站点计为失败）", len(failedSites)+len(retryableSites))
 	}
+	// 部署前已被禁用的绑定属"已禁用"一类，不进重试列表
 	if len(failedSites) != 1 || failedSites[0] != "disabled.example.com" {
 		t.Errorf("failedSites = %v, 期望 [disabled.example.com]", failedSites)
+	}
+	if len(retryableSites) != 0 {
+		t.Errorf("retryableSites = %v, 期望空", retryableSites)
 	}
 	// 禁用的绑定不应被部署：证书文件不应写入
 	if _, err := os.Stat(disabledCert); err == nil {

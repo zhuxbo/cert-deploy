@@ -1,6 +1,7 @@
 package setup
 
 import (
+	"context"
 	"crypto/x509"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/zhuxbo/sslctl/pkg/certops"
 	"github.com/zhuxbo/sslctl/pkg/config"
+	sslerrors "github.com/zhuxbo/sslctl/pkg/errors"
 	"github.com/zhuxbo/sslctl/pkg/fetcher"
 	"github.com/zhuxbo/sslctl/pkg/matcher"
 	"github.com/zhuxbo/sslctl/pkg/util"
@@ -25,6 +27,10 @@ type certDeployPlan struct {
 	PrivateKey     string
 	Bindings       []config.SiteBinding
 	NeedSSLInstall []*matcher.ScannedSiteInfo
+
+	// 部署阶段填充，供保存阶段使用
+	SiteSuccess    int      // 本证书成功部署的站点数，保存门禁据此判定
+	RetryableSites []string // 可重试失败的站点，写入 FailedBindings 交给 daemon
 }
 
 // siteCandidate 站点的候选证书信息（用于冲突解决）
@@ -179,9 +185,19 @@ func runBatch(p *setupParams, query string) {
 		}
 
 		// 部署到每个绑定
-		siteSuccess, siteFail := deployPlanBindings(p, plan)
+		siteSuccess, failedSites, retryableSites := deployPlanBindings(p, plan)
+		siteFail := len(failedSites) + len(retryableSites)
+		plan.RetryableSites = retryableSites
+		plan.SiteSuccess = siteSuccess
 		totalSiteSuccess += siteSuccess
 		totalSiteFail += siteFail
+
+		// 上报该证书的部署结果（deploy-spec §5.1 步骤 6）。必须留在部署循环内：
+		// 后面既有全失败 os.Exit(1)，保存循环又会跳过没有成功绑定的证书，
+		// 放到那里会正好丢掉最该上报的那批。
+		// 三条 continue（无绑定、缺私钥、私钥验证失败）都未发生部署，不上报——
+		// deploy-spec §5.3 把"需要私钥"单列为区别于"失败"的第三类。
+		sendBatchDeployCallback(p, f, plan.CertData.OrderID, siteSuccess, siteFail)
 
 		if siteSuccess > 0 {
 			certSuccess++
@@ -204,15 +220,10 @@ func runBatch(p *setupParams, query string) {
 		if len(plan.Bindings) == 0 {
 			continue
 		}
-		// 检查是否有成功的绑定
-		hasEnabled := false
-		for _, b := range plan.Bindings {
-			if b.Enabled {
-				hasEnabled = true
-				break
-			}
-		}
-		if !hasEnabled {
+		// 必须按"有没有成功部署"判定，不能看"有没有启用的绑定"。
+		// 二者此前等价，仅仅因为部署失败一律置 Enabled=false；P1-2 保留可重试绑定后
+		// 该等价被打破，全失败的证书会被写入配置，进而由 AddCert 摘除其它证书的同名绑定。
+		if plan.SiteSuccess == 0 {
 			continue
 		}
 
@@ -230,6 +241,11 @@ func runBatch(p *setupParams, query string) {
 		certConfig.Metadata.CertExpiresAt = plan.ParsedCert.NotAfter
 		certConfig.Metadata.CertSerial = fmt.Sprintf("%X", plan.ParsedCert.SerialNumber)
 		certConfig.Metadata.LastDeployAt = time.Now()
+		// 可重试失败的站点交给 daemon 自愈
+		if len(plan.RetryableSites) > 0 {
+			certConfig.Metadata.FailedBindings = plan.RetryableSites
+			certConfig.Metadata.FailedBindingsAt = time.Now()
+		}
 
 		// 逐证书派生续签模式：SAN 含 IP 的证书强制 local + file（deploy-spec §5.2），
 		// DNS 证书按命令行参数派生，混合批次下 DNS 证书不受 IP 证书影响。
@@ -492,21 +508,53 @@ func installSSLForBatch(site *matcher.ScannedSiteInfo, plan *certDeployPlan, p *
 	}
 }
 
-// deployPlanBindings 部署证书计划中的所有绑定，返回成功和失败数
-func deployPlanBindings(p *setupParams, plan *certDeployPlan) (success, fail int) {
+// sendBatchDeployCallback 上报单张证书的 setup 部署结果（deploy-spec §5.1 步骤 6）。
+// 非关键路径，失败仅记日志。
+func sendBatchDeployCallback(p *setupParams, f *fetcher.Fetcher, orderID, successCount, failCount int) {
+	req := &fetcher.CallbackRequest{
+		OrderID:    orderID,
+		Status:     "success",
+		DeployedAt: time.Now().Format(time.RFC3339),
+	}
+	if failCount > 0 {
+		req.Status = "failure"
+		req.Message = certops.CallbackMessage(
+			fmt.Errorf("%d 个站点部署失败，%d 个成功", failCount, successCount))
+	}
+
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(p.ctx), certops.CallbackFallbackBudget)
+	defer cancel()
+
+	renewBeforeDays, err := f.CallbackNew(ctx, p.apiURL, p.token, req)
+	if err != nil {
+		p.log.Warn("上报证书 order_id=%d 的部署结果失败（不影响部署结果）: %v", orderID, err)
+		return
+	}
+	applyRenewBeforeDays(p.cfgManager, p.log, renewBeforeDays)
+}
+
+// deployPlanBindings 部署证书计划中的所有绑定。
+// 与 deploySingleBindings 同一分流规则：failedSites 的绑定已禁用，
+// retryableSites 的绑定保持启用并写入 FailedBindings 交给 daemon 重试，两者不重叠。
+func deployPlanBindings(p *setupParams, plan *certDeployPlan) (success int, failedSites, retryableSites []string) {
 	svc := certops.NewService(p.cfgManager, p.log)
 	for i := range plan.Bindings {
 		binding := &plan.Bindings[i]
 		if !binding.Enabled {
-			fail++
+			failedSites = append(failedSites, binding.ServerName)
 			continue
 		}
 		fmt.Printf("    部署到: %s\n", binding.ServerName)
 
 		if err := deployToSiteBinding(p.ctx, svc, binding, plan.CertData, plan.PrivateKey); err != nil {
-			fmt.Fprintf(os.Stderr, "      部署失败: %v\n", err)
-			fail++
-			binding.Enabled = false
+			if sslerrors.IsPermanentDeployError(err) {
+				fmt.Fprintf(os.Stderr, "      部署失败（需修正该站点配置后重新 setup）: %v\n", err)
+				binding.Enabled = false
+				failedSites = append(failedSites, binding.ServerName)
+				continue
+			}
+			fmt.Fprintf(os.Stderr, "      部署失败（保留绑定，将由守护进程重试）: %v\n", err)
+			retryableSites = append(retryableSites, binding.ServerName)
 			continue
 		}
 		fmt.Printf("      ✓ 部署成功\n")

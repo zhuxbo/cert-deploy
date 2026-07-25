@@ -228,7 +228,10 @@ func (s *Service) deployToBinding(ctx context.Context, binding *config.SiteBindi
 				fmt.Sprintf("部署失败且回滚失败（服务可能不可用）: deploy=%v, rollback=%v\n手动恢复: %s", deployErr, rollbackErr, recoveryCmd), nil)
 		}
 		s.log.Info("已回滚到备份: %s", backupPath)
-		return errors.NewStructuredDeployError(errors.DeployErrorReload, errors.PhaseReload, "部署失败（已回滚）", deployErr)
+		// 包裹而非重造错误码：同一根因（如 nginx -t 失败 = Config@test_config）
+		// 此前"有备份"被重包成 Reload@reload、"首次部署无备份"原样返回，
+		// 相同问题得到相反的错误分类。%w 保留根因，与 cmd/deploy 的写法一致。
+		return fmt.Errorf("部署失败（已回滚）: %w", deployErr)
 	}
 
 	return deployErr

@@ -222,7 +222,10 @@ func TestDetectDockerServer_BoundaryLength(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			id := strings.Repeat("a", tt.length)
+			// 必须用非十六进制字符：Docker 按 ID 前缀匹配，用 "a" 造的短 ID
+			// 会命中宿主机上任何 ID 以 a 开头的真实容器，使本用例随环境变红。
+			// 容器名匹配要求完全相等、不做前缀，因此 "z" 串不会误命中。
+			id := strings.Repeat("z", tt.length)
 			got := DetectDockerServer(id)
 			// 所有用例都应返回 TypeUnknown（非法输入被拒绝，合法输入但容器不存在）
 			if got != TypeUnknown {

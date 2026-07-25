@@ -299,12 +299,22 @@ sslctl                    Manager API                    CA
 - **绑定重试触顶**：仅"确实发生了部署且仍失败"的出口上报一次带「绑定重试已达上限」标注的 failure；查询失败、私钥不可读等未发生部署的出口按 deploy-spec §2.8 触顶静默；证书处于 `processing` 不计入配额也不上报。
 - **手动 `sslctl deploy` 上报一次部署结果**（deploy-spec §5.1 步骤 6）：CLI 无 deadline，回调显式限定 `certops.CallbackFallbackBudget`（90s）。
 - **回调脱离取消传播**（`certops.callbackContext`）：回调是部署结果的唯一出口，父 ctx 取消（daemon SIGTERM、检查超时）时沿用会让整轮结果凭空消失，因此基于 `context.WithoutCancel` 重建，并按四条分支定预算——已取消 → 90s 兜底（**必须先于余量判断**，`cancel()` 不改变 deadline，此时父预算余量可能仍有几十分钟）；余量 ≤90s → 90s 兜底；余量充裕 → 保留父 deadline；无 deadline → 不设限，由单次请求超时与重试上限兜底。90s ≈ 一次完整 POST + 约 1s 退避 + 被截断的第二次尝试，daemon 60s 关停预算可能将其截断。
-- **已知偏离**：`retryFailedBindings` 的 `QueryOrder` 失败出口在未发生部署时仍报 failure（查询失败不是部署结果，与 deploy-spec §2.8 不符），本次维持现状不扩大——触顶后停止；`cmd/setup` 目前不发部署回调，待项 I-b 落地后移除本条。
+- **`sslctl setup` 上报部署结果**（deploy-spec §5.1 步骤 6）：单证书一次、批量逐证书一次，`success`/`failure` 由该证书是否有失败站点决定。调用位置有硬性要求——必须紧跟部署循环，早于全失败 `os.Exit(1)` 与保存门禁；放到保存阶段会被这两道关卡同时吃掉，而它们拦下的恰是最该上报的那批。三条未发生部署的 `continue`（无绑定、缺私钥、私钥验证失败）不上报，其中"需要私钥"按 deploy-spec §5.3 属区别于"失败"的第三类。
+- **已知偏离**：`retryFailedBindings` 的 `QueryOrder` 失败出口在未发生部署时仍报 failure（查询失败不是部署结果，与 deploy-spec §2.8 不符），本次维持现状不扩大——触顶后停止。
 
 ### 部署链语义（setup/deploy/续签）
 
 - **复用统一部署路径**：setup 部署走 `Service.DeployToBinding`，与 deploy/续签一致地做证书私钥校验、覆盖前备份现有证书、测试/reload 失败自动回滚，消除 setup 直接覆盖无备份的旧路径。
 - **失败如实统计**：SSL 配置安装失败的绑定标记 `Enabled=false` 后跳过部署并计入失败，单证书与批量模式一致，不误报"部署成功"。
+- **setup 部署失败按错误性质分流**（`sslerrors.IsPermanentDeployError`，判定取 `errors.As` 的最外层结构化错误）：
+  只有 `Config@write_cert`（Docker 绑定校验不通过、创建部署器失败）与 `Validation@validate`（证书私钥不匹配）算**永久性**——绑定配置本身有问题，禁用绑定等人工重新 setup；
+  其余（`Config@test_config`、`Config@rollback`、`Reload@*`、`Permission@*`、`Unknown@*`、非结构化错误）一律**保留绑定启用**并写入 `failed_bindings` 交给 daemon 每日重试。
+  这不等于"一定会自愈"（`Permission` 多半要人工介入），但禁用会让 daemon 永不接手、站点静默过期；保持可重试至少能持续暴露问题，触顶后转 `stale_bindings` 告警。
+  `nginx -t` 失败构造的正是 `Config@test_config`——最典型的可修复情形，判成永久会直接禁用，是本项要消除的洞。
+- **错误码不随"有无备份"变化**（项 L）：`deployToBinding` 回滚成功后用 `%w` 包裹原错误而非重造 `Reload@reload`，
+  否则同一根因在"有备份"与"首次部署无备份"两条路径上会得到相反分类。`IsPermanentDeployError` 因此必须穿透包裹层取根因。
+- **批量保存门禁按 `SiteSuccess > 0`**：此前用"有没有启用的绑定"，二者等价仅仅因为部署失败一律置 `Enabled=false`。
+  保留可重试绑定后该等价被打破，全失败的证书会被写入配置，进而由 `AddCert` 摘除其它证书的同名绑定。
 - **退出码语义**（`hasDeployFailures`）：任一站点部署失败、任一证书失败、或存在需人工提供私钥而跳过的证书，进程即以退出码 1 结束（部分失败也算失败，先保存成功站点配置再退出），单证书与批量模式一致。
 - **pending 私钥转正时机**（local 续签，deploy-spec §3.8）：签发 active 后先校验服务端证书与 pending 私钥配对，不配对按失败处理（保留 pending、不动线上私钥）；配对通过并部署成功后才转正，旧线上私钥由部署路径覆盖前备份。部署全失败时不得更新到期元数据，保持下轮完整自愈。
 

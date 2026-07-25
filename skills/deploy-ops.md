@@ -316,6 +316,12 @@ sslctl                    Manager API                    CA
 - **批量保存门禁按 `SiteSuccess > 0`**：此前用"有没有启用的绑定"，二者等价仅仅因为部署失败一律置 `Enabled=false`。
   保留可重试绑定后该等价被打破，全失败的证书会被写入配置，进而由 `AddCert` 摘除其它证书的同名绑定。
 - **退出码语义**（`hasDeployFailures`）：任一站点部署失败、任一证书失败、或存在需人工提供私钥而跳过的证书，进程即以退出码 1 结束（部分失败也算失败，先保存成功站点配置再退出），单证书与批量模式一致。
+- **部署层贯通 context**：`webserver.Deployer` 的 `Deploy`/`Reload`/`Test`/`Rollback` 首参接收 ctx，一路传到 `executor.RunWithin`
+  （在父 ctx 之下再套单命令上限，取二者更早者，上游无 deadline 时不丢默认保护）、Windows 服务停止轮询与 Apache reload 等待循环。
+  目的是让检查超时与关停信号中断部署等待、缩短强杀窗口；**不解决**"新私钥 + 旧证书"的磁盘窗口——那来自两次非事务写入，仍由 `deploy_started_at` 重放兜底。
+- **回滚必须脱离取消传播**（`certops.RollbackBudget`）：部署失败往往正是 ctx 被取消所致，回滚沿用同一个 ctx 会当场失败，
+  直接落进"部署失败且回滚失败（服务可能不可用）"——比不贯通 ctx 更糟。回滚走 `WithoutCancel` + 独立预算，仍然有界。
+  测试侧的 mock 部署器必须如实返回 `ctx.Err()`，否则这类用例永远是绿的、测不出任何东西。
 - **pending 私钥转正时机**（local 续签，deploy-spec §3.8）：签发 active 后先校验服务端证书与 pending 私钥配对，不配对按失败处理（保留 pending、不动线上私钥）；配对通过并部署成功后才转正，旧线上私钥由部署路径覆盖前备份。部署全失败时不得更新到期元数据，保持下轮完整自愈。
 
 ---

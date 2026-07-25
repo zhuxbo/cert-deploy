@@ -2,6 +2,7 @@
 package deployer
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -70,7 +71,7 @@ func TestApacheDeployer_Deploy_WriteCert(t *testing.T) {
 	intermediate := "-----BEGIN CERTIFICATE-----\ntest-intermediate\n-----END CERTIFICATE-----"
 	key := "-----BEGIN RSA PRIVATE KEY-----\ntest-key\n-----END RSA PRIVATE KEY-----"
 
-	err := d.Deploy(cert, intermediate, key)
+	err := d.Deploy(context.Background(), cert, intermediate, key)
 	if err != nil {
 		t.Fatalf("Deploy() error = %v", err)
 	}
@@ -116,7 +117,7 @@ func TestApacheDeployer_Deploy_NoChain(t *testing.T) {
 	intermediate := "-----BEGIN CERTIFICATE-----\ntest-intermediate\n-----END CERTIFICATE-----"
 	key := "-----BEGIN RSA PRIVATE KEY-----\ntest-key\n-----END RSA PRIVATE KEY-----"
 
-	err := d.Deploy(cert, intermediate, key)
+	err := d.Deploy(context.Background(), cert, intermediate, key)
 	if err != nil {
 		t.Fatalf("Deploy() error = %v", err)
 	}
@@ -149,7 +150,7 @@ func TestApacheDeployer_Deploy_KeyPermissions(t *testing.T) {
 	cert := "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----"
 	key := "-----BEGIN RSA PRIVATE KEY-----\ntest\n-----END RSA PRIVATE KEY-----"
 
-	err := d.Deploy(cert, "", key)
+	err := d.Deploy(context.Background(), cert, "", key)
 	if err != nil {
 		t.Fatalf("Deploy() error = %v", err)
 	}
@@ -179,7 +180,7 @@ func TestApacheDeployer_Deploy_CreateDirectory(t *testing.T) {
 	intermediate := "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----"
 	key := "-----BEGIN RSA PRIVATE KEY-----\ntest\n-----END RSA PRIVATE KEY-----"
 
-	err := d.Deploy(cert, intermediate, key)
+	err := d.Deploy(context.Background(), cert, intermediate, key)
 	if err != nil {
 		t.Fatalf("Deploy() error = %v", err)
 	}
@@ -255,7 +256,7 @@ func TestParseCommand(t *testing.T) {
 func TestApacheDeployer_Reload_EmptyCommand(t *testing.T) {
 	d := NewApacheDeployer(baseDeployer.Config{})
 
-	err := d.Reload()
+	err := d.Reload(context.Background())
 	if err != nil {
 		t.Errorf("空重载命令应返回 nil，实际: %v", err)
 	}
@@ -265,7 +266,7 @@ func TestApacheDeployer_Reload_EmptyCommand(t *testing.T) {
 func TestApacheDeployer_Test_EmptyCommand(t *testing.T) {
 	d := NewApacheDeployer(baseDeployer.Config{})
 
-	err := d.Test()
+	err := d.Test(context.Background())
 	if err != nil {
 		t.Errorf("空测试命令应返回 nil，实际: %v", err)
 	}
@@ -295,7 +296,7 @@ func TestApacheDeployer_Rollback(t *testing.T) {
 
 	d := NewApacheDeployer(baseDeployer.Config{CertPath: certPath, KeyPath: keyPath, ChainPath: chainPath})
 
-	err := d.Rollback(backupCertPath, backupKeyPath, backupChainPath)
+	err := d.Rollback(context.Background(), backupCertPath, backupKeyPath, backupChainPath)
 	if err != nil {
 		t.Fatalf("Rollback() error = %v", err)
 	}
@@ -338,7 +339,7 @@ func TestApacheDeployer_Rollback_NoChain(t *testing.T) {
 	// 不指定 chainPath
 	d := NewApacheDeployer(baseDeployer.Config{CertPath: certPath, KeyPath: keyPath})
 
-	err := d.Rollback(backupCertPath, backupKeyPath, "")
+	err := d.Rollback(context.Background(), backupCertPath, backupKeyPath, "")
 	if err != nil {
 		t.Fatalf("Rollback() error = %v", err)
 	}

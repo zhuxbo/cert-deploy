@@ -2,6 +2,7 @@
 package setup
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 
@@ -83,7 +84,7 @@ type mockDeployer struct {
 	chainPath string
 }
 
-func (m *mockDeployer) Deploy(cert, chain, key string) error {
+func (m *mockDeployer) Deploy(_ context.Context, cert, chain, key string) error {
 	if m.certPath != "" {
 		fullchain := cert
 		if chain != "" {
@@ -114,8 +115,8 @@ func (m *mockDeployer) Deploy(cert, chain, key string) error {
 	}
 	return nil
 }
-func (m *mockDeployer) Reload() error { return nil }
-func (m *mockDeployer) Test() error   { return nil }
-func (m *mockDeployer) Rollback(backupCertPath, backupKeyPath, backupChainPath string) error {
+func (m *mockDeployer) Reload(_ context.Context) error { return nil }
+func (m *mockDeployer) Test(_ context.Context) error   { return nil }
+func (m *mockDeployer) Rollback(_ context.Context, backupCertPath, backupKeyPath, backupChainPath string) error {
 	return nil
 }

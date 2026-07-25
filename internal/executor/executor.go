@@ -209,6 +209,15 @@ func Run(cmdStr string) error {
 	return RunContext(ctx, cmdStr)
 }
 
+// RunWithin 在父 ctx 之下执行命令，同时保留默认单命令上限。
+// 直接把上游 ctx 交给 RunContext 会在上游无 deadline 时丢掉 30s 保护；
+// 直接用 Run 又让上游取消无法中断命令。取二者更早者。
+func RunWithin(ctx context.Context, cmdStr string) error {
+	c, cancel := context.WithTimeout(ctx, DefaultTimeout)
+	defer cancel()
+	return RunContext(c, cmdStr)
+}
+
 // RunContext 执行命令（带 context 超时控制）
 // 优先匹配静态白名单，不匹配时回退到动态路径校验（basename + args 白名单）
 // 动态路径校验支持 nginx 安装在非标准路径的场景（如 /usr/local/nginx/sbin/nginx -t）

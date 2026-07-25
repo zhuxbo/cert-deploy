@@ -2,6 +2,7 @@
 package certops
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -152,7 +153,7 @@ func TestRollbackFromBackup(t *testing.T) {
 	}
 
 	// 执行回滚
-	err = svc.rollbackFromBackup(binding, backupDir)
+	err = svc.rollbackFromBackup(context.Background(), binding, backupDir)
 	if err != nil {
 		t.Fatalf("rollbackFromBackup() error = %v", err)
 	}
@@ -889,7 +890,7 @@ func TestRollbackFromBackup_WithChainFile(t *testing.T) {
 		},
 	}
 
-	err = svc.rollbackFromBackup(binding, backupDir)
+	err = svc.rollbackFromBackup(context.Background(), binding, backupDir)
 	if err != nil {
 		t.Fatalf("回滚失败: %v", err)
 	}
@@ -934,7 +935,6 @@ func TestNewService_Fields(t *testing.T) {
 		t.Error("log 未正确设置")
 	}
 }
-
 
 // TestSendDeployCallback_EmptyAPI 测试 API URL 为空时回调直接返回
 func TestSendDeployCallback_EmptyAPI(t *testing.T) {
@@ -1221,4 +1221,3 @@ func TestDeployAllCerts_Empty(t *testing.T) {
 		_ = err
 	})
 }
-

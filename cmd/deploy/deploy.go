@@ -229,7 +229,7 @@ func fetchAndDeployCert(ctx context.Context, cfgManager *config.ConfigManager, c
 		return cfgManager.UpdateCert(cert)
 	}
 
-	successCount, failedNames, deployErr := deployToBindings(cert, certData, privateKey, backupMgr, log)
+	successCount, failedNames, deployErr := deployToBindings(ctx, cert, certData, privateKey, backupMgr, log)
 
 	// 仅在至少有一个绑定部署成功时才更新元数据
 	if successCount > 0 {
@@ -298,7 +298,7 @@ func sendDeployResultCallback(ctx context.Context, cfgManager *config.ConfigMana
 // deployToBindings 部署全部启用绑定；只要有一个绑定失败就返回错误，
 // 便于脚本调用方通过退出码识别部分失败，同时不影响其他绑定继续部署。
 // 返回成功数、仍失败的站点名（供 FailedBindings 记录）与聚合错误。
-func deployToBindings(cert *config.CertConfig, certData *fetcher.CertData, privateKey string, backupMgr *backup.Manager, log *logger.Logger) (int, []string, error) {
+func deployToBindings(ctx context.Context, cert *config.CertConfig, certData *fetcher.CertData, privateKey string, backupMgr *backup.Manager, log *logger.Logger) (int, []string, error) {
 	successCount := 0
 	failedSites := make([]string, 0)
 	failedNames := make([]string, 0)
@@ -310,7 +310,7 @@ func deployToBindings(cert *config.CertConfig, certData *fetcher.CertData, priva
 		}
 
 		fmt.Printf("  部署到: %s\n", binding.ServerName)
-		if err := deployToBinding(binding, certData, privateKey, backupMgr, log); err != nil {
+		if err := deployToBinding(ctx, binding, certData, privateKey, backupMgr, log); err != nil {
 			fmt.Printf("    失败: %v\n", err)
 			failedSites = append(failedSites, fmt.Sprintf("%s: %v", binding.ServerName, err))
 			failedNames = append(failedNames, binding.ServerName)
@@ -340,7 +340,7 @@ func applyDeployRenewBeforeDays(cm *config.ConfigManager, log *logger.Logger, va
 }
 
 // deployToBinding 部署到绑定（带备份和回滚）
-func deployToBinding(binding *config.SiteBinding, certData *fetcher.CertData, privateKey string, backupMgr *backup.Manager, log *logger.Logger) error {
+func deployToBinding(ctx context.Context, binding *config.SiteBinding, certData *fetcher.CertData, privateKey string, backupMgr *backup.Manager, log *logger.Logger) error {
 	// Docker 站点：校验可安全部署（挂载卷模式 + 容器重载命令），否则如实报错而非静默成功
 	if config.IsDockerType(binding.ServerType) {
 		if err := config.ValidateDockerBinding(binding); err != nil {
@@ -380,13 +380,17 @@ func deployToBinding(binding *config.SiteBinding, certData *fetcher.CertData, pr
 		return fmt.Errorf("创建部署器失败: %w", err)
 	}
 
-	deployErr := deployer.Deploy(certData.Cert, certData.IntermediateCert, privateKey)
+	deployErr := deployer.Deploy(ctx, certData.Cert, certData.IntermediateCert, privateKey)
 
 	// 部署失败时回滚
 	if deployErr != nil && backupPath != "" {
 		log.Warn("部署失败，尝试回滚: %v", deployErr)
 		certPath, keyPath, chainPath := backupMgr.GetBackupPathsWithChain(backupPath)
-		rollbackErr := deployer.Rollback(certPath, keyPath, chainPath)
+		// 回滚脱离取消传播：部署失败常常正是 ctx 被取消所致，
+		// 沿用同一个 ctx 会让兜底回滚当场失败、服务停在坏状态
+		rbCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), certops.RollbackBudget)
+		rollbackErr := deployer.Rollback(rbCtx, certPath, keyPath, chainPath)
+		cancel()
 		if rollbackErr != nil {
 			log.Error("回滚失败: %v", rollbackErr)
 			return fmt.Errorf("部署失败且回滚失败: deploy=%v, rollback=%v", deployErr, rollbackErr)
@@ -720,7 +724,8 @@ func runLocal(args []string, debug bool) {
 	}
 
 	backupMgr := backup.NewManager(cfgManager.GetBackupDir(), 5)
-	if err := deployToBinding(binding, certDataStruct, keyPEM, backupMgr, log); err != nil {
+	// CLI 单次操作：无上游 deadline，由 executor 的单命令上限兜底
+	if err := deployToBinding(context.Background(), binding, certDataStruct, keyPEM, backupMgr, log); err != nil {
 		fmt.Fprintf(os.Stderr, "部署失败: %v\n", err)
 		os.Exit(1)
 	}

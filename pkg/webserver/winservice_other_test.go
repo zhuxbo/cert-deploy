@@ -3,6 +3,7 @@
 package webserver
 
 import (
+	"context"
 	"strings"
 	"testing"
 )
@@ -17,7 +18,7 @@ func TestFindWebServerService_AlwaysEmptyOnNonWindows(t *testing.T) {
 }
 
 func TestRestartWindowsService_NotSupportedOnNonWindows(t *testing.T) {
-	err := RestartWindowsService("nginx")
+	err := RestartWindowsService(context.Background(), "nginx")
 	if err == nil {
 		t.Fatalf("非 Windows 上必须返回错误")
 	}

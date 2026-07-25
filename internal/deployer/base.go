@@ -41,11 +41,11 @@ type Base struct {
 }
 
 // TestConfig 测试配置
-func (b *Base) TestConfig() error {
+func (b *Base) TestConfig(ctx context.Context) error {
 	if b.TestCommand == "" {
 		return nil
 	}
-	return executor.Run(b.TestCommand)
+	return executor.RunWithin(ctx, b.TestCommand)
 }
 
 // NeedsProcessRestart 检测是否需要通过进程重启方式重载（Windows 非服务模式）
@@ -71,34 +71,34 @@ func (b *Base) NeedsProcessRestart() bool {
 //     哨兵中编入的 reload 命令，再失败走进程重启
 //   - Linux 容器环境（无 systemd）：优先发送 SIGUSR1 并等待新 generation；失败再执行 reload 命令
 //   - Windows 非服务模式：reload 命令失败时回退到进程重启
-func (b *Base) ReloadService() error {
+func (b *Base) ReloadService(ctx context.Context) error {
 	if b.ReloadCommand == "" {
 		return nil
 	}
 
 	// Windows 服务路径：detector 已识别 nginx/apache 为 Windows 服务
 	if strings.HasPrefix(b.ReloadCommand, webserver.WinSvcReloadPrefix) {
-		return b.reloadWinSvc()
+		return b.reloadWinSvc(ctx)
 	}
 
 	// docker exec 重载命令直接在容器内执行，宿主机侧的 SIGUSR1/进程重启回退不适用
 	// （Apache/nginx master 进程在容器内，宿主机没有对应进程）
 	if executor.IsDockerExecCommand(b.ReloadCommand) {
-		return executor.Run(b.ReloadCommand)
+		return executor.RunWithin(ctx, b.ReloadCommand)
 	}
 
 	// Linux 容器环境预检：如果 systemd 不可用且命令涉及 httpd/apache，
 	// 先尝试通过 SIGUSR1 信号 reload（避免 httpd -k graceful 因无 dbus 导致进程异常退出）
 	if runtime.GOOS != "windows" && !isSystemdAvailable() && b.isApacheReload() {
-		if err := b.reloadFallbackLinux(); err == nil {
+		if err := b.reloadFallbackLinux(ctx); err == nil {
 			return nil
 		}
 	}
 
 	if runtime.GOOS == "windows" {
-		return runReloadCommandWindows(b.ReloadCommand, nil)
+		return runReloadCommandWindows(ctx, b.ReloadCommand, nil)
 	}
-	return executor.Run(b.ReloadCommand)
+	return executor.RunWithin(ctx, b.ReloadCommand)
 }
 
 // parseWinSvcSentinel 解析 winsvc:<service-name>[|<fallback>] 哨兵串。
@@ -117,22 +117,22 @@ func parseWinSvcSentinel(s string) (svcName, fallback string) {
 //  3. 命令仍失败且属于已知白名单错误，走进程重启
 //
 // 三层失败时返回最后一步的错误，并在错误链中保留前置 SCM 错误以便排查。
-func (b *Base) reloadWinSvc() error {
+func (b *Base) reloadWinSvc(ctx context.Context) error {
 	svcName, fallback := parseWinSvcSentinel(b.ReloadCommand)
 	if svcName == "" {
 		if fallback != "" {
-			return runReloadCommandWindows(fallback, nil)
+			return runReloadCommandWindows(ctx, fallback, nil)
 		}
 		return fmt.Errorf("invalid winsvc sentinel: %s", b.ReloadCommand)
 	}
-	scmErr := restartWindowsServiceFunc(svcName)
+	scmErr := restartWindowsServiceFunc(ctx, svcName)
 	if scmErr == nil {
 		return nil
 	}
 	if fallback == "" {
 		return scmErr
 	}
-	return reloadFallbackCommandFunc(fallback, scmErr)
+	return reloadFallbackCommandFunc(ctx, fallback, scmErr)
 }
 
 // runReloadCommandWindows 在 Windows 上执行 reload 命令；失败时按已知白名单错误
@@ -140,8 +140,8 @@ func (b *Base) reloadWinSvc() error {
 //
 // prevErr 为可选的前置错误（如 SCM 失败错误），返回错误时一起带回上下文，
 // 但不影响白名单判定（白名单只看 reload 命令本身的错误信息）。
-func runReloadCommandWindows(reloadCmd string, prevErr error) error {
-	err := executor.Run(reloadCmd)
+func runReloadCommandWindows(ctx context.Context, reloadCmd string, prevErr error) error {
+	err := executor.RunWithin(ctx, reloadCmd)
 	if err == nil {
 		return nil
 	}
@@ -158,7 +158,7 @@ func runReloadCommandWindows(reloadCmd string, prevErr error) error {
 	if exe == "" {
 		return wrapWithPrev(err, prevErr)
 	}
-	if rerr := restartProcessWindows(exe, err); rerr != nil {
+	if rerr := restartProcessWindows(ctx, exe, err); rerr != nil {
 		return wrapWithPrev(rerr, prevErr)
 	}
 	return nil
@@ -185,7 +185,7 @@ func (b *Base) isApacheReload() bool {
 }
 
 // reloadFallbackLinux 在 Linux 容器中通过 SIGUSR1 信号实现 Apache graceful reload
-func (b *Base) reloadFallbackLinux() error {
+func (b *Base) reloadFallbackLinux(ctx context.Context) error {
 	exe, _ := executor.ParseCommand(b.ReloadCommand)
 	if exe == "" {
 		return fmt.Errorf("cannot parse reload command: %s", b.ReloadCommand)
@@ -213,7 +213,7 @@ func (b *Base) reloadFallbackLinux() error {
 	// SIGUSR1 只负责通知 master，信号发送成功不代表 graceful reload 已完成。
 	// 必须等到新一代 worker 出现后再允许下一绑定改写另一组证书文件；否则
 	// Apache 可能在读取配置时撞上“新私钥 + 旧证书”的瞬时状态并退出。
-	if err := waitForApacheReload(pid, childrenBefore, apacheReloadTimeout); err != nil {
+	if err := waitForApacheReload(ctx, pid, childrenBefore, apacheReloadTimeout); err != nil {
 		return fmt.Errorf("wait for apache reload: %w", err)
 	}
 	return nil
@@ -231,9 +231,12 @@ const (
 // waitForApacheReload 等待 Apache master 创建至少一个新 worker，证明 graceful
 // reload 已读取完配置并进入新 generation。master 退出或超时均按 reload 失败处理
 // （静默放行会掩盖真正没 reload 成功的情况，让站点挂着旧证书却报部署成功）。
-func waitForApacheReload(masterPID int, childrenBefore map[int]struct{}, timeout time.Duration) error {
+func waitForApacheReload(ctx context.Context, masterPID int, childrenBefore map[int]struct{}, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("wait aborted: %w", err)
+		}
 		if _, err := os.Stat(fmt.Sprintf("/proc/%d", masterPID)); err != nil {
 			return fmt.Errorf("apache master %d exited", masterPID)
 		}
@@ -378,18 +381,18 @@ func findMasterPIDByName(name string) int {
 
 // restartProcessWindows 通过终止进程+重启实现重载（适用于 Apache/Nginx 非服务模式）
 // 流程：终止进程 → 等待退出 → 等守护进程自动拉起 → 否则手动启动
-func restartProcessWindows(exe string, origErr error) error {
+func restartProcessWindows(ctx context.Context, exe string, origErr error) error {
 	// 提取进程名（如 httpd.exe、nginx.exe）
 	processName := filepath.Base(exe)
 
 	// 终止进程树
 	fmt.Fprintf(os.Stderr, "正在停止 %s 进程...\n", processName)
-	_ = executor.Run(fmt.Sprintf("taskkill /F /T /IM %s", processName))
+	_ = executor.RunWithin(ctx, fmt.Sprintf("taskkill /F /T /IM %s", processName))
 
 	// 等待进程退出（最多 10 秒）
 	for i := 0; i < 20; i++ {
 		time.Sleep(500 * time.Millisecond)
-		if !isProcessRunning(processName) {
+		if !isProcessRunning(ctx, processName) {
 			break
 		}
 	}
@@ -398,7 +401,7 @@ func restartProcessWindows(exe string, origErr error) error {
 	fmt.Fprintf(os.Stderr, "等待 %s 重新启动...\n", processName)
 	for i := 0; i < 10; i++ {
 		time.Sleep(time.Second)
-		if isProcessRunning(processName) {
+		if isProcessRunning(ctx, processName) {
 			fmt.Fprintf(os.Stderr, "%s 已恢复运行\n", processName)
 			return nil
 		}
@@ -418,21 +421,21 @@ func restartProcessWindows(exe string, origErr error) error {
 
 	// 确认启动成功
 	time.Sleep(2 * time.Second)
-	if !isProcessRunning(processName) {
+	if !isProcessRunning(ctx, processName) {
 		return fmt.Errorf("进程启动后退出（原始错误: %v）", origErr)
 	}
 	return nil
 }
 
 // TestAndReload 测试配置并重载服务
-func (b *Base) TestAndReload() error {
-	if err := b.TestConfig(); err != nil {
+func (b *Base) TestAndReload(ctx context.Context) error {
+	if err := b.TestConfig(ctx); err != nil {
 		return errors.NewStructuredDeployError(
 			errors.DeployErrorConfig, errors.PhaseTest,
 			"config test failed", err,
 		)
 	}
-	if err := b.ReloadService(); err != nil {
+	if err := b.ReloadService(ctx); err != nil {
 		return errors.NewStructuredDeployError(
 			errors.DeployErrorReload, errors.PhaseReload,
 			"reload failed", err,
@@ -442,9 +445,9 @@ func (b *Base) TestAndReload() error {
 }
 
 // TestAndReloadForRollback 回滚后测试配置并重载服务
-func (b *Base) TestAndReloadForRollback() error {
+func (b *Base) TestAndReloadForRollback(ctx context.Context) error {
 	if b.TestCommand != "" {
-		if err := executor.Run(b.TestCommand); err != nil {
+		if err := executor.RunWithin(ctx, b.TestCommand); err != nil {
 			return errors.NewStructuredDeployError(
 				errors.DeployErrorConfig, errors.PhaseRollback,
 				"config test failed after rollback", err,
@@ -452,7 +455,7 @@ func (b *Base) TestAndReloadForRollback() error {
 		}
 	}
 	if b.ReloadCommand != "" {
-		if err := b.ReloadService(); err != nil {
+		if err := b.ReloadService(ctx); err != nil {
 			return errors.NewStructuredDeployError(
 				errors.DeployErrorReload, errors.PhaseRollback,
 				"reload failed after rollback", err,
@@ -468,8 +471,8 @@ func (b *Base) TestAndReloadForRollback() error {
 const processProbeTimeout = 5 * time.Second
 
 // isProcessRunning 检测指定名称的进程是否仍在运行（Windows）
-func isProcessRunning(name string) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), processProbeTimeout)
+func isProcessRunning(ctx context.Context, name string) bool {
+	ctx, cancel := context.WithTimeout(ctx, processProbeTimeout)
 	defer cancel()
 
 	out, err := exec.CommandContext(ctx, "tasklist", "/FI", fmt.Sprintf("IMAGENAME eq %s", name), "/NH").Output()

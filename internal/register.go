@@ -180,21 +180,21 @@ type nginxDeployerAdapter struct {
 	deployer *nginxDeployer.NginxDeployer
 }
 
-func (a *nginxDeployerAdapter) Deploy(cert, chain, key string) error {
-	return a.deployer.Deploy(cert, chain, key)
+func (a *nginxDeployerAdapter) Deploy(ctx context.Context, cert, chain, key string) error {
+	return a.deployer.Deploy(ctx, cert, chain, key)
 }
 
-func (a *nginxDeployerAdapter) Reload() error {
-	return a.deployer.Reload()
+func (a *nginxDeployerAdapter) Reload(ctx context.Context) error {
+	return a.deployer.Reload(ctx)
 }
 
-func (a *nginxDeployerAdapter) Test() error {
-	return a.deployer.Test()
+func (a *nginxDeployerAdapter) Test(ctx context.Context) error {
+	return a.deployer.Test(ctx)
 }
 
-func (a *nginxDeployerAdapter) Rollback(backupCertPath, backupKeyPath, _ string) error {
+func (a *nginxDeployerAdapter) Rollback(ctx context.Context, backupCertPath, backupKeyPath, _ string) error {
 	// Nginx 不需要 chainPath，忽略第三个参数
-	return a.deployer.Rollback(backupCertPath, backupKeyPath)
+	return a.deployer.Rollback(ctx, backupCertPath, backupKeyPath)
 }
 
 // apacheDeployerAdapter Apache 部署器适配器
@@ -202,20 +202,20 @@ type apacheDeployerAdapter struct {
 	deployer *apacheDeployer.ApacheDeployer
 }
 
-func (a *apacheDeployerAdapter) Deploy(cert, chain, key string) error {
-	return a.deployer.Deploy(cert, chain, key)
+func (a *apacheDeployerAdapter) Deploy(ctx context.Context, cert, chain, key string) error {
+	return a.deployer.Deploy(ctx, cert, chain, key)
 }
 
-func (a *apacheDeployerAdapter) Reload() error {
-	return a.deployer.Reload()
+func (a *apacheDeployerAdapter) Reload(ctx context.Context) error {
+	return a.deployer.Reload(ctx)
 }
 
-func (a *apacheDeployerAdapter) Test() error {
-	return a.deployer.Test()
+func (a *apacheDeployerAdapter) Test(ctx context.Context) error {
+	return a.deployer.Test(ctx)
 }
 
-func (a *apacheDeployerAdapter) Rollback(backupCertPath, backupKeyPath, backupChainPath string) error {
-	return a.deployer.Rollback(backupCertPath, backupKeyPath, backupChainPath)
+func (a *apacheDeployerAdapter) Rollback(ctx context.Context, backupCertPath, backupKeyPath, backupChainPath string) error {
+	return a.deployer.Rollback(ctx, backupCertPath, backupKeyPath, backupChainPath)
 }
 
 // apacheScannerAdapter Apache 扫描器适配器

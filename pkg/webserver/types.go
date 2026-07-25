@@ -1,6 +1,8 @@
 // Package webserver Web 服务器抽象层
 package webserver
 
+import "context"
+
 // ServerType 服务器类型
 type ServerType string
 
@@ -42,17 +44,21 @@ type Scanner interface {
 	ServerType() ServerType
 }
 
-// Deployer 部署器接口
+// Deployer 部署器接口。
+// 各方法首参接收 ctx：重载等待、进程探测与外部命令都可能长时间阻塞，
+// 检查超时与关停信号需要能中断它们，缩短 daemon 的强杀窗口。
+// 注意回滚路径不得直接沿用被取消的 ctx（见 certops 的回滚预算），
+// 否则"关停能打断部署"会连兜底回滚一起打断，落进服务不可用的更坏分支。
 type Deployer interface {
 	// Deploy 部署证书
-	Deploy(cert, intermediate, key string) error
+	Deploy(ctx context.Context, cert, intermediate, key string) error
 	// Reload 重载服务
-	Reload() error
+	Reload(ctx context.Context) error
 	// Test 测试配置
-	Test() error
+	Test(ctx context.Context) error
 	// Rollback 回滚到备份的证书
 	// chainPath 可选，用于 Apache；Nginx 可忽略该参数
-	Rollback(backupCertPath, backupKeyPath, backupChainPath string) error
+	Rollback(ctx context.Context, backupCertPath, backupKeyPath, backupChainPath string) error
 }
 
 // Installer SSL 配置安装器接口

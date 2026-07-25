@@ -83,58 +83,65 @@ func TestSendCallback_EmptyAPI(t *testing.T) {
 	}
 }
 
-// TestRetryFailedBindings_Expired 测试过期重试分支
-func TestRetryFailedBindings_Expired(t *testing.T) {
+// TestRetryFailedBindings_CapParksToStale 重试触顶停车：不消耗证书级配额、不 CAP 整张证书，
+// 未发生部署的出口静默停车（deploy-spec §2.8:297 触顶路径不发送任何回调）。
+func TestRetryFailedBindings_CapParksToStale(t *testing.T) {
 	dir := t.TempDir()
 	cm, err := config.NewConfigManagerWithDir(dir)
 	if err != nil {
 		t.Fatalf("创建配置管理器失败: %v", err)
 	}
 
-	// 添加证书到配置
+	staleSince := time.Now().Add(-8 * 24 * time.Hour)
 	cert := &config.CertConfig{
-		CertName: "expired-retry-cert",
+		CertName: "capped-retry-cert",
 		OrderID:  123,
 		Enabled:  true,
-		API:      config.APIConfig{URL: "http://example.com", Token: "test-token"},
+		API:      config.APIConfig{URL: "http://127.0.0.1:1", Token: "test-token"},
 		Metadata: config.CertMetadata{
 			FailedBindings:   []string{"site1.com"},
-			FailedBindingsAt: time.Now().Add(-8 * 24 * time.Hour), // 8 天前，超过 retryMaxDays(7)
+			FailedBindingsAt: staleSince,
+			// 本轮入口递增后恰好达到上限
+			RetryAttemptCount:  MaxRetryAttemptCount - 1,
+			DeployAttemptCount: 3, // 证书级配额基线，重试路径全程不得触碰
 		},
+		Bindings: []config.SiteBinding{{ServerName: "site1.com", ServerType: config.ServerTypeNginx, Enabled: true}},
 	}
 	_ = cm.AddCert(cert)
 
-	log := logger.NewNopLogger()
-	svc := NewService(cm, log)
+	svc := NewService(cm, logger.NewNopLogger())
+	certCopy, _ := cm.GetCert("capped-retry-cert")
 
-	// 重新获取 cert（深拷贝）
-	certCopy, _ := cm.GetCert("expired-retry-cert")
+	result := svc.retryFailedBindings(t.Context(), certCopy, cert.API)
 
-	result := svc.retryFailedBindings(t.Context(), certCopy, config.APIConfig{
-		URL:   "http://example.com",
-		Token: "test-token",
-	})
-
-	if result == nil {
-		t.Fatal("结果不应为 nil")
-	}
-	if result.Status != "failure" {
-		t.Errorf("过期重试应返回 failure，实际: %s", result.Status)
-	}
-	if result.Error == nil {
-		t.Error("过期重试应���回错误")
-	}
-	if result.Mode != "retry" {
-		t.Errorf("Mode = %s, 期望 retry", result.Mode)
+	// API 不可达属"未发生部署"：触顶时静默停车，不上报回调
+	if result != nil {
+		t.Fatalf("触顶且未发生部署时应静默停车（返回 nil），实际: %+v", result)
 	}
 
-	// 验证 FailedBindings 已被清空并持久化
-	updated, _ := cm.GetCert("expired-retry-cert")
+	updated, _ := cm.GetCert("capped-retry-cert")
 	if len(updated.Metadata.FailedBindings) != 0 {
-		t.Errorf("过期后 FailedBindings 应被清空，实际: %v", updated.Metadata.FailedBindings)
+		t.Errorf("停车后 FailedBindings 应被清空，实际: %v", updated.Metadata.FailedBindings)
 	}
 	if !updated.Metadata.FailedBindingsAt.IsZero() {
-		t.Errorf("过期后 FailedBindingsAt 应被清零，实际: %v", updated.Metadata.FailedBindingsAt)
+		t.Errorf("停车后 FailedBindingsAt 应被清零，实际: %v", updated.Metadata.FailedBindingsAt)
+	}
+	if updated.Metadata.RetryAttemptCount != 0 {
+		t.Errorf("停车后重试计数应复位，实际: %d", updated.Metadata.RetryAttemptCount)
+	}
+	// 关键不变式：绑定级重试绝不能消耗证书级部署配额，
+	// 否则一个坏站点或一次 API 宕机就会把整张证书打进 CAPPED、健康站点跟着过期
+	if updated.Metadata.DeployAttemptCount != 3 {
+		t.Errorf("重试路径不得触碰证书级 DeployAttemptCount，实际: %d", updated.Metadata.DeployAttemptCount)
+	}
+	if updated.Metadata.LastIssueState != "" {
+		t.Errorf("重试触顶不得把整张证书打进终止态，实际: %q", updated.Metadata.LastIssueState)
+	}
+	if len(updated.Metadata.StaleBindings) != 1 || updated.Metadata.StaleBindings[0] != "site1.com" {
+		t.Errorf("停车后绑定应转入 StaleBindings，实际: %v", updated.Metadata.StaleBindings)
+	}
+	if updated.Metadata.StaleSince.Sub(staleSince) > time.Second || staleSince.Sub(updated.Metadata.StaleSince) > time.Second {
+		t.Errorf("StaleSince 应取首次失败时间，实际: %v", updated.Metadata.StaleSince)
 	}
 }
 
@@ -153,8 +160,10 @@ func TestRetryFailedBindings_APIFail(t *testing.T) {
 		API:      config.APIConfig{URL: "http://127.0.0.1:1", Token: "test-token"},
 		Metadata: config.CertMetadata{
 			FailedBindings:   []string{"site1.com"},
-			FailedBindingsAt: time.Now().Add(-1 * time.Hour), // 1 小时前，未过期
+			FailedBindingsAt: time.Now().Add(-1 * time.Hour), // 1 小时前
 		},
+		// 失败绑定必须仍在启用绑定中，否则被前置预检判为幽灵条目直接清理
+		Bindings: []config.SiteBinding{{ServerName: "site1.com", ServerType: config.ServerTypeNginx, Enabled: true}},
 	}
 	_ = cm.AddCert(cert)
 
@@ -259,9 +268,11 @@ func TestRetryFailedBindings_CertNotReady(t *testing.T) {
 		Enabled:  true,
 		API:      config.APIConfig{URL: server.URL, Token: "test-token"},
 		Metadata: config.CertMetadata{
-			FailedBindings:   []string{"site1.com"},
-			FailedBindingsAt: time.Now().Add(-1 * time.Hour),
+			FailedBindings:    []string{"site1.com"},
+			FailedBindingsAt:  time.Now().Add(-1 * time.Hour),
+			RetryAttemptCount: 5,
 		},
+		Bindings: []config.SiteBinding{{ServerName: "site1.com", ServerType: config.ServerTypeNginx, Enabled: true}},
 	}
 	_ = cm.AddCert(cert)
 
@@ -280,6 +291,22 @@ func TestRetryFailedBindings_CertNotReady(t *testing.T) {
 	}
 	if result.Status != "pending" {
 		t.Errorf("证书未就绪应返回 pending，实际: %s", result.Status)
+	}
+	// 服务端仍在签发（合法在途状态）：既非部署尝试也非部署结果，不得计入重试配额，
+	// 否则合法 processing 满 10 轮会清空 FailedBindings，证书真正签发后反而不再重试
+	if certCopy.Metadata.RetryAttemptCount != 5 {
+		t.Errorf("未就绪分支不应计入重试配额，实际 RetryAttemptCount = %d", certCopy.Metadata.RetryAttemptCount)
+	}
+	// syncOrderID 会把 cert_name 修正为 {domain}-{order_id}，按修正后的名字回读
+	updated, err := cm.GetCert(certCopy.CertName)
+	if err != nil {
+		t.Fatalf("读取证书 %s 失败: %v", certCopy.CertName, err)
+	}
+	if updated.Metadata.RetryAttemptCount != 5 {
+		t.Errorf("回滚后的重试计数应已落盘，实际 %d", updated.Metadata.RetryAttemptCount)
+	}
+	if len(updated.Metadata.FailedBindings) != 1 {
+		t.Errorf("未就绪不应清空失败绑定，实际: %v", updated.Metadata.FailedBindings)
 	}
 }
 

@@ -89,6 +89,17 @@ type CertMetadata struct {
 	// 部署失败的绑定列表（ServerName），下次检查时重试
 	FailedBindings   []string  `json:"failed_bindings,omitempty"`
 	FailedBindingsAt time.Time `json:"failed_bindings_at,omitempty"` // 首次记录失败绑定的时间
+	// RetryAttemptCount 失败绑定重试计数（平台扩展字段，deploy-spec §1.6）。
+	// 与证书级 DeployAttemptCount 分离：绑定级重试是规范未建模的平台扩展，
+	// 共用公共计数会让单个坏站点把整张证书打进 CAPPED，健康站点跟着过期。
+	RetryAttemptCount int `json:"retry_attempt_count,omitempty"`
+	// NoBindingBlockedAt 零启用绑定阻断标记（平台扩展字段，deploy-spec §1.6）。
+	// 证书 enabled 但无任何启用绑定时置位：退出自动流程、不发请求、不回调，等待人工处理；
+	// 绑定恢复后自动清除。不占用公共字段 last_issue_state，避免覆盖在途签发状态。
+	NoBindingBlockedAt time.Time `json:"no_binding_blocked_at,omitempty"`
+	// StaleBindings 长期未部署成功的绑定（平台扩展字段）：语义为"该绑定当前未持有本证书的最新证书"。
+	StaleBindings []string  `json:"stale_bindings,omitempty"`
+	StaleSince    time.Time `json:"stale_since,omitempty"`
 	// 文件验证相关
 	ValidationFiles []string `json:"validation_files,omitempty"` // 已写入的验证文件路径（部署成功后清理）
 }
@@ -219,6 +230,18 @@ func (c *CertConfig) IsIllegalIPConfig(schedule *ScheduleConfig) bool {
 	}
 	if c.ValidationMethod == ValidationMethodDelegation {
 		return true // IP + delegation
+	}
+	return false
+}
+
+// HasEnabledBinding 是否存在启用的站点绑定。
+// 证书 enabled 但零启用绑定属配置异常（站点被改绑到其它证书、人工禁用等）：
+// 无部署目标，不应进入自动续签/部署流程，更不应向服务端上报"部署成功"。
+func (c *CertConfig) HasEnabledBinding() bool {
+	for i := range c.Bindings {
+		if c.Bindings[i].Enabled {
+			return true
+		}
 	}
 	return false
 }

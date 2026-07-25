@@ -59,11 +59,44 @@ func TestSyncOrderID_MigratesPendingKey(t *testing.T) {
 	}
 }
 
-// TestRenamePendingKey_NoPending 验证无 pending 私钥时迁移为空操作。
-func TestRenamePendingKey_NoPending(t *testing.T) {
+// TestCopyPendingKey_NoPending 验证无 pending 私钥时复制为空操作。
+func TestCopyPendingKey_NoPending(t *testing.T) {
 	tmpDir := t.TempDir()
-	if err := renamePendingKey(tmpDir, "old-name", "new-name"); err != nil {
+	if err := copyPendingKey(tmpDir, "old-name", "new-name"); err != nil {
 		t.Errorf("无 pending 私钥时应为空操作: %v", err)
+	}
+	if _, err := os.Lstat(getPendingKeyPath(tmpDir, "new-name")); !os.IsNotExist(err) {
+		t.Error("空操作不应创建新目录")
+	}
+}
+
+// TestCopyPendingKey_KeepsSourceUntilCommit 验证两阶段提交的第一步：
+// 复制后源与副本同时存在（改名落盘成功后才由调用方删除源），内容一致、权限 0600。
+func TestCopyPendingKey_KeepsSourceUntilCommit(t *testing.T) {
+	tmpDir := t.TempDir()
+	keyPEM := "-----BEGIN RSA PRIVATE KEY-----\ntwo-phase\n-----END RSA PRIVATE KEY-----"
+	if err := savePendingKey(tmpDir, "old-name", keyPEM); err != nil {
+		t.Fatalf("保存 pending 私钥失败: %v", err)
+	}
+	if err := copyPendingKey(tmpDir, "old-name", "new-name"); err != nil {
+		t.Fatalf("复制 pending 私钥失败: %v", err)
+	}
+
+	for _, name := range []string{"old-name", "new-name"} {
+		got, err := readPendingKey(tmpDir, name)
+		if err != nil {
+			t.Fatalf("%s 应能读到 pending 私钥: %v", name, err)
+		}
+		if got != keyPEM {
+			t.Errorf("%s 的 pending 私钥内容不应改变", name)
+		}
+	}
+	info, err := os.Lstat(getPendingKeyPath(tmpDir, "new-name"))
+	if err != nil {
+		t.Fatalf("读取副本权限失败: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0600 {
+		t.Errorf("副本权限应为 0600，实际 %04o", perm)
 	}
 }
 

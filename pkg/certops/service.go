@@ -79,16 +79,34 @@ func FixCertName(cfgManager *config.ConfigManager, cert *config.CertConfig, log 
 		return
 	}
 	oldName := cert.CertName
+	workDir := cfgManager.GetWorkDir()
+
+	// 两阶段提交：先复制 pending 私钥 → 再落盘改名 → 成功后才改内存名并清理旧目录。
+	// 任一步失败都保持"配置名与 pending 目录一致"，否则 local 续签读不到在途私钥，
+	// 会回退线上私钥 → 与新证书不配对 → 重置签发状态 → 下轮重新生成 CSR 覆盖 pending。
+	if err := copyPendingKey(workDir, oldName, expectedName); err != nil {
+		if log != nil {
+			log.Error("证书 %s 改名中止：复制 pending 私钥到 %s 失败: %v", oldName, expectedName, err)
+		}
+		return
+	}
+	renamed := *cert
+	renamed.CertName = expectedName
+	if err := cfgManager.RenameCert(oldName, &renamed); err != nil {
+		if cleanupErr := cleanupPendingKey(workDir, expectedName); cleanupErr != nil && log != nil {
+			log.Error("回滚 pending 私钥副本失败，需人工清理 pending-keys/%s: %v", expectedName, cleanupErr)
+		}
+		if log != nil {
+			log.Error("证书 %s 改名为 %s 失败，保留旧名（order_id 已更新）: %v", oldName, expectedName, err)
+		}
+		return
+	}
 	cert.CertName = expectedName
+	if err := cleanupPendingKey(workDir, oldName); err != nil && log != nil {
+		log.Warn("清理旧 pending 私钥目录失败（新目录已生效，不影响功能）: %v", err)
+	}
 	if log != nil {
 		log.Info("证书名称修正: %s -> %s", oldName, expectedName)
-	}
-	// pending 私钥按 certName 组织，改名时一并迁移，否则 local 模式续签读不到 pending key
-	if err := renamePendingKey(cfgManager.GetWorkDir(), oldName, expectedName); err != nil && log != nil {
-		log.Warn("迁移 pending 私钥失败: %v", err)
-	}
-	if err := cfgManager.RenameCert(oldName, cert); err != nil && log != nil {
-		log.Warn("重命名证书配置失败: %v", err)
 	}
 }
 
@@ -111,9 +129,14 @@ func (s *Service) CheckExpiry() {
 		if !cert.Enabled {
 			continue
 		}
-		// 到期时间未知不再静默跳过（告警盲区），下轮续签检查会自动回填
+		// 到期时间未知不再静默跳过（告警盲区），下轮续签检查会自动回填。
+		// 零启用绑定的证书例外：闸门在回填之前拦截，不会有人去回填，不能给出假承诺。
 		if cert.Metadata.CertExpiresAt.IsZero() {
-			s.log.Warn("证书 %s 到期时间未知（元数据缺失），无法判断过期风险，续签检查将自动回填", cert.CertName)
+			if !cert.HasEnabledBinding() {
+				s.log.Error("证书 %s 到期时间未知且没有启用的站点绑定，已阻断自动续签，需人工处理", cert.CertName)
+			} else {
+				s.log.Warn("证书 %s 到期时间未知（元数据缺失），无法判断过期风险，续签检查将自动回填", cert.CertName)
+			}
 			continue
 		}
 

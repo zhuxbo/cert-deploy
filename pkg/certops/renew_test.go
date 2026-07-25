@@ -3,6 +3,7 @@ package certops
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -540,6 +541,12 @@ func TestCheckAndRenewAll_ContextCancelDuringDelay(t *testing.T) {
 			Metadata: config.CertMetadata{
 				CertExpiresAt: time.Now().Add(3 * 24 * time.Hour), // 3 天后过期，需要续期
 			},
+			// 必须有启用绑定：零绑定证书会被闸门拦截、不发任何请求，也就不会产生证书间延迟
+			Bindings: []config.SiteBinding{{
+				ServerName: name + ".example.com",
+				ServerType: config.ServerTypeNginx,
+				Enabled:    true,
+			}},
 		}
 		_ = cm.AddCert(cert)
 	}
@@ -601,8 +608,10 @@ func TestDeployCertToBindings_NoBindings(t *testing.T) {
 	ctx := t.Context()
 	count, _, err := svc.deployCertToBindings(ctx, cert, certData, testCert.KeyPEM)
 
-	if err != nil {
-		t.Errorf("无绑定时不应返回错误: %v", err)
+	// 零启用绑定必须返回明确错误：返回 (0, nil, nil) 会让调用方把"一个站点都没部署"
+	// 读成成功并向服务端上报 success（已实测的误报链）
+	if !errors.Is(err, ErrNoEnabledBinding) {
+		t.Errorf("无绑定时应返回 ErrNoEnabledBinding，实际: %v", err)
 	}
 
 	if count != 0 {
@@ -643,12 +652,46 @@ func TestDeployCertToBindings_AllDisabled(t *testing.T) {
 	ctx := t.Context()
 	count, _, err := svc.deployCertToBindings(ctx, cert, certData, testCert.KeyPEM)
 
-	if err != nil {
-		t.Errorf("所有绑定禁用时不应返回错误: %v", err)
+	if !errors.Is(err, ErrNoEnabledBinding) {
+		t.Errorf("所有绑定禁用时应返回 ErrNoEnabledBinding，实际: %v", err)
 	}
 
 	if count != 0 {
 		t.Errorf("所有绑定禁用时部署计数应为 0，实际: %d", count)
+	}
+}
+
+// TestDeployCertToBindings_NoEnabledBindingKeepsFailedBindings 回归：零启用绑定早退必须发生在
+// FailedBindings 赋值之前——早退点若放到函数末尾，失败绑定记录会被本轮清空并落盘，
+// 重试与 stale 迁移赖以工作的名单直接消失。
+func TestDeployCertToBindings_NoEnabledBindingKeepsFailedBindings(t *testing.T) {
+	tmpDir := t.TempDir()
+	cm, err := config.NewConfigManagerWithDir(tmpDir)
+	if err != nil {
+		t.Fatalf("创建配置管理器失败: %v", err)
+	}
+	svc := NewService(cm, logger.NewNopLogger())
+
+	testCert, err := certs.GenerateValidCert("keep.example.com", []string{"keep.example.com"})
+	if err != nil {
+		t.Fatalf("生成测试证书失败: %v", err)
+	}
+
+	cert := &config.CertConfig{
+		CertName: "keep.example.com-1",
+		Bindings: []config.SiteBinding{{ServerName: "keepme", Enabled: false}},
+		Metadata: config.CertMetadata{FailedBindings: []string{"keepme"}},
+	}
+
+	_, failed, err := svc.deployCertToBindings(t.Context(), cert, &fetcher.CertData{Cert: testCert.CertPEM}, testCert.KeyPEM)
+	if !errors.Is(err, ErrNoEnabledBinding) {
+		t.Fatalf("应返回 ErrNoEnabledBinding，实际: %v", err)
+	}
+	if len(cert.Metadata.FailedBindings) != 1 || cert.Metadata.FailedBindings[0] != "keepme" {
+		t.Errorf("早退不得清空 FailedBindings，实际: %v", cert.Metadata.FailedBindings)
+	}
+	if len(failed) != 1 {
+		t.Errorf("应原样返回既有失败绑定，实际: %v", failed)
 	}
 }
 

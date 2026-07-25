@@ -4,6 +4,7 @@ package certops
 import (
 	"context"
 	"crypto/x509"
+	stderrors "errors"
 	"fmt"
 	"math/rand/v2"
 	"os"
@@ -28,6 +29,16 @@ const MaxIssueRetryCount = config.AttemptCap
 
 // MaxDeployAttemptCount 部署尝试上限，>= 10 触顶；与签发计数分离
 const MaxDeployAttemptCount = config.AttemptCap
+
+// MaxRetryAttemptCount 失败绑定重试上限，>= 10 停车（迁入 stale_bindings 并停止重试）。
+// 使用独立计数（config.CertMetadata.RetryAttemptCount）而非证书级 DeployAttemptCount：
+// 绑定级重试是 deploy-spec 未建模的平台扩展，共用公共计数会让单个坏站点、API 宕机或
+// 服务端签发中把整张证书打进 CAPPED，健康站点跟着过期。
+const MaxRetryAttemptCount = config.AttemptCap
+
+// ErrNoEnabledBinding 证书没有任何启用的站点绑定（配置异常，无部署目标）。
+// 部署函数据此返回明确错误而非 (0, nil, nil)，防止调用方把"一个站点都没部署"读成成功。
+var ErrNoEnabledBinding = stderrors.New("证书没有启用的站点绑定")
 
 // AutoActionSafetyMargin 自动动作安全余量（deploy-spec §3.2/§11）：
 // 证书剩余有效期小于该值时不再启动新的签发/部署动作，避免临门失败与噪声。
@@ -90,6 +101,12 @@ func (s *Service) CheckAndRenewAll(ctx context.Context) ([]*RenewResult, error) 
 		return nil, fmt.Errorf("加载配置失败: %w", err)
 	}
 
+	// 同名条目告警：只能由历史上未做重名检测的改名产生，其中必有零绑定孤儿，
+	// 而 UpdateCert 按名匹配首条会写错条目。不自动合并/删除，交人工处理。
+	if dups, dupErr := s.cfgManager.FindDuplicateCertNames(); dupErr == nil && len(dups) > 0 {
+		s.log.Error("配置中存在重名证书条目 %v，元数据可能写到错误条目上，请人工清理", dups)
+	}
+
 	var results []*RenewResult
 	var needsDelay bool // 上一轮是否发起了 API 请求，需要延迟
 
@@ -146,6 +163,11 @@ func (s *Service) willMakeAPICall(cert *config.CertConfig, schedule *config.Sche
 		return false
 	}
 	if isTerminalIssueState(cert.Metadata.LastIssueState) || cert.IsIllegalIPConfig(schedule) {
+		return false
+	}
+	// 零启用绑定：闸门在回填之前拦截，全程零 API 请求（必须先于下面的零到期分支判断，
+	// 否则零绑定 + 到期时间未知会被预估成"要发请求"，与编排层实际行为反向漂移）
+	if !cert.HasEnabledBinding() {
 		return false
 	}
 	// 到期时间未知：会发起一次 API 查询回填
@@ -251,6 +273,32 @@ func (s *Service) processCertRenewal(ctx context.Context, cfg *config.Config, ce
 		return nil, false
 	}
 
+	// 零启用绑定闸门：证书 enabled 却没有任何启用绑定（站点被 setup/deploy 改绑到其它证书、
+	// 人工禁用、改名产生的孤儿条目等）——没有部署目标，退出自动流程：不发起任何 API 请求、
+	// 不部署、不计数、不回调，落阻断标记等待人工处理。
+	//
+	// 位置必须在"到期时间回填"之前：回填内部会走 syncOrderID → FixCertName → RenameCert，
+	// 等于让一个已被阻断的证书去改写配置；且零绑定 + 到期未知的证书若卡在回填失败上，
+	// 会每天发一次注定无用的请求却永远拿不到标记。
+	// 闸门内部先跑两个纯本地判定（零 API 请求），保住 deploy-spec §3.2 的 EXPIRED / CAPPED 状态转移。
+	if !cert.HasEnabledBinding() {
+		if !cert.Metadata.CertExpiresAt.IsZero() {
+			if cert.IsExpired() {
+				s.markExpired(&cert)
+				return nil, false
+			}
+			if phase := cappedPhaseFor(&cert, &cfg.Schedule); phase != "" {
+				s.markCapped(&cert, phase)
+				return nil, false
+			}
+		}
+		s.markNoBindingBlocked(&cert)
+		return nil, false
+	}
+	if !cert.Metadata.NoBindingBlockedAt.IsZero() {
+		s.clearNoBindingBlocked(&cert)
+	}
+
 	// 到期时间未知（部署成功但元数据保存失败、带外换证等）：
 	// 语义为"未知需处理"，先查询 API 回填元数据再按正常逻辑判定，避免"永不续签 + 告警盲区"双盲
 	if cert.Metadata.CertExpiresAt.IsZero() {
@@ -288,6 +336,10 @@ func (s *Service) processCertRenewal(ctx context.Context, cfg *config.Config, ce
 		madeAPICall = true
 		s.log.Info("证书 %s 重试 %d 个失败绑定...", cert.CertName, len(cert.Metadata.FailedBindings))
 		result = s.retryFailedBindings(ctx, &cert, api)
+		// nil 表示本轮无可上报的结果（幽灵条目已清理、或触顶静默停车）
+		if result == nil {
+			return nil, madeAPICall
+		}
 		// 部署结果回调（pending 不发）
 		if result.Status == "success" || result.Status == "failure" {
 			s.sendRenewCallback(ctx, &cert, result)
@@ -348,10 +400,12 @@ func (s *Service) processCertRenewal(ctx context.Context, cfg *config.Config, ce
 // 崩溃重启复验时据 DeployStartedAt 复位重放同一意图、不再递增（不盲增）。
 // 回调纪律：底层部署函数不发回调，仅由本编排层在结果原子落盘后统一上报（成功/明确失败各尽力一次）。
 func (s *Service) runDeployAttempt(ctx context.Context, cert *config.CertConfig, certData *fetcher.CertData, privateKey string, result *RenewResult) {
+	incremented := false
 	if cert.Metadata.DeployStartedAt.IsZero() {
 		// 新部署意图：部署前原子落盘"已开始"标记与计数递增（崩溃可复位重放）
 		cert.Metadata.DeployAttemptCount++
 		cert.Metadata.DeployStartedAt = time.Now()
+		incremented = true
 		if err := s.cfgManager.UpdateCert(cert); err != nil {
 			s.log.Warn("持久化部署意图失败: %v", err)
 		}
@@ -362,6 +416,22 @@ func (s *Service) runDeployAttempt(ctx context.Context, cert *config.CertConfig,
 
 	deployCount, _, deployErr := s.deployCertToBindings(ctx, cert, certData, privateKey)
 	result.DeployCount = deployCount
+
+	// 零启用绑定（纵深防御命中）：本轮没有发生任何部署尝试 —— 回滚计数、不上报回调。
+	// 回滚必须是条件式的：崩溃重放分支本轮未递增，无条件 -- 会把计数减到上一轮之下，削弱触顶保护。
+	if stderrors.Is(deployErr, ErrNoEnabledBinding) {
+		if incremented {
+			cert.Metadata.DeployAttemptCount--
+		}
+		cert.Metadata.DeployStartedAt = time.Time{}
+		if err := s.cfgManager.UpdateCert(cert); err != nil {
+			s.log.Warn("回滚证书 %s 部署意图失败: %v", cert.CertName, err)
+		}
+		result.Status = "failure"
+		result.Error = deployErr
+		s.log.Error("证书 %s 没有启用的站点绑定，跳过部署（不计数、不上报回调）", cert.CertName)
+		return
+	}
 
 	// 结果落盘：清除"已开始"标记（本次尝试已产生明确结果）；
 	// deployCertToBindings 成功时已清零全部计数与状态，失败时保留计数递增值。
@@ -394,6 +464,114 @@ func (s *Service) persistTerminalState(cert *config.CertConfig, state, phase str
 	if err := s.cfgManager.UpdateCert(cert); err != nil {
 		s.log.Warn("持久化证书 %s 状态 %s 失败: %v", cert.CertName, state, err)
 	}
+}
+
+// markNoBindingBlocked 落零绑定阻断标记。
+// 落盘走 UpdateCertIf 原子复检：GetCert 复读是 mtime 门控的缓存读，而写入在文件锁内强制重读盘上状态，
+// 两者可能是不同快照——人工在窗口内补齐绑定时，会被整条覆盖回零绑定。
+// 仅在标记从无到有时打 Error（含在途签发提示），之后每轮 Debug。
+func (s *Service) markNoBindingBlocked(cert *config.CertConfig) {
+	if !cert.Metadata.NoBindingBlockedAt.IsZero() {
+		s.log.Debug("证书 %s 无启用绑定，保持阻断", cert.CertName)
+		return
+	}
+	s.log.Error("证书 %s 已启用但没有任何启用的站点绑定，已阻断自动续签与部署（不发起请求、不上报回调），请重新 setup 或恢复绑定", cert.CertName)
+	if state := normalizeIssueState(cert.Metadata.LastIssueState); state == config.IssueStateProcessing || state == config.IssueStateActive {
+		s.log.Error("证书 %s 存在在途订单（状态 %s）与可能未转正的 pending 私钥，阻断期间不会自行终止，需人工处理", cert.CertName, cert.Metadata.LastIssueState)
+	}
+
+	now := time.Now()
+	err := s.cfgManager.UpdateCertIf(cert.CertName,
+		func(c *config.CertConfig) bool { return !c.HasEnabledBinding() },
+		func(c *config.CertConfig) { c.Metadata.NoBindingBlockedAt = now })
+	switch {
+	case err == nil:
+		cert.Metadata.NoBindingBlockedAt = now
+	case stderrors.Is(err, config.ErrCertCondNotMet):
+		s.log.Warn("证书 %s 落阻断标记时复检发现绑定已恢复，跳过写入", cert.CertName)
+	default:
+		s.log.Warn("持久化证书 %s 阻断标记失败: %v", cert.CertName, err)
+	}
+}
+
+// clearNoBindingBlocked 绑定恢复后解除阻断（计数不复位，避免旁路停机保护）
+func (s *Service) clearNoBindingBlocked(cert *config.CertConfig) {
+	err := s.cfgManager.UpdateCertIf(cert.CertName,
+		func(c *config.CertConfig) bool { return c.HasEnabledBinding() },
+		func(c *config.CertConfig) { c.Metadata.NoBindingBlockedAt = time.Time{} })
+	if err != nil && !stderrors.Is(err, config.ErrCertCondNotMet) {
+		s.log.Warn("清除证书 %s 阻断标记失败: %v", cert.CertName, err)
+		return
+	}
+	cert.Metadata.NoBindingBlockedAt = time.Time{}
+	s.log.Info("证书 %s 已恢复启用绑定，解除阻断（计数不复位）", cert.CertName)
+}
+
+// retainableStaleNames 过滤可迁入 StaleBindings 的名字：只保留仍在 cert.Bindings 中的绑定。
+// 已被改绑到其它证书的名字不能迁入——本证书永远不会再部署该站点，
+// ClearStaleBinding 的调用点都以"本次部署成功的 ServerName"为入参，永远不会包含它，
+// 告警会变成永远关不掉的每日 Error。
+func retainableStaleNames(cert *config.CertConfig, names []string) []string {
+	if len(names) == 0 {
+		return nil
+	}
+	exists := make(map[string]bool, len(cert.Bindings))
+	for i := range cert.Bindings {
+		exists[cert.Bindings[i].ServerName] = true
+	}
+	var kept []string
+	for _, name := range names {
+		if exists[name] {
+			kept = append(kept, name)
+		}
+	}
+	return kept
+}
+
+// migrateToStale 把绑定迁入 StaleBindings（去重）；StaleSince 仅在从空变非空时设置
+func migrateToStale(cert *config.CertConfig, names []string, since time.Time) {
+	kept := retainableStaleNames(cert, names)
+	if len(kept) == 0 {
+		return
+	}
+	seen := make(map[string]bool, len(cert.Metadata.StaleBindings))
+	for _, name := range cert.Metadata.StaleBindings {
+		seen[name] = true
+	}
+	wasEmpty := len(cert.Metadata.StaleBindings) == 0
+	for _, name := range kept {
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		cert.Metadata.StaleBindings = append(cert.Metadata.StaleBindings, name)
+	}
+	if wasEmpty && len(cert.Metadata.StaleBindings) > 0 {
+		if since.IsZero() {
+			since = time.Now()
+		}
+		cert.Metadata.StaleSince = since
+	}
+}
+
+// ClearStaleBinding 部署成功后清除该绑定的 stale 标记；列表清空时一并清除 StaleSince。
+// 供续签、失败绑定重试、CLI 部署与 setup 共用。
+func ClearStaleBinding(cert *config.CertConfig, serverName string) {
+	if len(cert.Metadata.StaleBindings) == 0 {
+		return
+	}
+	kept := cert.Metadata.StaleBindings[:0]
+	for _, name := range cert.Metadata.StaleBindings {
+		if name != serverName {
+			kept = append(kept, name)
+		}
+	}
+	if len(kept) == 0 {
+		cert.Metadata.StaleBindings = nil
+		cert.Metadata.StaleSince = time.Time{}
+		return
+	}
+	cert.Metadata.StaleBindings = kept
 }
 
 // markCapped 触顶进入 CAPPED 静默并记录触顶阶段
@@ -465,32 +643,108 @@ func (s *Service) refreshExpiryFromAPI(ctx context.Context, cert *config.CertCon
 	return true
 }
 
-// retryMaxDays 失败绑定重试的最大天数，超过后放弃重试
-const retryMaxDays = 7
+// splitRetryTargets 把 FailedBindings 分成可重试集与幽灵集。
+// 幽灵有两类：已不在 cert.Bindings（站点被改绑到其它证书）、仍在但被禁用（运维维护中）。
+func splitRetryTargets(cert *config.CertConfig) (retryable, ghosts []string) {
+	enabled := make(map[string]bool, len(cert.Bindings))
+	for i := range cert.Bindings {
+		if cert.Bindings[i].Enabled {
+			enabled[cert.Bindings[i].ServerName] = true
+		}
+	}
+	for _, name := range cert.Metadata.FailedBindings {
+		if enabled[name] {
+			retryable = append(retryable, name)
+		} else {
+			ghosts = append(ghosts, name)
+		}
+	}
+	return retryable, ghosts
+}
 
-// retryFailedBindings 重试上次部署失败的绑定
-// 返回 RenewResult 供上层统计
+// annotateCapReached 给触顶那一次失败的原因前置标注，供服务端识别"已停止自动重试"。
+// 措辞与 runDeployAttempt 的证书级标注区分，避免服务端在同一张证书上看到两个配额发出同样文本。
+func annotateCapReached(err error) error {
+	return fmt.Errorf("绑定重试已达上限（已停止自动重试，需人工介入）: %w", err)
+}
+
+// rollbackRetryCount 回滚本轮的重试计数（用于"未发生部署且不应计入配额"的出口）
+func (s *Service) rollbackRetryCount(cert *config.CertConfig) {
+	if cert.Metadata.RetryAttemptCount > 0 {
+		cert.Metadata.RetryAttemptCount--
+	}
+	if err := s.cfgManager.UpdateCert(cert); err != nil {
+		s.log.Warn("回滚证书 %s 重试计数失败: %v", cert.CertName, err)
+	}
+}
+
+// parkExhaustedRetries 重试触顶停车：迁入 StaleBindings、清空失败列表、复位重试计数。
+// **不设置 LastIssueState=CAPPED**——绑定级重试是 deploy-spec 未建模的平台扩展，
+// 让它把整张证书打进 CAPPED 会连健康站点一起停掉续签直至过期。
+// report 为 true 时返回带标注的 failure 结果由调用方上报（仅"确实发生了部署且仍失败"的出口）；
+// 其余出口（查询失败、私钥不可读）未发生部署，按 deploy-spec §2.8:297「触顶路径不发送任何回调」静默。
+func (s *Service) parkExhaustedRetries(cert *config.CertConfig, result *RenewResult, cause error, report bool) *RenewResult {
+	parked := cert.Metadata.FailedBindings
+	migrateToStale(cert, parked, cert.Metadata.FailedBindingsAt)
+	cert.Metadata.FailedBindings = nil
+	cert.Metadata.FailedBindingsAt = time.Time{}
+	cert.Metadata.RetryAttemptCount = 0
+	cert.Metadata.DeployStartedAt = time.Time{}
+	if err := s.cfgManager.UpdateCert(cert); err != nil {
+		s.log.Warn("持久化证书 %s 重试停车状态失败: %v", cert.CertName, err)
+	}
+	s.log.Error("证书 %s 的失败绑定 %v 重试已达上限 (%d)，停止重试并转入长期未部署告警，等待人工处理: %v",
+		cert.CertName, parked, MaxRetryAttemptCount, cause)
+	if !report {
+		return nil
+	}
+	result.Status = "failure"
+	result.Error = annotateCapReached(cause)
+	return result
+}
+
+// retryFailedBindings 重试上次部署失败的绑定。
+// 返回 nil 表示本轮无可上报的结果（幽灵条目已清理、或触顶静默停车），调用方不得解引用。
 func (s *Service) retryFailedBindings(ctx context.Context, cert *config.CertConfig, api config.APIConfig) *RenewResult {
 	result := &RenewResult{
 		CertName: cert.CertName,
 		Mode:     "retry",
 	}
 
-	// 超过重试期限，放弃重试并清空
-	if !cert.Metadata.FailedBindingsAt.IsZero() &&
-		time.Since(cert.Metadata.FailedBindingsAt) > retryMaxDays*24*time.Hour {
-		s.log.Warn("证书 %s 失败绑定重试已超过 %d 天，放弃重试", cert.CertName, retryMaxDays)
+	// 前置预检（不发任何请求，故排在入口计数之前，纯记账清理不占配额）：
+	// 失败集与启用绑定的交集为空时一个绑定都不会被重试，绝不能报 success。
+	retryable, ghosts := splitRetryTargets(cert)
+	if len(ghosts) > 0 {
+		s.log.Warn("证书 %s 的失败绑定 %v 已不可重试（绑定被禁用或已改绑其它证书）", cert.CertName, ghosts)
+	}
+	if len(retryable) == 0 {
+		// 仍在 Bindings 但被禁用的转入 stale 等待恢复；已改绑他证的由 migrateToStale 过滤丢弃
+		migrateToStale(cert, cert.Metadata.FailedBindings, cert.Metadata.FailedBindingsAt)
 		cert.Metadata.FailedBindings = nil
 		cert.Metadata.FailedBindingsAt = time.Time{}
-		_ = s.cfgManager.UpdateCert(cert)
-		result.Status = "failure"
-		result.Error = fmt.Errorf("failed bindings retry expired after %d days", retryMaxDays)
-		return result
+		cert.Metadata.RetryAttemptCount = 0
+		cert.Metadata.DeployStartedAt = time.Time{}
+		if err := s.cfgManager.UpdateCert(cert); err != nil {
+			s.log.Warn("更新证书元数据失败: %v", err)
+		}
+		return nil
+	}
+
+	// 入口计数：独立配额，全程不触碰证书级 DeployAttemptCount / DeployStartedAt。
+	// 计数点必须在 QueryOrder 之前——否则 API 持续不可达时永远走不到计数点，
+	// 会产生无上限的每日 failure 回调流。
+	cert.Metadata.RetryAttemptCount++
+	exhausted := cert.Metadata.RetryAttemptCount >= MaxRetryAttemptCount
+	if err := s.cfgManager.UpdateCert(cert); err != nil {
+		s.log.Warn("持久化证书 %s 重试计数失败: %v", cert.CertName, err)
 	}
 
 	certData, renewBeforeDays, err := s.fetcher.QueryOrder(ctx, api.URL, api.Token, cert.OrderID)
 	if err != nil {
 		s.log.Warn("重试失败绑定: 查询证书 %s 失败: %v", cert.CertName, err)
+		if exhausted {
+			return s.parkExhaustedRetries(cert, result, err, false)
+		}
 		result.Status = "failure"
 		result.Error = err
 		return result
@@ -498,31 +752,37 @@ func (s *Service) retryFailedBindings(ctx context.Context, cert *config.CertConf
 	s.tryUpdateRenewBeforeDays(renewBeforeDays)
 	s.syncOrderID(cert, certData)
 	if certData.Status != "active" || certData.Cert == "" || certData.IntermediateCert == "" {
+		// 证书仍在签发中：上游在途状态，既非部署尝试也非部署结果。
+		// 不计入配额（回滚本轮递增）、不停车、不回调，等服务端签完自愈——
+		// 否则合法 processing 满 10 轮会清空 FailedBindings，证书真正签发后反而不再重试。
+		s.rollbackRetryCount(cert)
 		s.log.Warn("重试失败绑定: 证书 %s 未就绪 (status=%s)", cert.CertName, certData.Status)
 		result.Status = "pending"
 		return result
 	}
 
 	// pending 感知：续签部署全失败后 pending 私钥尚未转正，重试须能读到它，
-	// 否则旧私钥与新证书配对必败，重试期满后站点走向真实过期
+	// 否则旧私钥与新证书配对必败，站点走向真实过期
 	privateKey, err := GetPrivateKeyForCert(s.cfgManager.GetWorkDir(), cert, certData.Cert, certData.PrivateKey, s.log)
 	if err != nil {
 		s.log.Warn("重试失败绑定: 获取私钥失败: %v", err)
+		if exhausted {
+			return s.parkExhaustedRetries(cert, result, err, false)
+		}
 		result.Status = "failure"
 		result.Error = err
 		return result
 	}
 
-	// 构建失败绑定集合用于快速查找
-	failedSet := make(map[string]bool, len(cert.Metadata.FailedBindings))
-	for _, name := range cert.Metadata.FailedBindings {
-		failedSet[name] = true
+	retrySet := make(map[string]bool, len(retryable))
+	for _, name := range retryable {
+		retrySet[name] = true
 	}
 
 	var stillFailed []string
 	for j := range cert.Bindings {
 		binding := cert.Bindings[j]
-		if !binding.Enabled || !failedSet[binding.ServerName] {
+		if !retrySet[binding.ServerName] {
 			continue
 		}
 		if err := s.deployToBinding(ctx, &binding, certData, privateKey); err != nil {
@@ -531,25 +791,31 @@ func (s *Service) retryFailedBindings(ctx context.Context, cert *config.CertConf
 			continue
 		}
 		s.log.Info("重试部署到 %s 成功", binding.ServerName)
+		ClearStaleBinding(cert, binding.ServerName)
 		result.DeployCount++
 	}
 
 	cert.Metadata.FailedBindings = stillFailed
-	// 本轮重试也是一次产生了明确结果的部署尝试：清除崩溃安全标记。
-	// 残留标记会让之后一次真正的 runDeployAttempt 被当成"重放同一意图"而不递增计数，
-	// 削弱部署触顶保护。
+	// 清除证书级崩溃安全标记：残留标记会让之后一次真正的 runDeployAttempt 被当成
+	// "重放同一意图"而不递增计数，削弱部署触顶保护。
 	cert.Metadata.DeployStartedAt = time.Time{}
-	if len(stillFailed) == 0 {
-		cert.Metadata.LastDeployAt = time.Now()
-		cert.Metadata.FailedBindingsAt = time.Time{}
-		result.Status = "success"
-	} else {
-		result.Status = "failure"
-		result.Error = fmt.Errorf("%d 个绑定仍然失败", len(stillFailed))
-	}
 	// 重试部署成功后补转正 pending 私钥（若本次使用的正是 pending 私钥）
 	if result.DeployCount > 0 {
 		s.commitPendingKeyAfterDeploy(cert, privateKey)
+	}
+
+	switch {
+	case len(stillFailed) == 0:
+		cert.Metadata.LastDeployAt = time.Now()
+		cert.Metadata.FailedBindingsAt = time.Time{}
+		cert.Metadata.RetryAttemptCount = 0
+		result.Status = "success"
+	case exhausted:
+		// 确实发生了部署且仍失败：这是明确的部署结果，带标注上报一次后停车
+		return s.parkExhaustedRetries(cert, result, fmt.Errorf("%d 个绑定仍然失败", len(stillFailed)), true)
+	default:
+		result.Status = "failure"
+		result.Error = fmt.Errorf("%d 个绑定仍然失败", len(stillFailed))
 	}
 	if err := s.cfgManager.UpdateCert(cert); err != nil {
 		s.log.Warn("更新证书元数据失败: %v", err)
@@ -560,6 +826,14 @@ func (s *Service) retryFailedBindings(ctx context.Context, cert *config.CertConf
 // callbackMessageMaxLen 回调 message 字段最大长度（按 rune 计）。
 // 服务端上限为 500，客户端取更严格的 256，超长整条会被服务端拒收。
 const callbackMessageMaxLen = 256
+
+// CallbackFallbackBudget 回调兜底预算：父 ctx 已取消或余量不足时使用。
+// 取值不低于 deploy-spec §11 规定的单次 POST 超时（60s），留出一轮退避余量；
+// CLI 路径（ctx 无 deadline）也用它显式限定，避免部署已成功却让命令再挂几分钟。
+const CallbackFallbackBudget = 90 * time.Second
+
+// CallbackMessage 导出版本，供 CLI 部署链复用同一套脱敏与截断规则
+func CallbackMessage(err error) string { return callbackMessage(err) }
 
 // callbackMessage 从失败错误生成回调 message：先脱敏（复用 logger 过滤规则）再按 rune 截断，
 // 确保 Bearer token / 私钥块 / URL token 参数不会随失败原因泄漏进回调请求体。
@@ -860,6 +1134,15 @@ func (s *Service) deployCertToBindings(ctx context.Context, cert *config.CertCon
 		return 0, nil, fmt.Errorf("私钥不匹配: %w", err)
 	}
 
+	// 纵深防御：零启用绑定时返回明确错误而非 (0, nil, nil)，否则调用方会把"一个站点都没部署"
+	// 读成成功并向服务端上报 success。早退发生在下方 FailedBindings 赋值之前，
+	// 失败绑定记录必须原样保留（在此清空会销毁重试与 stale 迁移所依赖的名单）。
+	// 验证文件仍需清理：已经拿到证书，签发用途已尽。
+	if !cert.HasEnabledBinding() {
+		s.cleanupCertValidationFiles(cert)
+		return 0, cert.Metadata.FailedBindings, ErrNoEnabledBinding
+	}
+
 	// 部署到所有绑定
 	deployCount := 0
 	var lastErr error
@@ -878,6 +1161,7 @@ func (s *Service) deployCertToBindings(ctx context.Context, cert *config.CertCon
 			continue
 		}
 		s.log.Info("证书已部署到 %s", binding.ServerName)
+		ClearStaleBinding(cert, binding.ServerName)
 		deployCount++
 	}
 
@@ -914,14 +1198,19 @@ func (s *Service) deployCertToBindings(ctx context.Context, cert *config.CertCon
 		cert.Metadata.DeployStartedAt = time.Time{}
 	}
 
-	// 清理验证文件：签发已完成（拿到证书）后验证文件用途已尽，
-	// 无论部署成败都清理，避免部署全失败时验证文件残留在 webroot
-	if len(cert.Metadata.ValidationFiles) > 0 {
-		cleanupValidationFiles(cert.Metadata.ValidationFiles, s.log)
-		cert.Metadata.ValidationFiles = nil
-	}
+	s.cleanupCertValidationFiles(cert)
 
 	return deployCount, failedBindings, lastErr
+}
+
+// cleanupCertValidationFiles 清理已放置的验证文件并清空记录。
+// 签发已完成（拿到证书）后验证文件用途已尽，无论部署成败都清理，避免残留在 webroot。
+func (s *Service) cleanupCertValidationFiles(cert *config.CertConfig) {
+	if len(cert.Metadata.ValidationFiles) == 0 {
+		return
+	}
+	cleanupValidationFiles(cert.Metadata.ValidationFiles, s.log)
+	cert.Metadata.ValidationFiles = nil
 }
 
 // commitPendingKeyAfterDeploy 部署成功后将 pending 私钥转正（Service 包装）
@@ -1043,23 +1332,30 @@ func extractDomainsFromParsedCert(cert *x509.Certificate) []string {
 	return domains
 }
 
-// renamePendingKey 证书改名（order_id 变更）时迁移 pending 私钥（不存在则跳过）
-// pending 私钥按 certName 组织，不迁移会导致 local 模式续签读不到 pending key
-func renamePendingKey(workDir, oldName, newName string) error {
+// copyPendingKey 证书改名（order_id 变更）时把 pending 私钥**复制**到新名目录（保留源）。
+// 源不存在为空操作。改名采用两阶段提交：复制成功 → 配置落盘成功 → 才删除旧目录；
+// 中途失败时配置名与 pending 目录始终保持一致，不会出现"配置已改名、私钥还在旧目录"的错配。
+// 权限与 savePendingKey 一致（目录 0700、文件 0600、原子写入），
+// 因为改为复制后不再有 os.Rename 自带的权限继承。
+func copyPendingKey(workDir, oldName, newName string) error {
+	if oldName == newName {
+		return nil
+	}
 	oldPath := getPendingKeyPath(workDir, oldName)
 	if _, err := os.Lstat(oldPath); os.IsNotExist(err) {
 		return nil
 	}
+	data, err := util.SafeReadFile(oldPath, config.MaxPrivateKeySize)
+	if err != nil {
+		return err
+	}
+	defer func() { clear(data) }()
+
 	newPath := getPendingKeyPath(workDir, newName)
 	if err := util.EnsureDir(filepath.Dir(newPath), 0700); err != nil {
 		return err
 	}
-	if err := os.Rename(oldPath, newPath); err != nil {
-		return err
-	}
-	// 清理旧的空目录
-	_ = os.Remove(filepath.Dir(oldPath))
-	return nil
+	return util.AtomicWrite(newPath, data, 0600)
 }
 
 // cleanupPendingKey 清理待确认私钥，返回清理过程中遇到的第一个错误

@@ -283,6 +283,11 @@ sslctl                    Manager API                    CA
 - `message` 为失败原因摘要：客户端复用 `logger.Sanitize` 脱敏后按 rune 截断 ≤256（`callbackMessageMaxLen=256`，服务端上限 500，超限整条被拒）。
 - 客户端只上报明确的部署结果：每次部署成功或失败由编排层在结果落盘后尽力回调一次；签发失败不回调，触顶、过期和 policy 阻断均静默终止且不回调。
 - 底层部署函数只返回结构化结果，不自行发送回调；传输失败仅由既有退避重试兜底，最终失败只记日志，不持久排队或补发。
+- **零启用绑定不上报**：证书 enabled 却无任何启用绑定时零部署即无部署结果，落 `no_binding_blocked_at` 后静默等待人工处理（deploy-spec §2.8、§5.2 policy_blocked 同构）。
+- **幽灵失败绑定不上报**：`failed_bindings` 与启用绑定交集为空时一个绑定都未重试，不报 success、不发回调。
+- **绑定重试触顶**：仅"确实发生了部署且仍失败"的出口上报一次带「绑定重试已达上限」标注的 failure；查询失败、私钥不可读等未发生部署的出口按 deploy-spec §2.8 触顶静默；证书处于 `processing` 不计入配额也不上报。
+- **手动 `sslctl deploy` 上报一次部署结果**（deploy-spec §5.1 步骤 6）：CLI 无 deadline，回调显式限定 `certops.CallbackFallbackBudget`（90s）。
+- **已知偏离**：`retryFailedBindings` 的 `QueryOrder` 失败出口在未发生部署时仍报 failure（查询失败不是部署结果，与 deploy-spec §2.8 不符），本次维持现状不扩大——触顶后停止；`cmd/setup` 目前不发部署回调，待项 I-b 落地后移除本条。
 
 ### 部署链语义（setup/deploy/续签）
 
@@ -406,7 +411,10 @@ sslctl                    Manager API                    CA
 - **单证书 panic 隔离**：续签循环中单证书处理 panic 记为该证书 failure（Error 日志 + 计入统计），不拖垮整轮。
 - **多证书续签间隔**：每个证书处理后随机延迟 30~90 秒，分散 API 请求压力。
 - **证书过期告警**（守护进程 `CheckExpiry` 周期检查）：剩余不足 7 天输出 Error，不足 13 天输出 Warn，已过期输出 Error（阈值来自 `pkg/certops/service.go` 的 `7*24h`/`13*24h`）。
-- **尝试次数上限**：签发与部署分别计数，各自达到 10 次即进入 `CAPPED`，静默停止并等待人工处理（不自动重置、不发送回调）。
+- **尝试次数上限**：签发与部署分别计数，各自达到 10 次即进入 `CAPPED`，静默停止并等待人工处理（不发送回调；部署成功——含手动 `sslctl deploy`——会清零计数并解除停机）。
+- **零启用绑定阻断**（`no_binding_blocked_at`，metadata 平台扩展字段）：证书 enabled 却无任何启用绑定（站点被改绑到其它证书、人工禁用、改名孤儿条目）时退出自动流程——**不发起任何 API 请求**、不部署、不计数、不回调，落标记等待人工处理；恢复启用绑定或重跑 setup 后自动解除，**计数不复位**。闸门内部先跑纯本地判定：已过期仍转 `EXPIRED`、部署触顶仍转 `CAPPED`（deploy-spec §3.2）。
+- **零绑定 + 在途签发无终止态**：闸门命中且 `last_issue_state` 为 `processing`/`active` 时不会进入任何终止态，在途订单与 `pending-keys/` 私钥会滞留至人工处理（日志会额外标注）。
+- **失败绑定重试用独立配额**（`retry_attempt_count`，metadata 平台扩展字段）：与证书级 `deploy_attempt_count` 分离，10 轮后把绑定转入 `stale_bindings` 并停止重试，**不会把整张证书打进 `CAPPED`**——共用公共计数时一个坏站点或一次 API 宕机就会连健康站点一起停掉续签。计数在入口递增（早于订单查询，保证 API 持续不可达时也能终止）；证书处于 `processing` 属上游在途状态，回滚本轮计数、不计入配额。
 
 ### processing / active 状态处理
 

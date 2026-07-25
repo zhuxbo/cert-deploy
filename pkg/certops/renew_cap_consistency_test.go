@@ -20,9 +20,10 @@ func TestCappedPhaseFor_MatchesWillMakeAPICall(t *testing.T) {
 	future := time.Now().Add(72 * time.Hour) // 已进入续签窗口且远超安全余量
 
 	tests := []struct {
-		name      string
-		meta      config.CertMetadata
-		wantPhase string
+		name       string
+		meta       config.CertMetadata
+		noBindings bool
+		wantPhase  string
 	}{
 		{
 			name:      "签发计数触顶且无在途状态：签发阶段触顶",
@@ -62,6 +63,14 @@ func TestCappedPhaseFor_MatchesWillMakeAPICall(t *testing.T) {
 			meta:      config.CertMetadata{CertExpiresAt: future, IssueRetryCount: 3, DeployAttemptCount: 3},
 			wantPhase: "",
 		},
+		{
+			// 零启用绑定被闸门在回填之前拦截，全程零 API 请求，
+			// 预估必须同步返回 false，否则与编排层反向漂移
+			name:       "零启用绑定：不触顶但也不发请求",
+			meta:       config.CertMetadata{CertExpiresAt: future},
+			noBindings: true,
+			wantPhase:  "",
+		},
 	}
 
 	svc := &Service{log: logger.NewNopLogger()}
@@ -73,16 +82,19 @@ func TestCappedPhaseFor_MatchesWillMakeAPICall(t *testing.T) {
 				Domains:  []string{"cap.example.com"},
 				Metadata: tt.meta,
 			}
+			if !tt.noBindings {
+				cert.Bindings = []config.SiteBinding{{ServerName: "cap.example.com", Enabled: true}}
+			}
 
 			if got := cappedPhaseFor(cert, schedule); got != tt.wantPhase {
 				t.Fatalf("cappedPhaseFor = %q, want %q", got, tt.wantPhase)
 			}
 
-			// 预估必须与触顶判定一致：触顶即不发请求，未触顶且需续签则会发请求
+			// 预估必须与编排层实际行为一致：触顶、零绑定均不发请求，其余需续签时会发请求
 			gotCall := svc.willMakeAPICall(cert, schedule)
-			wantCall := tt.wantPhase == "" && cert.NeedsRenewal(schedule)
+			wantCall := tt.wantPhase == "" && cert.HasEnabledBinding() && cert.NeedsRenewal(schedule)
 			if gotCall != wantCall {
-				t.Fatalf("willMakeAPICall = %v, want %v（应与 cappedPhaseFor 一致）", gotCall, wantCall)
+				t.Fatalf("willMakeAPICall = %v, want %v（应与 cappedPhaseFor + HasEnabledBinding 一致）", gotCall, wantCall)
 			}
 		})
 	}

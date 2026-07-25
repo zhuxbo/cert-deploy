@@ -197,6 +197,20 @@ func TestCheckExpiry(t *testing.T) {
 					CertName: "zero-cert",
 					Enabled:  true,
 					Metadata: config.CertMetadata{},
+					// 有启用绑定才会走"续签检查将自动回填"的 WARN 分支
+					Bindings: []config.SiteBinding{{ServerName: "zero.example.com", Enabled: true}},
+				},
+			},
+		},
+		{
+			// 零绑定证书由闸门在回填之前拦截，不会有人去回填 —— 不能给出假承诺，改 ERROR
+			name:      "零启用绑定且到期时间未知输出阻断告警",
+			wantLevel: "ERROR",
+			certs: []config.CertConfig{
+				{
+					CertName: "blocked-cert",
+					Enabled:  true,
+					Metadata: config.CertMetadata{},
 				},
 			},
 		},
@@ -472,7 +486,10 @@ func TestFixCertName(t *testing.T) {
 	}
 }
 
-// TestFixCertName_RenameFail 测试重命名失败时不 panic
+// TestFixCertName_RenameFail 落盘失败时必须保持旧名（两阶段提交）。
+// 若像早期实现那样先改内存名再落盘，后续 UpdateCert 会按新名匹配到别的条目并整体覆盖它；
+// pending 私钥也会停在与配置不一致的目录上，导致 local 续签读不到在途私钥、
+// 下轮重新生成 CSR 覆盖 pending。
 func TestFixCertName_RenameFail(t *testing.T) {
 	dir := t.TempDir()
 	cm, err := config.NewConfigManagerWithDir(dir)
@@ -485,18 +502,87 @@ func TestFixCertName_RenameFail(t *testing.T) {
 	log := logger.NewNopLogger()
 	svc := NewService(cm, log)
 
+	keyPEM := "-----BEGIN RSA PRIVATE KEY-----\nrename-fail\n-----END RSA PRIVATE KEY-----"
+	if err := savePendingKey(cm.GetWorkDir(), "example.com-100", keyPEM); err != nil {
+		t.Fatalf("保存 pending 私钥失败: %v", err)
+	}
+
 	cert := &config.CertConfig{
 		CertName: "example.com-100",
 		OrderID:  200,
 		Enabled:  true,
 	}
 
-	// 不应 panic，只是记录 warn 日志
+	// 不应 panic
 	svc.fixCertName(cert)
 
-	// cert.CertName 仍然会被修改（内存中）
-	if cert.CertName != "example.com-200" {
-		t.Errorf("CertName = %s, 期望 example.com-200", cert.CertName)
+	if cert.CertName != "example.com-100" {
+		t.Errorf("落盘失败时应保留旧名，实际 CertName = %s", cert.CertName)
+	}
+	// 在途 pending 私钥必须仍能按当前 cert_name 读到
+	got, err := readPendingKey(cm.GetWorkDir(), cert.CertName)
+	if err != nil {
+		t.Fatalf("旧名 pending 私钥应仍可读: %v", err)
+	}
+	if got != keyPEM {
+		t.Error("pending 私钥内容不应改变")
+	}
+	// 复制出来的副本必须回滚，避免留下孤儿目录
+	if _, err := os.Lstat(getPendingKeyPath(cm.GetWorkDir(), "example.com-200")); !os.IsNotExist(err) {
+		t.Error("改名失败后不应残留新名 pending 副本")
+	}
+}
+
+// TestFixCertName_NameConflict 目标名已存在时必须放弃改名：
+// 同名条目并存会让 UpdateCert（按名匹配首条）把健康条目整体覆盖成孤儿条目的内容。
+func TestFixCertName_NameConflict(t *testing.T) {
+	dir := t.TempDir()
+	cm, err := config.NewConfigManagerWithDir(dir)
+	if err != nil {
+		t.Fatalf("创建配置管理器失败: %v", err)
+	}
+	svc := NewService(cm, logger.NewNopLogger())
+
+	// 健康条目已占用目标名
+	if err := cm.AddCert(&config.CertConfig{
+		CertName: "dup.example.com-200",
+		OrderID:  200,
+		Enabled:  true,
+		Bindings: []config.SiteBinding{{ServerName: "dup.example.com", Enabled: true}},
+	}); err != nil {
+		t.Fatalf("添加健康证书失败: %v", err)
+	}
+	// 待改名的孤儿条目
+	if err := cm.AddCert(&config.CertConfig{
+		CertName: "dup.example.com-100",
+		OrderID:  200,
+		Enabled:  true,
+	}); err != nil {
+		t.Fatalf("添加孤儿证书失败: %v", err)
+	}
+
+	orphan, err := cm.GetCert("dup.example.com-100")
+	if err != nil {
+		t.Fatalf("读取孤儿证书失败: %v", err)
+	}
+	svc.fixCertName(orphan)
+
+	if orphan.CertName != "dup.example.com-100" {
+		t.Errorf("撞名时应放弃改名，实际 CertName = %s", orphan.CertName)
+	}
+	healthy, err := cm.GetCert("dup.example.com-200")
+	if err != nil {
+		t.Fatalf("健康条目应仍在: %v", err)
+	}
+	if !healthy.HasEnabledBinding() {
+		t.Error("健康条目不得被孤儿条目覆盖（绑定丢失）")
+	}
+	dups, err := cm.FindDuplicateCertNames()
+	if err != nil {
+		t.Fatalf("检测重名失败: %v", err)
+	}
+	if len(dups) != 0 {
+		t.Errorf("不应产生重名条目，实际: %v", dups)
 	}
 }
 

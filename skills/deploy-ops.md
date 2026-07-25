@@ -438,6 +438,11 @@ sslctl                    Manager API                    CA
 - **定时检查**：每天一次，随机选择明天 09:00~23:59 的时间点执行（服务端 0:00~7:59 续签，预留 1 小时签发）；启动即检查一次；运行中若 `LastCheckAt` 距今超 25 小时（停摆/睡眠/任务跳过）则在 30~60 分钟内补偿一轮。
 - **单证书 panic 隔离**：续签循环中单证书处理 panic 记为该证书 failure（Error 日志 + 计入统计），不拖垮整轮。
 - **多证书续签间隔**：每个证书处理后随机延迟 30~90 秒，分散 API 请求压力。
+- **陈旧绑定告警**（`stale_bindings`/`stale_since`，metadata 平台扩展字段）：该绑定当前未持有本证书的最新证书。
+  证书级到期日只反映最新签发的证书，这些站点仍挂旧证书，按证书级判断永远看不出风险——因此 `CheckExpiry` 每轮单独 Error。
+  迁入点：`parkExhaustedRetries`（主）与 `persistTerminalState`（终止态兜底）；迁移一律经 `retainableStaleNames` 过滤掉不在 `cert.Bindings` 中的名字，
+  否则 `ClearStaleBinding` 的入参永远来自遍历 `cert.Bindings` 的部署循环，幽灵名字进去就再也出不来、告警无法消除。
+  `StaleSince` 仅在从空变非空时设置。**已知未覆盖**：安全余量早退是裸 `return`、不经 `persistTerminalState`，该情形 ≤24h 后由过期路径补上。
 - **证书过期告警**（守护进程 `CheckExpiry` 周期检查）：剩余不足 7 天输出 Error，不足 13 天输出 Warn，已过期输出 Error（阈值来自 `pkg/certops/service.go` 的 `7*24h`/`13*24h`）。
   该告警以 `defer` 覆盖 `checkAndDeploy` 的**全部**出口——未取到续签锁、`CheckAndRenewAll` 出错时同样告警，否则"另一个进程在跑"与"API 持续失败"会连告警一起静默，恰是最需要告警的场景。
   `CheckAndRenewAll` 被取消时会连同已完成证书的结果一起返回，daemon 先输出统计再报错，不丢这批结果。

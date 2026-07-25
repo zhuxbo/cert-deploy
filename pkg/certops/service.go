@@ -140,6 +140,14 @@ func FixCertName(cfgManager *config.ConfigManager, cert *config.CertConfig, log 
 func fillCertMetadata(_ *fetcher.CallbackRequest, _ *config.CertConfig) {
 }
 
+// formatStaleSince 格式化 stale 起始时间；缺失时给出明确占位而非空串
+func formatStaleSince(t time.Time) string {
+	if t.IsZero() {
+		return "时间未知"
+	}
+	return t.Format("2006-01-02")
+}
+
 // CheckExpiry 检查证书过期时间并输出告警日志
 // 距过期不足 7 天 → Error 级别
 // 距过期不足 13 天 → Warn 级别
@@ -154,6 +162,12 @@ func (s *Service) CheckExpiry() {
 	for _, cert := range cfg.Certificates {
 		if !cert.Enabled {
 			continue
+		}
+		// 长期未部署成功的绑定必须持续告警：证书级到期日只反映"最新签发的证书"，
+		// 这些站点仍挂着旧证书，按证书级判断永远看不出风险，会一路静默到真实过期。
+		if len(cert.Metadata.StaleBindings) > 0 {
+			s.log.Error("证书 %s 的站点 %v 长期未部署成功（自 %s），仍在使用旧证书，需人工处理",
+				cert.CertName, cert.Metadata.StaleBindings, formatStaleSince(cert.Metadata.StaleSince))
 		}
 		// 到期时间未知不再静默跳过（告警盲区），下轮续签检查会自动回填。
 		// 零启用绑定的证书例外：闸门在回填之前拦截，不会有人去回填，不能给出假承诺。

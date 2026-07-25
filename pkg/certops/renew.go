@@ -461,6 +461,15 @@ func (s *Service) persistTerminalState(cert *config.CertConfig, state, phase str
 	cert.Metadata.LastIssueState = state
 	cert.Metadata.CappedPhase = phase
 	cert.Metadata.DeployStartedAt = time.Time{}
+	// 兜底迁移：进入终止态后不会再有人重试 FailedBindings，不迁走就等于把这批站点
+	// 静默丢弃——它们仍持有旧证书，会一路走到真实过期。只靠 markCapped 覆盖不到，
+	// 先过期与先判签发阶段两条路径都绕过它。
+	// 已知未覆盖：安全余量早退是裸 return、不经本函数；该情形 ≤24h 后会由过期路径补上。
+	if len(cert.Metadata.FailedBindings) > 0 {
+		migrateToStale(cert, cert.Metadata.FailedBindings, cert.Metadata.FailedBindingsAt)
+		cert.Metadata.FailedBindings = nil
+		cert.Metadata.FailedBindingsAt = time.Time{}
+	}
 	if err := s.cfgManager.UpdateCert(cert); err != nil {
 		s.log.Warn("持久化证书 %s 状态 %s 失败: %v", cert.CertName, state, err)
 	}

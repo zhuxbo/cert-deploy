@@ -8,6 +8,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"runtime"
 	"strings"
@@ -386,7 +387,43 @@ func runStatus() {
 		if !cert.Metadata.LastDeployAt.IsZero() {
 			fmt.Printf("    上次部署: %s\n", cert.Metadata.LastDeployAt.Format("2006-01-02 15:04:05"))
 		}
+		printCertHaltState(os.Stdout, &cert)
 	}
+}
+
+// printCertHaltState 展示停机/阻断/陈旧绑定状态。
+// 这些状态此前只出现在日志里，`status` 看上去一切正常，人工排查无从下手。
+func printCertHaltState(w io.Writer, cert *config.CertConfig) {
+	if !cert.Metadata.NoBindingBlockedAt.IsZero() {
+		_, _ = fmt.Fprintf(w, "    %s 无启用绑定，自动续签与部署已阻断（自 %s），请重新 setup 或恢复绑定\n",
+			colorize("[阻断]", colorRed), cert.Metadata.NoBindingBlockedAt.Format("2006-01-02 15:04:05"))
+	}
+	if cert.Metadata.LastIssueState == config.IssueStateCapped {
+		phase := cert.Metadata.CappedPhase
+		if phase == "" {
+			phase = "未知阶段"
+		}
+		_, _ = fmt.Fprintf(w, "    %s 已达尝试次数上限（阶段: %s），已停止自动重试，需人工处理\n",
+			colorize("[停机]", colorRed), phase)
+	}
+	if len(cert.Metadata.StaleBindings) > 0 {
+		_, _ = fmt.Fprintf(w, "    %s 长期未部署成功的站点: %s（自 %s），这些站点仍在使用旧证书\n",
+			colorize("[陈旧]", colorRed), strings.Join(cert.Metadata.StaleBindings, ", "),
+			formatStatusTime(cert.Metadata.StaleSince))
+	}
+	if len(cert.Metadata.FailedBindings) > 0 {
+		_, _ = fmt.Fprintf(w, "    %s 待重试的失败站点: %s（已重试 %d/%d 轮）\n",
+			colorize("[重试中]", colorYellow), strings.Join(cert.Metadata.FailedBindings, ", "),
+			cert.Metadata.RetryAttemptCount, certops.MaxRetryAttemptCount)
+	}
+}
+
+// formatStatusTime 缺失时间时给出明确占位，避免打印空串
+func formatStatusTime(t time.Time) string {
+	if t.IsZero() {
+		return "时间未知"
+	}
+	return t.Format("2006-01-02 15:04:05")
 }
 
 func webServerStatusSummary(localServerType string, cfg *config.Config) string {

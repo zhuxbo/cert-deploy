@@ -299,6 +299,26 @@ func (s *Service) processCertRenewal(ctx context.Context, cfg *config.Config, ce
 		s.clearNoBindingBlocked(&cert)
 	}
 
+	// 无进展停更闸门（deploy-spec §3.2）。位置有硬性要求：
+	//   - 必须在到期时间回填**之前**——「到期时间未知 + 查询持续失败」正是本闸门要管的
+	//     主场景，若排在回填之后，那条路径每轮都在 refreshExpiryFromAPI 里 return，
+	//     永远走不到这里；
+	//   - 必须在过期判定**之后**——两者同时成立时以 EXPIRED 为准（更准确，spec §3.2）。
+	//     IsExpired 对零值到期时间返回 false，故到期未知的证书仍能落到本闸门。
+	// 纯本地判定，零 API 请求。
+	if cert.IsExpired() {
+		s.markExpired(&cert)
+		return nil, madeAPICall
+	}
+	if s.stalledTooLong(&cert) {
+		s.markStalled(&cert)
+		return nil, madeAPICall
+	}
+
+	// 本轮进展基线：出口据前后快照结算无进展计时（settleNoProgress）
+	progressBefore := snapshotProgress(&cert)
+	defer func() { s.settleNoProgress(&cert, progressBefore, madeAPICall) }()
+
 	// 到期时间未知（部署成功但元数据保存失败、带外换证等）：
 	// 语义为"未知需处理"，先查询 API 回填元数据再按正常逻辑判定，避免"永不续签 + 告警盲区"双盲
 	if cert.Metadata.CertExpiresAt.IsZero() {
@@ -904,6 +924,121 @@ func getRenewMode(schedule *config.ScheduleConfig) string {
 	return mode
 }
 
+// progressMark 判定「证书状态是否真的往前走了」的字段快照（deploy-spec §3.2）。
+//
+// 只取明确表示前进的字段，编排层比对前后快照即可覆盖全部路径——
+// 无进展的出口散布在 pull / local / 回填 / 重试等十余处返回点，
+// 逐个手写标记必然漏掉，而漏掉一个就等于那条路径永远没有边界。
+//
+// 刻意**不含** LastIssueState：resetIssueStateForResubmit 会把它清空以便下轮重新提交，
+// 那是本轮流程失效后的回退、不是前进；计入会让「pending 私钥反复缺失」永远清零计时。
+// 也不含 LastOrderStatus：终态之间互相变化（cancelled → failed）不是进展。
+type progressMark struct {
+	lastDeployAt   time.Time
+	certExpiresAt  time.Time
+	certSerial     string
+	csrSubmittedAt time.Time
+}
+
+// snapshotProgress 取当前进展快照
+func snapshotProgress(cert *config.CertConfig) progressMark {
+	return progressMark{
+		lastDeployAt:   cert.Metadata.LastDeployAt,
+		certExpiresAt:  cert.Metadata.CertExpiresAt,
+		certSerial:     cert.Metadata.CertSerial,
+		csrSubmittedAt: cert.Metadata.CSRSubmittedAt,
+	}
+}
+
+// settleNoProgress 依据本轮前后快照结算无进展计时。
+// 仅在本轮确实发起过 API 请求时结算——静默跳过（有效期充足、触顶等）不该计入。
+func (s *Service) settleNoProgress(cert *config.CertConfig, before progressMark, madeAPICall bool) {
+	if !madeAPICall {
+		return
+	}
+	if snapshotProgress(cert) != before {
+		s.clearNoProgress(cert)
+		return
+	}
+	s.markNoProgress(cert)
+}
+
+// markNoProgress 记录「本轮只查询、没有任何进展」的起点。
+//
+// 锚定首次、不滑动窗口：每轮都刷新时间戳等于永远达不到时限，那正是要修的问题。
+// 进展的判据是证书状态真的往前走了（部署发生、CSR 被接受、订单回到可用、
+// 到期时间成功回填），而不是"这一轮跑完没报错"。
+func (s *Service) markNoProgress(cert *config.CertConfig) {
+	if !cert.Metadata.NoProgressSince.IsZero() {
+		return
+	}
+	cert.Metadata.NoProgressSince = time.Now()
+	if err := s.cfgManager.UpdateCert(cert); err != nil {
+		s.log.Warn("记录证书 %s 无进展起点失败: %v", cert.CertName, err)
+	}
+}
+
+// clearNoProgress 有实际进展时清零停更计时
+func (s *Service) clearNoProgress(cert *config.CertConfig) {
+	if cert.Metadata.NoProgressSince.IsZero() {
+		return
+	}
+	cert.Metadata.NoProgressSince = time.Time{}
+	if err := s.cfgManager.UpdateCert(cert); err != nil {
+		s.log.Warn("清除证书 %s 无进展计时失败: %v", cert.CertName, err)
+	}
+}
+
+// reanchorNoProgress 时间戳不可信时重新锚定到当前时刻
+func (s *Service) reanchorNoProgress(cert *config.CertConfig) {
+	cert.Metadata.NoProgressSince = time.Now()
+	if err := s.cfgManager.UpdateCert(cert); err != nil {
+		s.log.Warn("重锚证书 %s 无进展计时失败: %v", cert.CertName, err)
+	}
+}
+
+// stalledTooLong 判断自首次无进展起是否已超过无进展时限。
+//
+// 时钟不可信时一律返回 false 并重新锚定（保守方向：宁可多查几轮，也不把还在正常
+// 等待签发的证书误判成停更）。不重锚的话，一个坏时间戳会让该证书永远绕过这道闸门。
+func (s *Service) stalledTooLong(cert *config.CertConfig) bool {
+	since := cert.Metadata.NoProgressSince
+	if since.IsZero() {
+		return false
+	}
+	elapsed := time.Since(since)
+	if elapsed < 0 {
+		s.log.Warn("证书 %s 无进展起点晚于当前时间（时钟回拨），重新锚定", cert.CertName)
+		s.reanchorNoProgress(cert)
+		return false
+	}
+	if elapsed > time.Duration(config.ClockSanityMaxDays)*24*time.Hour {
+		s.log.Warn("证书 %s 无进展间隔 %.0f 天超出可信范围（%d 天），按时钟跳变重新锚定",
+			cert.CertName, elapsed.Hours()/24, config.ClockSanityMaxDays)
+		s.reanchorNoProgress(cert)
+		return false
+	}
+	return elapsed >= time.Duration(config.MaxNoProgressDays)*24*time.Hour
+}
+
+// markStalled 无进展时限触顶：进入 CAPPED（停更）并清理在途产物。
+// 私钥不能因为一张永远签不出来的证书永久驻留磁盘；验证文件同样清理——
+// 订单已停止跟进，留在 webroot 下的 challenge 文件既无用又对外可读。
+func (s *Service) markStalled(cert *config.CertConfig) {
+	s.log.Error("证书 %s 自 %s 起连续 %d 天无任何进展，进入 CAPPED（停更），已清理在途私钥与验证文件，等待人工处理",
+		cert.CertName, cert.Metadata.NoProgressSince.Format("2006-01-02"), config.MaxNoProgressDays)
+
+	if err := cleanupPendingKey(s.cfgManager.GetWorkDir(), cert.CertName); err != nil {
+		s.log.Warn("清理证书 %s 待确认私钥失败: %v", cert.CertName, err)
+	}
+	s.cleanupCertValidationFiles(cert)
+	// 在途 CSR 标记一并清除：订单已停止跟进，保留只会让人误判仍有在途提交
+	cert.Metadata.CSRSubmittedAt = time.Time{}
+	cert.Metadata.LastCSRHash = ""
+	cert.Metadata.NoProgressSince = time.Time{}
+	s.persistTerminalState(cert, config.IssueStateCapped, config.CappedPhaseStalled)
+}
+
 // trackOrderStatus 记录服务端返回的订单状态（展示专用，不参与门禁判定），
 // 返回状态是否相对上一轮发生变化。未变化时不写盘，避免每轮无谓 IO。
 func (s *Service) trackOrderStatus(cert *config.CertConfig, status string) bool {
@@ -1259,6 +1394,10 @@ func (s *Service) deployCertToBindings(ctx context.Context, cert *config.CertCon
 		cert.Metadata.IssueRetryCount = 0
 		cert.Metadata.DeployAttemptCount = 0
 		cert.Metadata.DeployStartedAt = time.Time{}
+		// 部署发生即最强的进展信号，一并清零停更计时（deploy-spec §3.8）。
+		// 编排层的快照结算也会覆盖此处（LastDeployAt 已变），显式清零是为了让
+		// 手动 deploy / setup 复用本函数时同样受益。
+		cert.Metadata.NoProgressSince = time.Time{}
 	}
 
 	s.cleanupCertValidationFiles(cert)

@@ -399,12 +399,24 @@ func printCertHaltState(w io.Writer, cert *config.CertConfig) {
 			colorize("[阻断]", colorRed), cert.Metadata.NoBindingBlockedAt.Format("2006-01-02 15:04:05"))
 	}
 	if cert.Metadata.LastIssueState == config.IssueStateCapped {
-		phase := cert.Metadata.CappedPhase
-		if phase == "" {
-			phase = "未知阶段"
+		// 停更与计数触顶成因不同：前者是长期只查询无进展（订单卡死/被删等），
+		// 后者是尝试次数用尽，展示上必须可区分，否则运维不知道该查哪一头
+		if cert.Metadata.CappedPhase == config.CappedPhaseStalled {
+			_, _ = fmt.Fprintf(w, "    %s 连续 %d 天无任何进展（订单长期未推进），已停止拉取，需人工核对订单状态\n",
+				colorize("[停更]", colorRed), config.MaxNoProgressDays)
+		} else {
+			phase := cert.Metadata.CappedPhase
+			if phase == "" {
+				phase = "未知阶段"
+			}
+			_, _ = fmt.Fprintf(w, "    %s 已达尝试次数上限（阶段: %s），已停止自动重试，需人工处理\n",
+				colorize("[停机]", colorRed), phase)
 		}
-		_, _ = fmt.Fprintf(w, "    %s 已达尝试次数上限（阶段: %s），已停止自动重试，需人工处理\n",
-			colorize("[停机]", colorRed), phase)
+	}
+	if !cert.Metadata.NoProgressSince.IsZero() {
+		_, _ = fmt.Fprintf(w, "    %s 自 %s 起无进展（%d 天后停止拉取）\n",
+			colorize("[无进展]", colorYellow), formatStatusTime(cert.Metadata.NoProgressSince),
+			config.MaxNoProgressDays)
 	}
 	if len(cert.Metadata.StaleBindings) > 0 {
 		_, _ = fmt.Fprintf(w, "    %s 长期未部署成功的站点: %s（自 %s），这些站点仍在使用旧证书\n",

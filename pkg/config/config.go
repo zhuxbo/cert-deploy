@@ -91,6 +91,11 @@ type CertMetadata struct {
 	// 把 cancelled 这类订单终态写进去会让两个概念混在一个字段里，
 	// 而 pull 模式从不 POST、根本不需要该区分。
 	LastOrderStatus string `json:"last_order_status,omitempty"`
+	// NoProgressSince 首次「本轮只查询、无任何进展」的时间（deploy-spec §3.2）。
+	// 锚定首次、不滑动：每轮刷新等于永远达不到时限，那正是要修的问题。
+	// 纯 GET 轮询不递增任何尝试计数，而到期闸门在 CertExpiresAt 为空时整段失效
+	// （新证书默认为空，只有部署成功才回填），故需要这条与计数正交的绝对边界。
+	NoProgressSince time.Time `json:"no_progress_since,omitempty"`
 	// 部署失败的绑定列表（ServerName），下次检查时重试
 	FailedBindings   []string  `json:"failed_bindings,omitempty"`
 	FailedBindingsAt time.Time `json:"failed_bindings_at,omitempty"` // 首次记录失败绑定的时间

@@ -164,6 +164,18 @@ func ClassifyOrderStatus(status string) OrderStatusClass {
 // AttemptCap 签发/部署尝试上限（deploy-spec §3.2/§11）：分别计数，各自 >= 10 触顶。
 const AttemptCap = 10
 
+// MaxNoProgressDays 无进展时限（deploy-spec §3.2/§11）：纯 GET 轮询的绝对边界。
+// 轮询不计入尝试计数，到期闸门在到期时间未知时失效，故需要独立时限。
+const MaxNoProgressDays = 14
+
+// ClockSanityMaxDays 无进展计时的时钟合理上限（deploy-spec §11）。
+//
+// 不是「允许停滞的预算」而是时间差的可信度判据：每日检查下计时走到第 14 天即已停更，
+// 自然流逝到不了这个值——超过它只可能是 daemon 长期停摆刚恢复（期间服务端状态可能
+// 已变化，应重查而非停更），或时钟跳变（如设备重启后 NTP 同步前锚定了 1970/2000 年）。
+// 两者的保守方向都是重新锚定。该值与证书生命周期正交，证书周期缩短不影响其语义。
+const ClockSanityMaxDays = 60
+
 // ContainsIPDomain 判断域名列表是否包含 IP 地址（SAN 含 IP）。
 // 复用 net.ParseIP 精确判断，IPv4/IPv6 均识别。
 func ContainsIPDomain(domains []string) bool {

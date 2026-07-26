@@ -246,6 +246,8 @@ func fetchAndDeployCert(ctx context.Context, cfgManager *config.ConfigManager, c
 		cert.Metadata.DeployAttemptCount = 0
 		cert.Metadata.DeployStartedAt = time.Time{}
 		cert.Metadata.RetryAttemptCount = 0
+		// 无进展计时同样解除：手动部署成功本身就是最强的进展信号
+		cert.Metadata.NoProgressSince = time.Time{}
 	}
 	// 失败绑定原样记录（不是清空）：清空会让 daemon 不再接手仍失败的站点，
 	// 制造"手动部署部分成功 → 剩下的永远没人管"的新洞

@@ -68,7 +68,11 @@ golangci-lint run --timeout=5m ./...
 GOOS=windows GOARCH=amd64 golangci-lint run --timeout=5m ./...
 ```
 
-不得用无依据的 `nolint` 绕过。若修改 Go 文件，使用 Go 1.24 对触及文件执行 gofmt，避免新版工具链机械重排基线文件。
+不得用无依据的 `nolint` 绕过。
+
+格式化已由 `.golangci.yml` 的 `formatters: gofmt` 门禁执行，未格式化会计入 issue 使本命令退出非零，`golangci-lint fmt` 可原地修复。CI 与本地都应使用 go.mod 钉死的 Go 1.24（`build/build.sh` 会强校验该约束）。
+
+注意：曾有「新版工具链会机械重排基线文件、故须用 1.24」的说法，2026-07-26 实测证伪——Go 1.24.13 与 1.26.5 的 gofmt 对本仓标记的文件集合完全一致，当时的 22 个文件只是从未格式化过。统一用 1.24 的理由是与发布产物、CI 保持同一工具链，不是规避重排。
 
 ## 5. 领域审查
 

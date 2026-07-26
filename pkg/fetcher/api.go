@@ -102,15 +102,23 @@ type APIErrors struct {
 // 服务端下发的 error_code 取值（deploy-spec §2.2）。
 // 取值一旦发布不得改动，只允许新增；未列出的取值按未分类处理。
 const (
+	// 整批共通（凭据 / 限流类）：对每个条目都会同样失败
 	ErrorCodeRateLimited     = "rate_limited"     // 触发限流，带 retry_after
 	ErrorCodeTokenMissing    = "token_missing"    // 请求未携带 token
 	ErrorCodeTokenInvalid    = "token_invalid"    // token 不存在或已失效
 	ErrorCodeTokenDisabled   = "token_disabled"   // token 被禁用
 	ErrorCodeAccountDisabled = "account_disabled" // token 所属账号被禁用
 	ErrorCodeIPNotAllowed    = "ip_not_allowed"   // 来源 IP 不在白名单
-	ErrorCodeOrderNotFound   = "order_not_found"  // 订单不存在或不可见
-	ErrorCodeCertNotFound    = "cert_not_found"   // 订单存在但无可用证书
-	ErrorCodeInvalidOrder    = "invalid_order"    // order 参数缺失或形态非法
+
+	// 单条目：只影响当前订单，不中断本批其余条目
+	ErrorCodeInvalidOrder    = "invalid_order"     // order 参数缺失、形态非法或超过 100 个
+	ErrorCodeOrderNotFound   = "order_not_found"   // 订单不存在或不可见
+	ErrorCodeCertNotFound    = "cert_not_found"    // 订单存在但无可用证书
+	ErrorCodeOrderInProgress = "order_in_progress" // 订单在途，不接受改 CSR/域名（唯一的过渡态）
+	// ErrorCodeValidationMethodUnsupported 产品不支持所请求的验证方式
+	ErrorCodeValidationMethodUnsupported = "validation_method_unsupported"
+	ErrorCodeAutoRenewDisabled           = "auto_renew_disabled"  // 订单未开启自动续费
+	ErrorCodeInsufficientBalance         = "insufficient_balance" // 余额不足以支付续费
 )
 
 // apiError 依据 error_code 构造错误：带 error_code 一律是服务端明确拒绝

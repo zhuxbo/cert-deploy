@@ -316,3 +316,62 @@ func TestPrepareLocalRenew_CancellingWaits(t *testing.T) {
 		t.Errorf("cancelling 期间不应 POST，实际 %d 次", n)
 	}
 }
+
+// TestPrepareLocalRenew_OrderInProgressNormalizes order_in_progress 必须归一为 processing，
+// 不得按普通业务拒绝处理。
+//
+// 它是 deploy-spec §2.2 中唯一的过渡态：服务端明确告知订单已在途（unpaid/pending，
+// 签发进行中），完成后自行消失。若按业务拒绝处理，会清理 pending key 并保持
+// last_issue_state 为空，于是下轮再次提交 CSR、再次被拒、签发计数再递增——
+// 10 轮后把一张正在正常签发的证书误判触顶，正是 spec 要求「不做永久停止或
+// 退避升级」所禁止的。
+func TestPrepareLocalRenew_OrderInProgressNormalizes(t *testing.T) {
+	tmpDir := t.TempDir()
+	cm, err := config.NewConfigManagerWithDir(tmpDir)
+	if err != nil {
+		t.Fatalf("创建配置管理器失败: %v", err)
+	}
+	svc := NewService(cm, logger.NewNopLogger())
+
+	var posts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPost {
+			posts++
+			_, _ = fmt.Fprint(w, `{"code":0,"msg":"订单处于pending状态（签发进行中）","errors":{"error_code":"order_in_progress"}}`)
+			return
+		}
+		_, _ = fmt.Fprint(w, `{"code":1,"msg":"ok","data":{"order_id":777,"status":"processing"}}`)
+	}))
+	defer server.Close()
+
+	cert := newLocalCert(t, tmpDir, "inprogress.example.com", 777, server.URL)
+	if err := cm.AddCert(cert); err != nil {
+		t.Fatalf("添加证书失败: %v", err)
+	}
+
+	// 首轮：无在途标记 → 提交 CSR → 被告知订单在途
+	cd, _, perr := svc.prepareLocalRenew(t.Context(), cert, cert.API)
+	if perr != nil {
+		t.Fatalf("order_in_progress 应归一等待，不应报错: %v", perr)
+	}
+	if cd != nil {
+		t.Fatal("归一等待不应返回证书数据")
+	}
+	if cert.Metadata.LastIssueState != config.IssueStateProcessing {
+		t.Errorf("应归一为 processing 以便下轮只查询，实际 %q", cert.Metadata.LastIssueState)
+	}
+	// pending key 必须保留：订单在途，之后签发成功需要它与新证书配对
+	if _, e := readPendingKey(cm.GetWorkDir(), cert.CertName); e != nil {
+		t.Error("order_in_progress 应保留 pending key（订单在途，签发完成后需与新证书配对）")
+	}
+
+	// 次轮：已归一，只查询、不再提交
+	postsAfterFirst := posts
+	if _, _, err := svc.prepareLocalRenew(t.Context(), cert, cert.API); err != nil {
+		t.Fatalf("次轮应只查询等待: %v", err)
+	}
+	if posts != postsAfterFirst {
+		t.Errorf("归一后不得重复提交 CSR，POST 次数 %d → %d", postsAfterFirst, posts)
+	}
+}

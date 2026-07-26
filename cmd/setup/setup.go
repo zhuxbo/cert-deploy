@@ -50,6 +50,8 @@ type setupParams struct {
 	nonCriticalSkipped int
 	// nonCriticalTripReason 因服务端明确拒绝而熔断时的 error_code，仅用于汇总文案
 	nonCriticalTripReason string
+	// nonCriticalRetryAfter 限流窗口剩余秒数，仅用于汇总文案（不据它定时重试）
+	nonCriticalRetryAfter int
 }
 
 // orderPattern --order 参数形态（deploy-spec §2.3）：仅订单 ID，单个或英文逗号分隔多个
@@ -87,15 +89,27 @@ func (p *setupParams) recordNonCritical(err error) {
 	if code := sslerrors.ErrorCodeOf(err); code != "" && !perCertErrorCode(code) {
 		p.nonCriticalFails = nonCriticalFailureCap
 		p.nonCriticalTripReason = code
+		// retry_after 只入日志文案供运维判断「大约多久后不再限流」。
+		// 刻意不据它定时重试：它是当前滑动窗口的剩余秒数，睡满后恰好落在新窗口起点，
+		// 而刚超限的上一窗口此时权重为 1、全额计入，估算值必然仍超限——
+		// 按它重试注定再被拒，且那次重试还会把计数器垫高、把恢复时间继续往后推。
+		p.nonCriticalRetryAfter = sslerrors.RetryAfterOf(err)
 		return
 	}
 	p.nonCriticalFails++
 }
 
-// perCertErrorCode 判断 error_code 是否只影响单张证书（而非整批共通的凭据/限流问题）
+// perCertErrorCode 判断 error_code 是否只影响单张证书（deploy-spec §2.2「单条目」组）。
+// 整批共通的凭据/限流问题返回 false，由调用方立即熔断。
 func perCertErrorCode(code string) bool {
 	switch code {
-	case fetcher.ErrorCodeOrderNotFound, fetcher.ErrorCodeCertNotFound, fetcher.ErrorCodeInvalidOrder:
+	case fetcher.ErrorCodeInvalidOrder,
+		fetcher.ErrorCodeOrderNotFound,
+		fetcher.ErrorCodeCertNotFound,
+		fetcher.ErrorCodeOrderInProgress,
+		fetcher.ErrorCodeValidationMethodUnsupported,
+		fetcher.ErrorCodeAutoRenewDisabled,
+		fetcher.ErrorCodeInsufficientBalance:
 		return true
 	}
 	return false
@@ -109,6 +123,9 @@ func (p *setupParams) reportNonCriticalSkips() {
 	cause := fmt.Sprintf("连续失败 %d 次", nonCriticalFailureCap)
 	if p.nonCriticalTripReason != "" {
 		cause = fmt.Sprintf("服务端明确拒绝（%s）", p.nonCriticalTripReason)
+		if p.nonCriticalRetryAfter > 0 {
+			cause += fmt.Sprintf("，当前限流窗口约 %d 秒后结束", p.nonCriticalRetryAfter)
+		}
 	}
 	msg := fmt.Sprintf("非关键上报因%s已熔断，跳过 %d 次上报；部署结果不受影响，但服务端状态可能滞后",
 		cause, p.nonCriticalSkipped)

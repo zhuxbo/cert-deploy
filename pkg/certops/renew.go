@@ -420,6 +420,15 @@ func (s *Service) processCertRenewal(ctx context.Context, cfg *config.Config, ce
 // 崩溃重启复验时据 DeployStartedAt 复位重放同一意图、不再递增（不盲增）。
 // 回调纪律：底层部署函数不发回调，仅由本编排层在结果原子落盘后统一上报（成功/明确失败各尽力一次）。
 func (s *Service) runDeployAttempt(ctx context.Context, cert *config.CertConfig, certData *fetcher.CertData, privateKey string, result *RenewResult) {
+	// 环境闸门先行：必须在递增部署计数之前。坏配置下 reload 必然失败，此时写入证书
+	// 既不生效又要触发回滚；且阻断不该占用部署尝试配额（修好即自动恢复，无需人工解除
+	// CAPPED）。闸门内部已按「原因变化 + 次数封顶」上报过 failure，此处只需按失败收敛。
+	if blockReason := s.checkDeployEnvironment(ctx, cert, cert.GetAPI(s.log)); blockReason != "" {
+		result.Status = "failure"
+		result.Error = stderrors.New(blockReason)
+		return
+	}
+
 	incremented := false
 	if cert.Metadata.DeployStartedAt.IsZero() {
 		// 新部署意图：部署前原子落盘"已开始"标记与计数递增（崩溃可复位重放）
@@ -1297,6 +1306,21 @@ func (s *Service) prepareLocalRenew(ctx context.Context, cert *config.CertConfig
 
 	certData, renewBeforeDaysFromUpdate, err := s.fetcher.Update(ctx, api.URL, api.Token, cert.OrderID, csrPEM, strings.Join(cert.Domains, ","), cert.ValidationMethod)
 	if err != nil {
+		// order_in_progress 是 spec §2.2 中唯一的过渡态：服务端明确告知订单已在途
+		// （unpaid/pending，签发进行中），完成后自行消失。必须走"已在处理"归一路径
+		// 而非业务拒绝——后者每轮都会重新提交 CSR 并递增签发计数，10 轮后把一张
+		// 正在正常签发的证书误判触顶，正是 spec 要求「不做永久停止或退避升级」所禁止的。
+		// 归一后下轮只查询订单状态，等服务端签完自愈。
+		if errors.ErrorCodeOf(err) == fetcher.ErrorCodeOrderInProgress {
+			cert.Metadata.CSRSubmittedAt = time.Now()
+			cert.Metadata.LastCSRHash = csrHash
+			cert.Metadata.LastIssueState = config.IssueStateProcessing
+			if updateErr := s.cfgManager.UpdateCert(cert); updateErr != nil {
+				s.log.Warn("保存证书 %s 提交状态失败: %v", cert.CertName, updateErr)
+			}
+			s.log.Info("证书 %s 订单已在途（服务端签发进行中），归一 processing 等待签发完成: %v", cert.CertName, err)
+			return nil, "", nil
+		}
 		// 明确业务拒绝（spec 2.6）：服务端未接收提交、未创建新证书，
 		// 属确定结果——清理在途 pending key 后停止（计数已递增，受签发上限约束）。
 		if errors.IsBusinessError(err) {

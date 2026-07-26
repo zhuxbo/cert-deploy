@@ -91,6 +91,15 @@ type CertMetadata struct {
 	// 把 cancelled 这类订单终态写进去会让两个概念混在一个字段里，
 	// 而 pull 模式从不 POST、根本不需要该区分。
 	LastOrderStatus string `json:"last_order_status,omitempty"`
+	// LastDeployBlockReason 最近一次环境阻断的原因（Web 配置本就损坏等非本次部署导致的失败）。
+	// 环境恢复时清空。用于边沿触发上报：原因未变化时不重复上报。
+	LastDeployBlockReason string `json:"last_deploy_block_reason,omitempty"`
+	// LastDeployBlockAt 最近一次环境阻断的时间
+	LastDeployBlockAt time.Time `json:"last_deploy_block_at,omitempty"`
+	// BlockReportCount 环境阻断上报累计次数，>= 10 后转静默（deploy-spec §2.8）。
+	// 阻断不递增 DeployAttemptCount（修好即自动恢复、无需人工解除 CAPPED），
+	// 故若无此上限，整条阻断回调路径就没有任何边界。环境恢复时清零。
+	BlockReportCount int `json:"block_report_count,omitempty"`
 	// UnchangedCertRounds 服务端连续返回同一张证书（序列号未变）的轮数（平台扩展字段）。
 	// 部署"成功"会清零全部计数，若服务端一直不换证，三重边界同时失效：
 	// 计数每轮清零永不触顶、部署发生算进展使无进展计时也清零、到期闸门要等真过期。

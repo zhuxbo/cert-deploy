@@ -418,6 +418,19 @@ func printCertHaltState(w io.Writer, cert *config.CertConfig) {
 			colorize("[无进展]", colorYellow), formatStatusTime(cert.Metadata.NoProgressSince),
 			config.MaxNoProgressDays)
 	}
+	if cert.Metadata.LastDeployBlockReason != "" {
+		// 环境阻断与部署失败要能区分：前者是既有 Web 配置损坏、与本证书无关，
+		// 修好配置即自动恢复，不需要人工解除任何状态
+		_, _ = fmt.Fprintf(w, "    %s %s（自 %s，已上报 %d/%d 次）\n",
+			colorize("[环境阻断]", colorRed), cert.Metadata.LastDeployBlockReason,
+			formatStatusTime(cert.Metadata.LastDeployBlockAt),
+			cert.Metadata.BlockReportCount, config.MaxBlockReportCount)
+	}
+	if cert.Metadata.UnchangedCertRounds > 0 {
+		_, _ = fmt.Fprintf(w, "    %s 服务端连续 %d/%d 轮返回同一张证书，证书未实际更新\n",
+			colorize("[未更替]", colorYellow), cert.Metadata.UnchangedCertRounds,
+			config.CertUnchangedRounds)
+	}
 	if len(cert.Metadata.StaleBindings) > 0 {
 		_, _ = fmt.Fprintf(w, "    %s 长期未部署成功的站点: %s（自 %s），这些站点仍在使用旧证书\n",
 			colorize("[陈旧]", colorRed), strings.Join(cert.Metadata.StaleBindings, ", "),

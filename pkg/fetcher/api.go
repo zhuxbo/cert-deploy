@@ -84,6 +84,45 @@ type APIResponse struct {
 	Code    int             `json:"code"`
 	Message string          `json:"msg"` // API 使用 msg 字段
 	Data    json.RawMessage `json:"data"`
+	// Errors 错误响应的附加信息（deploy-spec §2.2）；仅 code != 1 时有值
+	Errors APIErrors `json:"errors"`
+}
+
+// APIErrors 错误响应的 errors 字段（deploy-spec §2.2）。
+// HTTP 状态码恒为 200、业务成败只由 code 区分，因此 error_code 是客户端
+// 唯一可靠的失败分类依据——没有它就只能把「订单不存在」这类确定性失败
+// 当成网络错误无限重试。
+type APIErrors struct {
+	// ErrorCode 机器可读的失败标识，取值见 deploy-spec §2.2；缺失表示未分类
+	ErrorCode string `json:"error_code"`
+	// RetryAfter 限流时的窗口剩余秒数（仅 error_code=rate_limited 时有值）
+	RetryAfter int `json:"retry_after"`
+}
+
+// 服务端下发的 error_code 取值（deploy-spec §2.2）。
+// 取值一旦发布不得改动，只允许新增；未列出的取值按未分类处理。
+const (
+	ErrorCodeRateLimited     = "rate_limited"     // 触发限流，带 retry_after
+	ErrorCodeTokenMissing    = "token_missing"    // 请求未携带 token
+	ErrorCodeTokenInvalid    = "token_invalid"    // token 不存在或已失效
+	ErrorCodeTokenDisabled   = "token_disabled"   // token 被禁用
+	ErrorCodeAccountDisabled = "account_disabled" // token 所属账号被禁用
+	ErrorCodeIPNotAllowed    = "ip_not_allowed"   // 来源 IP 不在白名单
+	ErrorCodeOrderNotFound   = "order_not_found"  // 订单不存在或不可见
+	ErrorCodeCertNotFound    = "cert_not_found"   // 订单存在但无可用证书
+	ErrorCodeInvalidOrder    = "invalid_order"    // order 参数缺失或形态非法
+)
+
+// apiError 依据 error_code 构造错误：带 error_code 一律是服务端明确拒绝
+// （确定性失败，调用方应停止本轮而非重试），无 error_code 沿用网络错误语义。
+//
+// 不按取值再分档：spec §2.2 表格中每一项的「客户端应对」都是停止本轮，
+// 逐值分支只会引入无谓的分类漂移。retry_after 由调用方按需读取。
+func (r *APIResponse) apiError(msg string) error {
+	if r.Errors.ErrorCode == "" {
+		return errors.NewNetworkError(msg, nil)
+	}
+	return errors.NewBusinessErrorWithCode(msg, r.Errors.ErrorCode, r.Errors.RetryAfter)
 }
 
 // ParseData 解析 Data 字段，支持单个对象或数组格式
@@ -189,6 +228,7 @@ type CallbackResponse struct {
 	Message         string          `json:"msg"`
 	RenewBeforeDays int             `json:"renew_before_days"`
 	Data            json.RawMessage `json:"data"`
+	Errors          APIErrors       `json:"errors"`
 }
 
 // renewBeforeDaysFromData 从 data 对象中提取 renew_before_days，形状不符或缺失返回 0
@@ -472,7 +512,9 @@ func (f *Fetcher) doAPICallQuery(ctx context.Context, newRequest func() (*http.R
 		return nil, 0, errors.NewNetworkError("failed to parse JSON response", err)
 	}
 	if apiResp.Code != APICodeSuccess {
-		return nil, 0, errors.NewNetworkError(fmt.Sprintf("API error: %s", apiResp.Message), nil)
+		// 带 error_code 时归为业务拒绝：订单不存在 / token 失效 / 形态非法都是
+		// 确定结果，此前一律当网络错误会让调用方每日重试到证书过期
+		return nil, 0, apiResp.apiError(fmt.Sprintf("API error: %s", apiResp.Message))
 	}
 	return apiResp.ParseQueryData()
 }
@@ -520,7 +562,11 @@ func (f *Fetcher) Callback(ctx context.Context, callbackURL, token string, callb
 		return 0, errors.NewNetworkError("failed to parse callback response", err)
 	}
 	if callbackResp.Code != APICodeSuccess {
-		return 0, errors.NewNetworkError(fmt.Sprintf("callback failed: %s", callbackResp.Message), nil)
+		msg := fmt.Sprintf("callback failed: %s", callbackResp.Message)
+		if callbackResp.Errors.ErrorCode != "" {
+			return 0, errors.NewBusinessErrorWithCode(msg, callbackResp.Errors.ErrorCode, callbackResp.Errors.RetryAfter)
+		}
+		return 0, errors.NewNetworkError(msg, nil)
 	}
 	renewBeforeDays := renewBeforeDaysFromData(callbackResp.Data)
 	if renewBeforeDays == 0 {
@@ -589,7 +635,12 @@ func (f *Fetcher) Update(ctx context.Context, baseURL, token string, orderID int
 	}
 	if apiResp.Code != APICodeSuccess {
 		// 服务端已成功响应但明确拒绝提交（校验失败、订单状态不允许等）：
-		// 属确定结果而非传输失败，调用方据此清理在途 pending 后停止（spec 2.6）
+		// 属确定结果而非传输失败，调用方据此清理在途 pending 后停止（spec 2.6）。
+		// 无 error_code 时同样保持业务拒绝语义——POST 的拒绝判定先于 error_code 存在，
+		// 不能因服务端未下发标识而退回可重试。
+		if apiResp.Errors.ErrorCode != "" {
+			return nil, 0, apiResp.apiError(fmt.Sprintf("API error: %s", apiResp.Message))
+		}
 		return nil, 0, errors.NewBusinessError(fmt.Sprintf("API error: %s", apiResp.Message), nil)
 	}
 	// update 响应 data 字段为单条，同层包含 renew_before_days
@@ -702,7 +753,7 @@ func (f *Fetcher) ToggleAutoReissue(ctx context.Context, baseURL, token string, 
 		return 0, errors.NewNetworkError("failed to parse JSON response", err)
 	}
 	if apiResp.Code != APICodeSuccess {
-		return 0, errors.NewNetworkError(fmt.Sprintf("API error: %s", apiResp.Message), nil)
+		return 0, apiResp.apiError(fmt.Sprintf("API error: %s", apiResp.Message))
 	}
 	var data struct {
 		RenewBeforeDays int `json:"renew_before_days"`

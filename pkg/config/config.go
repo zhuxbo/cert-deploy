@@ -84,8 +84,13 @@ type CertMetadata struct {
 	// DeployStartedAt 部署尝试崩溃安全标记：置位表示已持久化一个部署意图但结果未落盘，
 	// 重启时据此复验并重放同一尝试，不再重复递增 DeployAttemptCount（deploy-spec §5.1）
 	DeployStartedAt time.Time `json:"deploy_started_at,omitempty"`
-	// CappedPhase 触顶阶段：issue / deploy / legacy（仅 LastIssueState==CAPPED 时有意义）
+	// CappedPhase 触顶阶段：issue / deploy / stalled / legacy（仅 LastIssueState==CAPPED 时有意义）
 	CappedPhase string `json:"capped_phase,omitempty"`
+	// LastOrderStatus 服务端最近一次返回的订单状态，**展示专用、不参与任何门禁判定**。
+	// 与 LastIssueState 分离（deploy-spec §3.4）：后者的真实作用是区分「有无在途订单」，
+	// 把 cancelled 这类订单终态写进去会让两个概念混在一个字段里，
+	// 而 pull 模式从不 POST、根本不需要该区分。
+	LastOrderStatus string `json:"last_order_status,omitempty"`
 	// 部署失败的绑定列表（ServerName），下次检查时重试
 	FailedBindings   []string  `json:"failed_bindings,omitempty"`
 	FailedBindingsAt time.Time `json:"failed_bindings_at,omitempty"` // 首次记录失败绑定的时间

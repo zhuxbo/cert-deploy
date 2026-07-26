@@ -186,7 +186,7 @@ func fetchAndDeployCert(ctx context.Context, cfgManager *config.ConfigManager, c
 		fmt.Printf("  证书名称修正: %s -> %s\n", oldCertName, cert.CertName)
 	}
 
-	if certData.Status != "active" || certData.Cert == "" {
+	if certData.Status != config.OrderStatusActive || certData.Cert == "" {
 		return fmt.Errorf("证书未就绪: status=%s", certData.Status)
 	}
 
@@ -503,7 +503,7 @@ func installSSLForSite(ctx context.Context, site *config.ScannedSite, binding *c
 		return fmt.Errorf("获取证书失败: %w", err)
 	}
 	applyDeployRenewBeforeDays(cfgManager, nil, renewBeforeDays)
-	if certData.Status != "active" || certData.Cert == "" {
+	if certData.Status != config.OrderStatusActive || certData.Cert == "" {
 		return fmt.Errorf("证书未就绪: status=%s", certData.Status)
 	}
 

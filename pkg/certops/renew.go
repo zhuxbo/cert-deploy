@@ -629,6 +629,13 @@ func (s *Service) resetIssueStateForResubmit(cert *config.CertConfig, cause erro
 func (s *Service) refreshExpiryFromAPI(ctx context.Context, cert *config.CertConfig, api config.APIConfig) bool {
 	certData, renewBeforeDays, err := s.fetcher.QueryOrder(ctx, api.URL, api.Token, cert.OrderID)
 	if err != nil {
+		// 服务端明确拒绝（订单不存在、token 失效、IP 不在白名单等）与传输失败区别对待：
+		// 前者每轮重试都注定同样失败，需要人工核对配置，按 Error 记而非 Warn。
+		// 本函数仍返回 false 让本轮跳过——真正的停止边界由无进展时限提供（spec §3.2）。
+		if errors.IsBusinessError(err) {
+			s.log.Error("证书 %s 到期时间未知且服务端拒绝查询（需人工核对配置，重试无用）: %v", cert.CertName, err)
+			return false
+		}
 		s.log.Warn("证书 %s 到期时间未知且查询失败，跳过本轮: %v", cert.CertName, err)
 		return false
 	}
@@ -750,7 +757,11 @@ func (s *Service) retryFailedBindings(ctx context.Context, cert *config.CertConf
 
 	certData, renewBeforeDays, err := s.fetcher.QueryOrder(ctx, api.URL, api.Token, cert.OrderID)
 	if err != nil {
-		s.log.Warn("重试失败绑定: 查询证书 %s 失败: %v", cert.CertName, err)
+		if errors.IsBusinessError(err) {
+			s.log.Error("重试失败绑定: 服务端拒绝查询证书 %s（需人工核对配置，重试无用）: %v", cert.CertName, err)
+		} else {
+			s.log.Warn("重试失败绑定: 查询证书 %s 失败: %v", cert.CertName, err)
+		}
 		if exhausted {
 			return s.parkExhaustedRetries(cert, result, err, false)
 		}
@@ -760,7 +771,7 @@ func (s *Service) retryFailedBindings(ctx context.Context, cert *config.CertConf
 	}
 	s.tryUpdateRenewBeforeDays(renewBeforeDays)
 	s.syncOrderID(cert, certData)
-	if certData.Status != "active" || certData.Cert == "" || certData.IntermediateCert == "" {
+	if certData.Status != config.OrderStatusActive || certData.Cert == "" || certData.IntermediateCert == "" {
 		// 证书仍在签发中：上游在途状态，既非部署尝试也非部署结果。
 		// 不计入配额（回滚本轮递增）、不停车、不回调，等服务端签完自愈——
 		// 否则合法 processing 满 10 轮会清空 FailedBindings，证书真正签发后反而不再重试。
@@ -893,6 +904,41 @@ func getRenewMode(schedule *config.ScheduleConfig) string {
 	return mode
 }
 
+// trackOrderStatus 记录服务端返回的订单状态（展示专用，不参与门禁判定），
+// 返回状态是否相对上一轮发生变化。未变化时不写盘，避免每轮无谓 IO。
+func (s *Service) trackOrderStatus(cert *config.CertConfig, status string) bool {
+	if cert.Metadata.LastOrderStatus == status {
+		return false
+	}
+	cert.Metadata.LastOrderStatus = status
+	if err := s.cfgManager.UpdateCert(cert); err != nil {
+		s.log.Warn("记录证书 %s 订单状态失败: %v", cert.CertName, err)
+	}
+	return true
+}
+
+// logOrderStatusSkip 按状态类别输出跳过日志。
+//
+// 仅在状态变化时用 Error/Warn：终态订单会被每日查询自愈，逐轮告警是零信息增量的
+// 噪声，只会淹没真正的新问题。未变化时降为 Debug。
+// 全部路径都只记日志不落门禁状态——真正的停止边界由无进展时限提供（spec §3.2）。
+func (s *Service) logOrderStatusSkip(cert *config.CertConfig, status string, changed bool) {
+	if !changed {
+		s.log.Debug("证书 %s 订单状态 %s 未变化，继续等待", cert.CertName, status)
+		return
+	}
+	switch config.ClassifyOrderStatus(status) {
+	case config.OrderClassTerminal:
+		s.log.Error("证书 %s 订单已进入终态 %s，不再自动推进，等待人工处理", cert.CertName, status)
+	case config.OrderClassChainAnomaly:
+		s.log.Error("证书 %s 收到链式状态 %s：服务端本应自动跟随续费/重签链，说明链数据异常（断链或成环），需人工核对", cert.CertName, status)
+	case config.OrderClassUnknown:
+		s.log.Warn("证书 %s 收到未知订单状态 %s，按等待处理（受无进展时限约束）", cert.CertName, status)
+	default:
+		s.log.Debug("证书 %s 状态: %s，跳过", cert.CertName, status)
+	}
+}
+
 // preparePullRenew 自动签发：等待服务端续签完成后拉取证书
 func (s *Service) preparePullRenew(ctx context.Context, cert *config.CertConfig, api config.APIConfig) (*fetcher.CertData, string, error) {
 	certData, renewBeforeDays, err := s.fetcher.QueryOrder(ctx, api.URL, api.Token, cert.OrderID)
@@ -901,14 +947,18 @@ func (s *Service) preparePullRenew(ctx context.Context, cert *config.CertConfig,
 	}
 	s.tryUpdateRenewBeforeDays(renewBeforeDays)
 	s.syncOrderID(cert, certData)
-	if certData.Status != "active" || certData.Cert == "" {
+	// 订单状态只落展示字段，不写 last_issue_state（deploy-spec §3.4）：
+	// pull 模式从不 POST，无需用该字段区分「有无在途订单」
+	statusChanged := s.trackOrderStatus(cert, certData.Status)
+
+	if certData.Status != config.OrderStatusActive || certData.Cert == "" {
 		// processing + 文件验证：放置验证文件（全部放置失败按失败处理，避免静默永远 pending）
-		if certData.Status == "processing" {
+		if certData.Status == config.OrderStatusProcessing {
 			if err := s.applyValidationFiles(cert, certData.File, true); err != nil {
 				return nil, "", err
 			}
 		}
-		s.log.Debug("证书 %s 状态: %s，跳过", cert.CertName, certData.Status)
+		s.logOrderStatusSkip(cert, certData.Status, statusChanged)
 		return nil, "", nil
 	}
 
@@ -951,9 +1001,10 @@ func (s *Service) prepareLocalRenew(ctx context.Context, cert *config.CertConfig
 		}
 		s.tryUpdateRenewBeforeDays(renewBeforeDays)
 		s.syncOrderID(cert, certData)
+		statusChanged := s.trackOrderStatus(cert, certData.Status)
 
-		switch certData.Status {
-		case "active":
+		switch config.ClassifyOrderStatus(certData.Status) {
+		case config.OrderClassActive:
 			if certData.Cert == "" {
 				// active 但证书内容为空，继续等待
 				s.log.Debug("证书 %s 状态 active 但内容为空，跳过", cert.CertName)
@@ -995,9 +1046,12 @@ func (s *Service) prepareLocalRenew(ctx context.Context, cert *config.CertConfig
 			// "证书已签发但全部绑定部署失败"的续跑循环受 MaxDeployAttemptCount 约束并最终触顶停机。
 			return certData, privateKey, nil
 
-		case "processing", "pending", "approving":
-			// pending / approving 归一 processing：只查询等待，不重复 POST、不增计数、不重生 CSR（spec 2.4/3.5）。
-			// 放置验证文件（如果有新的；全部放置失败按失败处理，避免静默永远 pending）
+		case config.OrderClassWaiting:
+			// pending / approving 归一 processing；unpaid / cancelling 同归此类——
+			// 二者都不是终态：unpaid 由服务端 update 自动推进、孤儿单 60 分钟内清理，
+			// cancelling 会转 cancelled。客户端只查询等待，**不主动 POST 推进**：
+			// POST 会触发服务端 pay 扣费，涉及资金的动作不由客户端自动发起。
+			// 不重复 POST、不增计数、不重生 CSR（spec 2.4/3.5），边界由无进展时限提供。
 			if err := s.applyValidationFiles(cert, certData.File, true); err != nil {
 				return nil, "", err
 			}
@@ -1005,17 +1059,17 @@ func (s *Service) prepareLocalRenew(ctx context.Context, cert *config.CertConfig
 			return nil, "", nil
 
 		default:
-			// 其他状态（订单终态）：持久化实际状态后停止，等待人工处理（spec 3.5）。
-			// 后续轮次仍会查询自愈（若状态回到在途/active 则恢复推进）；
-			// 状态未变化时不重复记录/落盘，避免每日 Error 噪声与无效写盘。
-			if certData.Status == cert.Metadata.LastIssueState {
-				s.log.Debug("证书 %s 订单终态 %s 未变化，继续等待人工处理", cert.CertName, certData.Status)
-				return nil, "", nil
+			// 真终态 / 链式异常 / 未知状态：只记日志与展示字段，**不写 last_issue_state**
+			// （spec §3.4）——该字段的语义是「有无在途订单」，写入订单状态会让两个概念
+			// 混在一起。后续轮次仍会查询自愈（状态回到在途/active 则恢复推进）。
+			s.logOrderStatusSkip(cert, certData.Status, statusChanged)
+			// 仅状态首次变化时报失败：让用户看到一次，之后静默等待自愈，
+			// 避免终态证书每日刷一条 failure 统计。未知状态一律不报失败——
+			// 服务端新增中间态不该把证书打进失败统计。
+			if statusChanged && config.ClassifyOrderStatus(certData.Status) != config.OrderClassUnknown {
+				return nil, "", fmt.Errorf("订单状态 %s 需人工处理", certData.Status)
 			}
-			cert.Metadata.LastIssueState = certData.Status
-			_ = s.cfgManager.UpdateCert(cert)
-			s.log.Error("证书 %s 订单状态异常: %s，等待人工处理", cert.CertName, certData.Status)
-			return nil, "", fmt.Errorf("订单状态异常: %s，等待人工处理", certData.Status)
+			return nil, "", nil
 		}
 	}
 
@@ -1089,7 +1143,7 @@ func (s *Service) prepareLocalRenew(ctx context.Context, cert *config.CertConfig
 	// pending 归一 processing（spec 2.6）
 	cert.Metadata.LastIssueState = normalizeIssueState(certData.Status)
 
-	if certData.Status != "active" || certData.Cert == "" {
+	if certData.Status != config.OrderStatusActive || certData.Cert == "" {
 		// 放置验证文件（如果有；全部放置失败按失败处理，但先保存元数据，
 		// LastIssueState=processing 已持久化，下轮走 processing 分支重试放置）
 		placeErr := s.applyValidationFiles(cert, certData.File, false)
@@ -1122,7 +1176,7 @@ func (s *Service) prepareLocalRenew(ctx context.Context, cert *config.CertConfig
 	// 保留 CSRSubmittedAt/LastCSRHash/IssueRetryCount，持久化 LastIssueState="active" 作为崩溃安全网，
 	// 使部署失败后下轮走 active 自愈分支：查询订单→读 pending→配对→复用部署路径。
 	// 部署成功由 deployCertToBindings 统一清零状态并转正 pending（规范 3.8）。
-	cert.Metadata.LastIssueState = "active"
+	cert.Metadata.LastIssueState = config.IssueStateActive
 	if err := s.cfgManager.UpdateCert(cert); err != nil {
 		s.log.Warn("保存证书元数据失败: %v", err)
 	}

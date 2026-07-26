@@ -25,14 +25,24 @@ type AppError struct {
 	Code    int
 	Message string
 	Err     error
+	// ErrorCode 服务端下发的机器可读失败标识（deploy-spec §2.2），仅业务拒绝时有值
+	ErrorCode string
+	// RetryAfter 限流场景的窗口剩余秒数，仅 ErrorCode=rate_limited 时有值
+	RetryAfter int
 }
 
 // Error 实现 error 接口
 func (e *AppError) Error() string {
-	if e.Err != nil {
-		return fmt.Sprintf("code=%d, msg=%s, err=%v", e.Code, e.Message, e.Err)
+	// ErrorCode 进入错误文本：它会随失败原因流入日志与回调 message，
+	// 是运维定位「为什么停止」的唯一线索
+	prefix := fmt.Sprintf("code=%d", e.Code)
+	if e.ErrorCode != "" {
+		prefix = fmt.Sprintf("code=%d, error_code=%s", e.Code, e.ErrorCode)
 	}
-	return fmt.Sprintf("code=%d, msg=%s", e.Code, e.Message)
+	if e.Err != nil {
+		return fmt.Sprintf("%s, msg=%s, err=%v", prefix, e.Message, e.Err)
+	}
+	return fmt.Sprintf("%s, msg=%s", prefix, e.Message)
 }
 
 // Unwrap 支持 errors.Is/As
@@ -70,10 +80,39 @@ func NewBusinessError(msg string, err error) *AppError {
 	return &AppError{Code: CodeBusinessError, Message: msg, Err: err}
 }
 
+// NewBusinessErrorWithCode 构造带服务端 error_code 的业务拒绝（deploy-spec §2.2）
+func NewBusinessErrorWithCode(msg, errorCode string, retryAfter int) *AppError {
+	return &AppError{
+		Code:       CodeBusinessError,
+		Message:    msg,
+		ErrorCode:  errorCode,
+		RetryAfter: retryAfter,
+	}
+}
+
 // IsBusinessError 判断是否为服务端明确业务拒绝（区别于超时/断连/解析失败等不确定结果）
 func IsBusinessError(err error) bool {
 	var appErr *AppError
 	return stderrors.As(err, &appErr) && appErr.Code == CodeBusinessError
+}
+
+// ErrorCodeOf 提取服务端下发的 error_code，无则返回空串。
+// 供调用方区分「确定性失败」的具体成因（订单不存在 / token 失效 / 限流等）。
+func ErrorCodeOf(err error) string {
+	var appErr *AppError
+	if stderrors.As(err, &appErr) {
+		return appErr.ErrorCode
+	}
+	return ""
+}
+
+// RetryAfterOf 提取限流响应的窗口剩余秒数，无则返回 0
+func RetryAfterOf(err error) int {
+	var appErr *AppError
+	if stderrors.As(err, &appErr) {
+		return appErr.RetryAfter
+	}
+	return 0
 }
 
 func NewDeployError(msg string, err error) *AppError {

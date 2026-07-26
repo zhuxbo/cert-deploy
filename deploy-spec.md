@@ -81,11 +81,12 @@
 | `cert_serial`          | string | 证书序列号                                                                                                                                    |
 | `csr_submitted_at`     | string | CSR 提交时间（仅 local 模式）                                                                                                                 |
 | `last_csr_hash`        | string | 上次 CSR 的 SHA256 哈希                                                                                                                       |
-| `last_issue_state`     | string | 签发/生命周期状态：`""` / `processing` / `CAPPED`（触顶，记录阶段：签发/部署/停更/legacy）/ `EXPIRED`（已过期静默）/ 其他异常（等待人工处理） |
+| `last_issue_state`     | string | 签发/生命周期状态，语义为「有无在途订单」：`""`（无在途，可提交新 CSR）/ `processing` / `active`（秒签待部署）/ `CAPPED`（触顶，阶段见 `capped_phase`：签发/部署/停更/legacy）/ `EXPIRED`（已过期静默）。**不承载服务端订单状态**（见 `last_order_status`） |
 | `issue_retry_count`    | int    | 签发尝试计数（CSR 提交），`>= 10` 触顶                                                                                                        |
 | `deploy_attempt_count` | int    | 部署尝试计数，`>= 10` 触顶；与签发计数分离，不从旧混合计数推断                                                                                |
 | `no_progress_since`    | string | 首次「只查询、无进展」的时间（RFC3339）；有进展时清空，超过无进展时限进入 `CAPPED`（停更）                                                    |
 | `block_report_count`   | int    | 环境阻断上报计数，`>= 10` 后转静默；环境恢复时清零                                                                                            |
+| `last_order_status`    | string | 服务端最近返回的订单状态，**展示专用、不参与任何门禁判定**（见 2.4 状态分类）                                                                  |
 
 ### 1.6 扩展区约定
 
@@ -203,7 +204,13 @@
 **取值一旦发布不得改动**，只允许新增。
 
 以上都是确定性失败：客户端必须据此停止本轮动作，不得当作网络错误重试。
-无 `errors.error_code` 的错误响应按未分类处理，沿用既有重试策略。
+无 `errors.error_code` 的错误响应按未分类处理，沿用既有重试策略。反向也成立：
+POST 提交的业务拒绝语义（§2.6）先于本机制存在，服务端未下发标识时**不得**退回可重试。
+
+`error_code` 须进入客户端错误文本，它是运维判断「为何停止」的唯一线索。批量场景下
+区分两类：整批共通的凭据/限流问题（`rate_limited` / `token_*` / `account_disabled` /
+`ip_not_allowed`）对每个条目都会同样失败，客户端应首次即停止本批剩余同类请求；
+`order_not_found` / `cert_not_found` / `invalid_order` 只影响单个条目，按普通失败计数。
 
 限流刻意**不**改用 HTTP 429：客户端把 429 认作可重试，指数退避（1s→2s→4s）全落在同一
 60 秒限流窗口内注定失败，且服务端计数器在阈值判断之前自增，重试反而把恢复时间往后拖。
@@ -274,9 +281,26 @@ GET /api/deploy?token={token}&order={order_id|domain}&field=private_key
 `certificate`、`ca_certificate`、`private_key`、`issued_at`、`expires_at` 仅在 `status=active` 时返回。
 
 状态语义：提交 CSR 的成功响应只会是 `pending` / `processing`（均表示服务端已收到 CSR）；查询订单在
-`processing` 与 `active` 之间可能出现短暂中间态 `approving`。客户端将 `pending` / `processing` /
-`approving` 统一归一为 `processing` 继续等待；`active` 之后的状态均为订单终态，客户端持久化后停止
-自动动作，等待人工处理。
+`processing` 与 `active` 之间可能出现短暂中间态 `approving`（服务端在 `active` 但中间证书尚未就绪时
+动态改写，不是持久状态）。
+
+**客户端必须显式分类全部取值，不得用「其余即终态」兜底**——服务端枚举含 `unpaid` / `cancelling`
+这类可自愈的中间态，误判为终态会让证书停在等人工而实际无人需处理：
+
+| 类别         | 取值                                          | 客户端处置                                                            |
+| ------------ | --------------------------------------------- | --------------------------------------------------------------------- |
+| 已签发       | `active`                                      | 部署                                                                  |
+| 在途等待     | `pending` / `processing` / `approving`        | 归一 processing，只 GET、不计数、不重复提交，计入无进展计时            |
+| 可自愈中间态 | `unpaid` / `cancelling`                       | 同「在途等待」。**不得主动 POST 推进**：POST 会触发服务端扣费          |
+| 真终态       | `failed` / `cancelled` / `revoked` / `expired`| 记录后停止自动动作，等待人工；后续轮次仍可查询自愈                    |
+| 链式状态     | `renewed` / `reissued`                        | 服务端本应自动跟随续费链，收到即链数据异常（断链/成环），按终态并告警 |
+| 未知新增     | 其他                                          | **保守当在途等待**，由无进展时限兜底；当终态会让新增中间态误伤全量证书 |
+
+订单状态只写入 `last_order_status`（展示专用），**不得写入 `last_issue_state`**：后者的语义是
+「有无在途订单」，用于防止重复提交 CSR，混入订单状态会让两个概念互相覆盖。
+
+终态与链式状态仅在**状态相对上一轮变化时**告警并计入失败统计，未变化时静默——这类订单会被每日
+查询自愈，逐轮告警是零信息增量的噪声。
 
 ### 2.5 file 结构
 
@@ -496,7 +520,7 @@ effective_mode = cert.renew_mode || schedule.renew_mode
 | --------------- | ------------------------------------------- |
 | `url`（必需）   | API 端点地址                                |
 | `token`（必需） | Bearer Token                                |
-| `order`（可选） | 订单 ID 或逗号分隔的多个 ID，不传时查询全部 |
+| `order`（必需） | 订单 ID 或逗号分隔的多个 ID（见 §2.3）      |
 
 ### 4.2 流程
 

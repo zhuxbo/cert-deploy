@@ -39,7 +39,7 @@ func (s *Service) DeployOne(ctx context.Context, certName string) (*DeployResult
 	// 订单续费后 API 返回新订单号，同步更新
 	s.syncOrderID(cert, certData)
 
-	if certData.Status != "active" || certData.Cert == "" {
+	if certData.Status != config.OrderStatusActive || certData.Cert == "" {
 		return nil, fmt.Errorf("证书未就绪 (status=%s)", certData.Status)
 	}
 

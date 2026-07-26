@@ -215,6 +215,79 @@ func TestNonCriticalCircuitBreaker_SharedAcrossCallTypes(t *testing.T) {
 	}
 }
 
+// errorCodeAPI 返回带 error_code 的 code=0 响应，并计数请求次数
+func errorCodeAPI(t *testing.T, errorCode string) (*httptest.Server, *atomic.Int32) {
+	t.Helper()
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":0,"msg":"denied","errors":{"error_code":"` + errorCode + `"}}`))
+	}))
+	t.Cleanup(server.Close)
+	return server, &calls
+}
+
+// TestNonCriticalCircuitBreaker_TripsImmediatelyOnBatchWideRejection
+// 整批共通的服务端拒绝（token 失效 / 账号或 IP 被禁 / 限流）第一次就熔断，不等攒满次数：
+// 这类失败对本批每一张证书都会以同样方式失败，逐张重试纯属浪费。
+func TestNonCriticalCircuitBreaker_TripsImmediatelyOnBatchWideRejection(t *testing.T) {
+	for _, code := range []string{
+		fetcher.ErrorCodeTokenDisabled,
+		fetcher.ErrorCodeAccountDisabled,
+		fetcher.ErrorCodeIPNotAllowed,
+		fetcher.ErrorCodeRateLimited,
+	} {
+		t.Run(code, func(t *testing.T) {
+			server, calls := errorCodeAPI(t, code)
+			p := newCallbackTestParams(t, server.URL)
+			f := fetcher.New()
+
+			for i := 1; i <= 5; i++ {
+				sendBatchDeployCallback(p, f, i, 1, 0)
+			}
+
+			if got := calls.Load(); got != 1 {
+				t.Errorf("请求次数 = %d, 期望 1（整批共通拒绝应立即熔断）", got)
+			}
+			if p.nonCriticalTripReason != code {
+				t.Errorf("熔断原因 = %q, 期望 %q", p.nonCriticalTripReason, code)
+			}
+			if p.nonCriticalSkipped != 4 {
+				t.Errorf("跳过次数 = %d, 期望 4", p.nonCriticalSkipped)
+			}
+		})
+	}
+}
+
+// TestNonCriticalCircuitBreaker_PerCertRejectionCountsNormally
+// order_not_found / cert_not_found / invalid_order 只说明这一张证书的订单有问题，
+// 同批其他证书仍可能上报成功，必须按普通失败计数而非立即熔断。
+func TestNonCriticalCircuitBreaker_PerCertRejectionCountsNormally(t *testing.T) {
+	for _, code := range []string{
+		fetcher.ErrorCodeOrderNotFound,
+		fetcher.ErrorCodeCertNotFound,
+		fetcher.ErrorCodeInvalidOrder,
+	} {
+		t.Run(code, func(t *testing.T) {
+			server, calls := errorCodeAPI(t, code)
+			p := newCallbackTestParams(t, server.URL)
+			f := fetcher.New()
+
+			for i := 1; i <= 5; i++ {
+				sendBatchDeployCallback(p, f, i, 1, 0)
+			}
+
+			if got := calls.Load(); got != int32(nonCriticalFailureCap) {
+				t.Errorf("请求次数 = %d, 期望 %d（按普通失败计数）", got, nonCriticalFailureCap)
+			}
+			if p.nonCriticalTripReason != "" {
+				t.Errorf("熔断原因 = %q, 期望空（非整批共通拒绝）", p.nonCriticalTripReason)
+			}
+		})
+	}
+}
+
 // TestSendSetupDeployCallback_SurvivesCanceledContext setup 的 ctx 被取消后仍须送达。
 // 与续签路径同构：回调是部署结果的唯一出口，不能随取消一起消失。
 func TestSendSetupDeployCallback_SurvivesCanceledContext(t *testing.T) {

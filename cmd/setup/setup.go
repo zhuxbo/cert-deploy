@@ -48,6 +48,8 @@ type setupParams struct {
 	nonCriticalFails int
 	// nonCriticalSkipped 熔断后跳过的非关键上报次数，结束时汇总
 	nonCriticalSkipped int
+	// nonCriticalTripReason 因服务端明确拒绝而熔断时的 error_code，仅用于汇总文案
+	nonCriticalTripReason string
 }
 
 // orderPattern --order 参数形态（deploy-spec §2.3）：仅订单 ID，单个或英文逗号分隔多个
@@ -70,13 +72,33 @@ func (p *setupParams) nonCriticalTripped() bool {
 }
 
 // recordNonCritical 记录一次非关键上报结果。
+//
 // 成功即清零而非累计：间歇性故障不该攒够次数后熔断，只有持续不可达才熔断。
+//
+// 服务端明确拒绝（带 error_code：token 失效 / 账号或 IP 被禁 / 限流）直接熔断，
+// 不等攒满次数——这类失败对本批每一张证书都会以同样方式失败，逐张重试纯属浪费。
+// 唯一例外是 order_not_found / cert_not_found：它们只说明**这一张**证书的订单有问题，
+// 同批其他证书仍可能上报成功，按普通失败计数。
 func (p *setupParams) recordNonCritical(err error) {
-	if err != nil {
-		p.nonCriticalFails++
+	if err == nil {
+		p.nonCriticalFails = 0
 		return
 	}
-	p.nonCriticalFails = 0
+	if code := sslerrors.ErrorCodeOf(err); code != "" && !perCertErrorCode(code) {
+		p.nonCriticalFails = nonCriticalFailureCap
+		p.nonCriticalTripReason = code
+		return
+	}
+	p.nonCriticalFails++
+}
+
+// perCertErrorCode 判断 error_code 是否只影响单张证书（而非整批共通的凭据/限流问题）
+func perCertErrorCode(code string) bool {
+	switch code {
+	case fetcher.ErrorCodeOrderNotFound, fetcher.ErrorCodeCertNotFound, fetcher.ErrorCodeInvalidOrder:
+		return true
+	}
+	return false
 }
 
 // reportNonCriticalSkips 汇总熔断跳过情况（部署结果不受影响，但服务端状态会滞后）
@@ -84,8 +106,12 @@ func (p *setupParams) reportNonCriticalSkips() {
 	if p.nonCriticalSkipped == 0 {
 		return
 	}
-	msg := fmt.Sprintf("非关键上报连续失败 %d 次后已熔断，跳过 %d 次上报；部署结果不受影响，但服务端状态可能滞后",
-		nonCriticalFailureCap, p.nonCriticalSkipped)
+	cause := fmt.Sprintf("连续失败 %d 次", nonCriticalFailureCap)
+	if p.nonCriticalTripReason != "" {
+		cause = fmt.Sprintf("服务端明确拒绝（%s）", p.nonCriticalTripReason)
+	}
+	msg := fmt.Sprintf("非关键上报因%s已熔断，跳过 %d 次上报；部署结果不受影响，但服务端状态可能滞后",
+		cause, p.nonCriticalSkipped)
 	fmt.Fprintf(os.Stderr, "\n[!] %s\n", msg)
 	p.log.Warn("%s", msg)
 }
@@ -262,7 +288,7 @@ func runSingle(p *setupParams, orderID int) {
 		orderID = certData.OrderID
 	}
 
-	if certData.Status != "active" || certData.Cert == "" {
+	if certData.Status != config.OrderStatusActive || certData.Cert == "" {
 		fmt.Fprintf(os.Stderr, "证书未就绪: status=%s\n", certData.Status)
 		os.Exit(1)
 	}

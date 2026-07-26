@@ -86,7 +86,7 @@ func runBatch(p *setupParams, query string) {
 	var plans []*certDeployPlan
 	for i := range certList {
 		cd := &certList[i]
-		if cd.Status != "active" || cd.Cert == "" {
+		if cd.Status != config.OrderStatusActive || cd.Cert == "" {
 			fmt.Printf("  ⚠ 订单 %d: 证书未就绪 (status=%s)，跳过\n", cd.OrderID, cd.Status)
 			continue
 		}

@@ -434,7 +434,11 @@ func (s *Service) runDeployAttempt(ctx context.Context, cert *config.CertConfig,
 		s.log.Info("证书 %s 检测到未落盘结果的部署意图，复验后重放同一尝试（不增计数）", cert.CertName)
 	}
 
-	deployCount, _, deployErr := s.deployCertToBindings(ctx, cert, certData, privateKey)
+	// 部署前记下旧序列号：deployCertToBindings 成功时会覆盖它，
+	// 事后无从判断服务端是否真的换了证书
+	prevSerial := cert.Metadata.CertSerial
+
+	deployCount, failedBindings, deployErr := s.deployCertToBindings(ctx, cert, certData, privateKey)
 	result.DeployCount = deployCount
 
 	// 零启用绑定（纵深防御命中）：本轮没有发生任何部署尝试 —— 回滚计数、不上报回调。
@@ -466,6 +470,17 @@ func (s *Service) runDeployAttempt(ctx context.Context, cert *config.CertConfig,
 		}
 	} else {
 		result.Status = "success"
+		// 全部站点成功时才校验证书是否真的更替：有站点失败的轮次压根没写 cert_serial，
+		// 本轮相同属预期的补部署（次日重试用的必然是同一张证书）
+		if len(failedBindings) == 0 {
+			if unchanged := s.trackCertUnchanged(cert, prevSerial); unchanged != "" {
+				// 改判为失败并上报：服务端看到的一直是 success，不改判就永远不知道
+				// 证书其实没更新，直到真的过期
+				result.Status = "failure"
+				result.Error = stderrors.New(unchanged)
+				s.log.Error("证书 %s %s，已改判为失败并上报，需人工核对服务端签发状态", cert.CertName, unchanged)
+			}
+		}
 	}
 	if err := s.cfgManager.UpdateCert(cert); err != nil {
 		s.log.Warn("更新证书元数据失败: %v", err)
@@ -473,6 +488,39 @@ func (s *Service) runDeployAttempt(ctx context.Context, cert *config.CertConfig,
 
 	// 编排层统一发送部署结果回调（成功/明确失败各尽力一次）
 	s.sendRenewCallback(ctx, cert, result)
+}
+
+// trackCertUnchanged 全部站点部署成功后比对序列号，判断服务端是否真的换了证书。
+// 返回非空字符串表示已连续多轮未更替，调用方据此把本轮结果改判为失败。
+//
+// 为什么需要这道检查：部署"成功"会清零全部计数并更新到期时间为同一个值，于是
+// 三重边界同时失效——计数每轮清零永不触顶、"部署发生"算进展使无进展计时也清零、
+// 到期闸门要等真过期。每轮还会真实改写证书文件并 reload Web 服务，服务端收到的
+// 却是一切正常的 success，直到证书真的过期。
+//
+// 只在编排层（自动续签）判定，手动部署不参与：用户点两次部署、粘贴私钥后重新
+// 部署、加绑站点后部署，都会用同一张证书，那是正常操作而非服务端故障。
+//
+// 判据要求两端序列号都非空——解析失败时序列号为空串，空串相等会让每次部署都误报。
+// 到期时间未前移只作序列号缺失时的降级判据、不与序列号并列：CA 重签常保留原订单
+// 剩余有效期，"新序列号 + 相同 notAfter"是完全正常的结果，而 local 模式走的恰恰
+// 是重签路径。
+func (s *Service) trackCertUnchanged(cert *config.CertConfig, prevSerial string) string {
+	newSerial := cert.Metadata.CertSerial
+	if prevSerial == "" || newSerial == "" || prevSerial != newSerial {
+		if cert.Metadata.UnchangedCertRounds != 0 {
+			cert.Metadata.UnchangedCertRounds = 0
+		}
+		return ""
+	}
+
+	cert.Metadata.UnchangedCertRounds++
+	rounds := cert.Metadata.UnchangedCertRounds
+	s.log.Warn("证书 %s 服务端返回的证书未更替（第 %d 轮，序列号 %s）", cert.CertName, rounds, newSerial)
+	if rounds < config.CertUnchangedRounds {
+		return ""
+	}
+	return fmt.Sprintf("服务端连续 %d 轮返回同一张证书（序列号 %s 未变），证书未实际更新", rounds, newSerial)
 }
 
 // persistTerminalState 落盘终止态（CAPPED / EXPIRED / policy_blocked），并清除部署"已开始"标记。
@@ -1398,6 +1446,10 @@ func (s *Service) deployCertToBindings(ctx context.Context, cert *config.CertCon
 		// 编排层的快照结算也会覆盖此处（LastDeployAt 已变），显式清零是为了让
 		// 手动 deploy / setup 复用本函数时同样受益。
 		cert.Metadata.NoProgressSince = time.Time{}
+		// 注意：**不得**在此清零 UnchangedCertRounds。它的所有权属于
+		// trackCertUnchanged（序列号变化时清零、相同时递增），而该检测在本函数之后执行——
+		// 在这里清零会让计数每轮先归零再递增到 1，永远达不到升级阈值，整个检测失效。
+		// sslbt 的实现正是踩了这个坑（unchanged_cert_rounds 被放进部署成功清零列表）。
 	}
 
 	s.cleanupCertValidationFiles(cert)

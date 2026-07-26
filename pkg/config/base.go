@@ -168,6 +168,12 @@ const AttemptCap = 10
 // 轮询不计入尝试计数，到期闸门在到期时间未知时失效，故需要独立时限。
 const MaxNoProgressDays = 14
 
+// CertUnchangedRounds 证书未更替的容忍轮数：连续该轮数返回同一张证书即升级为失败。
+//
+// 取 2 而非 1：单轮相同可能是上一轮部分失败后的正常补部署——失败站点次日重试时，
+// 用的必然还是同一张证书。
+const CertUnchangedRounds = 2
+
 // ClockSanityMaxDays 无进展计时的时钟合理上限（deploy-spec §11）。
 //
 // 不是「允许停滞的预算」而是时间差的可信度判据：每日检查下计时走到第 14 天即已停更，

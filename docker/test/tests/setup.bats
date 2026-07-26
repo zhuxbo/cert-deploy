@@ -79,16 +79,28 @@ setup() {
   assert_failure
 }
 
+# 以下三个场景服务端都是 HTTP 200 + code=0 + errors.error_code（deploy-spec §2.2）。
+# 断言 error_code 出现在输出里：规范要求它必须进入客户端错误文本——服务端 msg 可能只是
+# 「Unauthorized」这类无指向文案，而 token_invalid 与 ip_not_allowed 的处置完全不同。
 @test "setup: 认证失败" {
   mock_set_scenario unauthorized
   run sslctl setup --url "$MOCK_URL" --token "$TOKEN" --order 1001 --no-service --yes
   assert_failure
+  assert_output_contains "token_invalid"
 }
 
 @test "setup: 订单不存在" {
   mock_set_scenario not_found
   run sslctl setup --url "$MOCK_URL" --token "$TOKEN" --order 1001 --no-service --yes
   assert_failure
+  assert_output_contains "order_not_found"
+}
+
+@test "setup: 限流拒绝" {
+  mock_set_scenario rate_limited
+  run sslctl setup --url "$MOCK_URL" --token "$TOKEN" --order 1001 --no-service --yes
+  assert_failure
+  assert_output_contains "rate_limited"
 }
 
 @test "setup: processing 状态" {

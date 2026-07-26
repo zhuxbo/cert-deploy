@@ -27,7 +27,7 @@ type AppError struct {
 	Err     error
 	// ErrorCode 服务端下发的机器可读失败标识（deploy-spec §2.2），仅业务拒绝时有值
 	ErrorCode string
-	// RetryAfter 限流场景的窗口剩余秒数，仅 ErrorCode=rate_limited 时有值
+	// RetryAfter 睡满即可重试的保守秒数，仅 ErrorCode=rate_limited 时有值
 	RetryAfter int
 }
 
@@ -106,7 +106,7 @@ func ErrorCodeOf(err error) string {
 	return ""
 }
 
-// RetryAfterOf 提取限流响应的窗口剩余秒数，无则返回 0
+// RetryAfterOf 提取限流响应的可重试秒数（睡满即可重试的保守值），无则返回 0
 func RetryAfterOf(err error) int {
 	var appErr *AppError
 	if stderrors.As(err, &appErr) {

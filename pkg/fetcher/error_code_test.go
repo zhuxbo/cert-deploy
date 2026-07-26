@@ -40,7 +40,7 @@ func TestQueryOrder_ErrorCodeClassifiesAsBusiness(t *testing.T) {
 	}{
 		{"订单不存在", `{"error_code":"order_not_found"}`, ErrorCodeOrderNotFound, 0},
 		{"token 被禁用", `{"error_code":"token_disabled"}`, ErrorCodeTokenDisabled, 0},
-		{"限流带 retry_after", `{"error_code":"rate_limited","retry_after":42}`, ErrorCodeRateLimited, 42},
+		{"限流带 retry_after（新语义：睡满即可重试的保守秒数，61..120）", `{"error_code":"rate_limited","retry_after":100}`, ErrorCodeRateLimited, 100},
 		{"order 形态非法", `{"error_code":"invalid_order"}`, ErrorCodeInvalidOrder, 0},
 	}
 
@@ -119,5 +119,47 @@ func TestCallback_ErrorCodeClassifiesAsBusiness(t *testing.T) {
 	}
 	if got := sslerrors.ErrorCodeOf(err); got != ErrorCodeOrderNotFound {
 		t.Errorf("ErrorCodeOf() = %q, want %q", got, ErrorCodeOrderNotFound)
+	}
+}
+
+// TestIsAuthBlockErrorCode 分组必须与 deploy-spec §2.2 的两张表严格一致。
+//
+// 分组决定的是「拉黑整个 token 本轮不再用」还是「只停这一个条目」，误判方向的代价不对称：
+// 把单条目码当成整批共通会连带停掉一整轮无辜条目，因此实现是正面列举而非取反。
+func TestIsAuthBlockErrorCode(t *testing.T) {
+	authBlock := []string{
+		ErrorCodeRateLimited,
+		ErrorCodeTokenMissing,
+		ErrorCodeTokenInvalid,
+		ErrorCodeTokenDisabled,
+		ErrorCodeAccountDisabled,
+		ErrorCodeIPNotAllowed,
+	}
+	perCert := []string{
+		ErrorCodeInvalidOrder,
+		ErrorCodeOrderNotFound,
+		ErrorCodeCertNotFound,
+		ErrorCodeOrderInProgress,
+		ErrorCodeValidationMethodUnsupported,
+		ErrorCodeAutoRenewDisabled,
+		ErrorCodeInsufficientBalance,
+	}
+
+	for _, code := range authBlock {
+		if !IsAuthBlockErrorCode(code) {
+			t.Errorf("IsAuthBlockErrorCode(%q) = false, want true（整批共通组）", code)
+		}
+	}
+	for _, code := range perCert {
+		if IsAuthBlockErrorCode(code) {
+			t.Errorf("IsAuthBlockErrorCode(%q) = true, want false（单条目组）", code)
+		}
+	}
+	// 未分类与未来新增的取值一律按未分类处理（spec §2.2）：语义未知，
+	// 不得推断成整批共通而把一整轮条目连带停掉
+	for _, code := range []string{"", "future_code_we_do_not_know", "RATE_LIMITED"} {
+		if IsAuthBlockErrorCode(code) {
+			t.Errorf("IsAuthBlockErrorCode(%q) = true, want false（未分类取值不得推断）", code)
+		}
 	}
 }

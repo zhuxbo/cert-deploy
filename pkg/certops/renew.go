@@ -107,6 +107,10 @@ func (s *Service) CheckAndRenewAll(ctx context.Context) ([]*RenewResult, error) 
 		s.log.Error("配置中存在重名证书条目 %v，元数据可能写到错误条目上，请人工清理", dups)
 	}
 
+	// 轮内 token 黑名单每轮清空：§2.2 的语义是「本轮停止」，不重置等于升级成永久停止，
+	// token 换发后再也不会被重试
+	s.authGate.reset()
+
 	var results []*RenewResult
 	var needsDelay bool // 上一轮是否发起了 API 请求，需要延迟
 
@@ -148,12 +152,27 @@ func (s *Service) CheckAndRenewAll(ctx context.Context) ([]*RenewResult, error) 
 		}
 	}
 
+	s.reportAuthBlocks()
+
 	// 更新检查时间（使用原子更新避免覆盖其他并发修改）
 	_ = s.cfgManager.UpdateMetadata(func(m *config.ConfigMetadata) {
 		m.LastCheckAt = time.Now()
 	})
 
 	return results, nil
+}
+
+// reportAuthBlocks 汇总本轮 token 级阻断。
+// 逐张只记 Debug，这里统一出一条 Error——否则 100 张证书会刷 100 行同因告警，
+// 而"本轮几乎什么都没做"的真正原因反而被埋掉。
+func (s *Service) reportAuthBlocks() {
+	tokens, codes, skipped := s.authGate.summary()
+	if tokens == 0 {
+		return
+	}
+	s.log.Error("本轮有 %d 个 API Token 被服务端拒绝（%s），已跳过使用它们的 %d 张证书（下轮调度照常重试）；"+
+		"凭据类需人工换发 token 或放行 IP，限流类等窗口过去即自愈",
+		tokens, strings.Join(codes, ", "), skipped)
 }
 
 // willMakeAPICall 判断证书本轮是否会发起 API 请求（用于分散延迟预估）。
@@ -312,6 +331,16 @@ func (s *Service) processCertRenewal(ctx context.Context, cfg *config.Config, ce
 	}
 	if s.stalledTooLong(&cert) {
 		s.markStalled(&cert)
+		return nil, madeAPICall
+	}
+
+	// 轮内 token 黑名单（deploy-spec §2.2「整批共通」组）：本轮已确认该 (url, token) 被
+	// 服务端拒绝，后续调用必然同样失败。位置在本地闸门之后、首个 API 请求之前——过期与
+	// 停更这类零请求的状态转移照常判定，只省掉注定失败的网络往返。
+	// madeAPICall 保持 false：本轮没发请求，不该计入无进展结算，也不占证书间延迟。
+	if blk, blocked := s.authGate.blockedBy(api); blocked {
+		s.authGate.markSkipped()
+		s.log.Debug("证书 %s 跳过本轮：该 Token 已被服务端拒绝（%s）", cert.CertName, blk.desc())
 		return nil, madeAPICall
 	}
 
@@ -704,7 +733,7 @@ func (s *Service) resetIssueStateForResubmit(cert *config.CertConfig, cause erro
 // refreshExpiryFromAPI 到期时间未知时查询 API 回填证书元数据，返回是否回填成功
 // 查询失败或服务端无证书内容时记录告警并返回 false（下轮续签检查会再次尝试）
 func (s *Service) refreshExpiryFromAPI(ctx context.Context, cert *config.CertConfig, api config.APIConfig) bool {
-	certData, renewBeforeDays, err := s.fetcher.QueryOrder(ctx, api.URL, api.Token, cert.OrderID)
+	certData, renewBeforeDays, err := s.queryOrder(ctx, api, cert.OrderID)
 	if err != nil {
 		// 服务端明确拒绝（订单不存在、token 失效、IP 不在白名单等）与传输失败区别对待：
 		// 前者每轮重试都注定同样失败，需要人工核对配置，按 Error 记而非 Warn。
@@ -832,8 +861,18 @@ func (s *Service) retryFailedBindings(ctx context.Context, cert *config.CertConf
 		s.log.Warn("持久化证书 %s 重试计数失败: %v", cert.CertName, err)
 	}
 
-	certData, renewBeforeDays, err := s.fetcher.QueryOrder(ctx, api.URL, api.Token, cert.OrderID)
+	certData, renewBeforeDays, err := s.queryOrder(ctx, api, cert.OrderID)
 	if err != nil {
+		// 整批共通失败（限流 / token 或账号被禁 / IP 未放行）由中间件拦下、与订单无关，
+		// 与「证书仍在签发中」同理不占重试配额：回滚本轮递增、不停车。否则 token 持续
+		// 失效满 10 轮会清空 FailedBindings，token 换发后这些绑定反而不再重试。
+		if fetcher.IsAuthBlockErrorCode(errors.ErrorCodeOf(err)) {
+			s.rollbackRetryCount(cert)
+			s.log.Error("重试失败绑定: 该 Token 被服务端拒绝，本轮跳过（不占重试配额）: %v", err)
+			result.Status = "failure"
+			result.Error = err
+			return result
+		}
 		if errors.IsBusinessError(err) {
 			s.log.Error("重试失败绑定: 服务端拒绝查询证书 %s（需人工核对配置，重试无用）: %v", cert.CertName, err)
 		} else {
@@ -1133,7 +1172,7 @@ func (s *Service) logOrderStatusSkip(cert *config.CertConfig, status string, cha
 
 // preparePullRenew 自动签发：等待服务端续签完成后拉取证书
 func (s *Service) preparePullRenew(ctx context.Context, cert *config.CertConfig, api config.APIConfig) (*fetcher.CertData, string, error) {
-	certData, renewBeforeDays, err := s.fetcher.QueryOrder(ctx, api.URL, api.Token, cert.OrderID)
+	certData, renewBeforeDays, err := s.queryOrder(ctx, api, cert.OrderID)
 	if err != nil {
 		return nil, "", err
 	}
@@ -1187,7 +1226,7 @@ func (s *Service) prepareLocalRenew(ctx context.Context, cert *config.CertConfig
 			s.log.Error("证书 %s 已过期且签发未完成部署（状态 %s），等待人工处理", cert.CertName, entryState)
 			return nil, "", fmt.Errorf("证书已过期，等待人工处理")
 		}
-		certData, renewBeforeDays, err := s.fetcher.QueryOrder(ctx, api.URL, api.Token, cert.OrderID)
+		certData, renewBeforeDays, err := s.queryOrder(ctx, api, cert.OrderID)
 		if err != nil {
 			return nil, "", fmt.Errorf("查询订单失败: %w", err)
 		}
@@ -1306,6 +1345,20 @@ func (s *Service) prepareLocalRenew(ctx context.Context, cert *config.CertConfig
 
 	certData, renewBeforeDaysFromUpdate, err := s.fetcher.Update(ctx, api.URL, api.Token, cert.OrderID, csrPEM, strings.Join(cert.Domains, ","), cert.ValidationMethod)
 	if err != nil {
+		// 整批共通失败（限流 / token 或账号被禁 / IP 未放行）由认证与限流中间件拦下，
+		// 服务端根本没收到这次提交：回滚签发计数、清理在途私钥，等同于本次提交没发生。
+		// 不回滚的话 token 持续失效满 10 轮就把签发额度烧光，人工换发 token 后证书已是
+		// CAPPED、还要再人工解除一次——与环境闸门「阻断不占配额、修好即自动恢复」同一纪律。
+		if s.authGate.record(api, err) {
+			cert.Metadata.IssueRetryCount--
+			if updateErr := s.cfgManager.UpdateCert(cert); updateErr != nil {
+				s.log.Warn("回滚证书 %s 签发计数失败: %v", cert.CertName, updateErr)
+			}
+			if cleanupErr := cleanupPendingKey(workDir, cert.CertName); cleanupErr != nil {
+				s.log.Warn("清理待确认私钥失败: %v", cleanupErr)
+			}
+			return nil, "", fmt.Errorf("提交 CSR 被服务端拒绝（本轮不再使用该 Token）: %w", err)
+		}
 		// order_in_progress 是 spec §2.2 中唯一的过渡态：服务端明确告知订单已在途
 		// （unpaid/pending，签发进行中），完成后自行消失。必须走"已在处理"归一路径
 		// 而非业务拒绝——后者每轮都会重新提交 CSR 并递增签发计数，10 轮后把一张

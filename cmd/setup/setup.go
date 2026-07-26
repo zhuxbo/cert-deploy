@@ -50,7 +50,7 @@ type setupParams struct {
 	nonCriticalSkipped int
 	// nonCriticalTripReason 因服务端明确拒绝而熔断时的 error_code，仅用于汇总文案
 	nonCriticalTripReason string
-	// nonCriticalRetryAfter 限流窗口剩余秒数，仅用于汇总文案（不据它定时重试）
+	// nonCriticalRetryAfter 睡满即可重试的保守秒数，仅用于汇总文案（不据它定时重试）
 	nonCriticalRetryAfter int
 }
 
@@ -77,42 +77,27 @@ func (p *setupParams) nonCriticalTripped() bool {
 //
 // 成功即清零而非累计：间歇性故障不该攒够次数后熔断，只有持续不可达才熔断。
 //
-// 服务端明确拒绝（带 error_code：token 失效 / 账号或 IP 被禁 / 限流）直接熔断，
-// 不等攒满次数——这类失败对本批每一张证书都会以同样方式失败，逐张重试纯属浪费。
-// 唯一例外是 order_not_found / cert_not_found：它们只说明**这一张**证书的订单有问题，
-// 同批其他证书仍可能上报成功，按普通失败计数。
+// 整批共通的 error_code（限流 / token 失效 / 账号或 IP 被禁）直接熔断，不等攒满次数——
+// 这类失败由认证与限流中间件下发，对本批每一张证书都会以同样方式失败，逐张重试纯属浪费。
+// 单条目 error_code（order_not_found 等）与未分类失败一律按普通失败计数：前者只说明这一张
+// 证书的订单有问题，后者结果不确定，同批其他证书仍可能上报成功，攒满上限才熔断。
 func (p *setupParams) recordNonCritical(err error) {
 	if err == nil {
 		p.nonCriticalFails = 0
 		return
 	}
-	if code := sslerrors.ErrorCodeOf(err); code != "" && !perCertErrorCode(code) {
+	if code := sslerrors.ErrorCodeOf(err); fetcher.IsAuthBlockErrorCode(code) {
 		p.nonCriticalFails = nonCriticalFailureCap
 		p.nonCriticalTripReason = code
-		// retry_after 只入日志文案供运维判断「大约多久后不再限流」。
-		// 刻意不据它定时重试：它是当前滑动窗口的剩余秒数，睡满后恰好落在新窗口起点，
-		// 而刚超限的上一窗口此时权重为 1、全额计入，估算值必然仍超限——
-		// 按它重试注定再被拒，且那次重试还会把计数器垫高、把恢复时间继续往后推。
+		// retry_after 只入日志文案供运维判断「大约多久后不再限流」，刻意不据它 sleep 重试。
+		// 服务端下发的是「睡满即可重试的保守秒数」（已跨过下一个整窗口，spec §2.2），据它
+		// sleep 属合法用法；但这里走的是 spec 推荐的另一种：本轮停止、下个调度周期自然重来。
+		// 批量部署里睡几十秒只为补一条状态上报，代价远大于收益；且 sleep 期间同一 token 上
+		// 的其他调用会继续累积计数，让这个值不再成立。
 		p.nonCriticalRetryAfter = sslerrors.RetryAfterOf(err)
 		return
 	}
 	p.nonCriticalFails++
-}
-
-// perCertErrorCode 判断 error_code 是否只影响单张证书（deploy-spec §2.2「单条目」组）。
-// 整批共通的凭据/限流问题返回 false，由调用方立即熔断。
-func perCertErrorCode(code string) bool {
-	switch code {
-	case fetcher.ErrorCodeInvalidOrder,
-		fetcher.ErrorCodeOrderNotFound,
-		fetcher.ErrorCodeCertNotFound,
-		fetcher.ErrorCodeOrderInProgress,
-		fetcher.ErrorCodeValidationMethodUnsupported,
-		fetcher.ErrorCodeAutoRenewDisabled,
-		fetcher.ErrorCodeInsufficientBalance:
-		return true
-	}
-	return false
 }
 
 // reportNonCriticalSkips 汇总熔断跳过情况（部署结果不受影响，但服务端状态会滞后）
@@ -124,7 +109,7 @@ func (p *setupParams) reportNonCriticalSkips() {
 	if p.nonCriticalTripReason != "" {
 		cause = fmt.Sprintf("服务端明确拒绝（%s）", p.nonCriticalTripReason)
 		if p.nonCriticalRetryAfter > 0 {
-			cause += fmt.Sprintf("，当前限流窗口约 %d 秒后结束", p.nonCriticalRetryAfter)
+			cause += fmt.Sprintf("，约 %d 秒后可重试", p.nonCriticalRetryAfter)
 		}
 	}
 	msg := fmt.Sprintf("非关键上报因%s已熔断，跳过 %d 次上报；部署结果不受影响，但服务端状态可能滞后",

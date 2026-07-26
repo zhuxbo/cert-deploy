@@ -95,7 +95,7 @@ type APIResponse struct {
 type APIErrors struct {
 	// ErrorCode 机器可读的失败标识，取值见 deploy-spec §2.2；缺失表示未分类
 	ErrorCode string `json:"error_code"`
-	// RetryAfter 限流时的窗口剩余秒数（仅 error_code=rate_limited 时有值）
+	// RetryAfter 睡满即可重试的保守秒数（仅 error_code=rate_limited 时有值，取值 61..120）
 	RetryAfter int `json:"retry_after"`
 }
 
@@ -120,6 +120,34 @@ const (
 	ErrorCodeAutoRenewDisabled           = "auto_renew_disabled"  // 订单未开启自动续费
 	ErrorCodeInsufficientBalance         = "insufficient_balance" // 余额不足以支付续费
 )
+
+// IsAuthBlockErrorCode 判断 error_code 是否属于「整批共通」组（deploy-spec §2.2）。
+//
+// 这类失败由认证与限流中间件下发，与具体订单无关：同一 (url, token) 的后续调用必然以
+// 同样方式失败。调用方应把该 token 本轮拉黑，而不是逐个条目重试——重试零收益，还会在
+// local 模式下每个条目各烧一次签发额度；限流场景更糟，spec §2.2 明确要求「等待期间不再
+// 发请求」，继续打会重新累积计数、把恢复时间往后推。
+//
+// 正面列举而非「非单条目即整批」：将来新增的取值语义未知，误判成整批共通会把一整轮
+// 无辜条目连带停掉。未列出的取值按未分类处理，沿用调用方既有的失败计数与重试策略。
+//
+// 单条目组（invalid_order / order_not_found / cert_not_found /
+// validation_method_unsupported / auto_renew_disabled / insufficient_balance）刻意不提供
+// 对称的判定函数：它们的「客户端应对」都是停止本轮该条目、等人工处理，而这正是「带
+// error_code 即业务错误」已经给出的行为，逐值分档只会引入无谓的分类漂移。唯一例外是
+// order_in_progress——它是过渡态而非永久失败，由 certops 单独识别并归一为等待。
+func IsAuthBlockErrorCode(code string) bool {
+	switch code {
+	case ErrorCodeRateLimited,
+		ErrorCodeTokenMissing,
+		ErrorCodeTokenInvalid,
+		ErrorCodeTokenDisabled,
+		ErrorCodeAccountDisabled,
+		ErrorCodeIPNotAllowed:
+		return true
+	}
+	return false
+}
 
 // apiError 依据 error_code 构造错误：带 error_code 一律是服务端明确拒绝
 // （确定性失败，调用方应停止本轮而非重试），无 error_code 沿用网络错误语义。

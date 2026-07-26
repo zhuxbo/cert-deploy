@@ -306,3 +306,30 @@ func TestSendSetupDeployCallback_SurvivesCanceledContext(t *testing.T) {
 		t.Fatalf("回调次数 = %d, 期望 1（ctx 取消不得吞掉部署结果）", len(got))
 	}
 }
+
+// TestNonCriticalCircuitBreaker_UnclassifiedRejectionCountsNormally
+// 服务端下发了 error_code 但取值不在 spec §2.2 两张表内（将来新增、或大小写等变体）：
+// 语义未知，必须按普通失败计数攒满上限才熔断，不得推断成整批共通而立即熔断。
+//
+// 判定方向刻意与「非单条目即整批」相反——后者会把每一个未知取值都当成凭据/限流问题，
+// 让服务端新增一个无害的码就能把整批上报一次性停掉。
+func TestNonCriticalCircuitBreaker_UnclassifiedRejectionCountsNormally(t *testing.T) {
+	for _, code := range []string{"future_code_we_do_not_know", "RATE_LIMITED"} {
+		t.Run(code, func(t *testing.T) {
+			server, calls := errorCodeAPI(t, code)
+			p := newCallbackTestParams(t, server.URL)
+			f := fetcher.New()
+
+			for i := 1; i <= 5; i++ {
+				sendBatchDeployCallback(p, f, i, 1, 0)
+			}
+
+			if got := calls.Load(); got != int32(nonCriticalFailureCap) {
+				t.Errorf("请求次数 = %d, 期望 %d（未分类取值按普通失败计数）", got, nonCriticalFailureCap)
+			}
+			if p.nonCriticalTripReason != "" {
+				t.Errorf("熔断原因 = %q, 期望空（未分类不得当作整批共通拒绝）", p.nonCriticalTripReason)
+			}
+		})
+	}
+}

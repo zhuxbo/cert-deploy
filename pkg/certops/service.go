@@ -19,6 +19,9 @@ type Service struct {
 	fetcher    *fetcher.Fetcher
 	backupMgr  *backup.Manager
 	log        *logger.Logger
+	// authGate 轮内 token 黑名单，仅由 CheckAndRenewAll 一轮的范围使用（每轮开头 reset）。
+	// 含互斥锁，故 Service 只能按指针传递。
+	authGate authGate
 }
 
 // NewService 创建证书服务
@@ -52,6 +55,16 @@ func callbackContext(ctx context.Context) (context.Context, context.CancelFunc) 
 		// 无 deadline（CLI 场景）：由 fetcher 的单次请求超时与重试上限兜底
 		return context.WithCancel(base)
 	}
+}
+
+// queryOrder 查询订单，顺带把「整批共通」失败记入轮内 token 黑名单（deploy-spec §2.2）。
+//
+// 续签路径的每一次订单查询都经由此处，记录点因此不会漏。手动部署也走这里：record 对它
+// 无副作用——单证书场景没有「本轮其余条目」可省，且黑名单只在续签主循环被查询。
+func (s *Service) queryOrder(ctx context.Context, api config.APIConfig, orderID int) (*fetcher.CertData, int, error) {
+	certData, renewBeforeDays, err := s.fetcher.QueryOrder(ctx, api.URL, api.Token, orderID)
+	_ = s.authGate.record(api, err)
+	return certData, renewBeforeDays, err
 }
 
 // sendCallback 统一发送回调

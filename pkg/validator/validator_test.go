@@ -288,10 +288,10 @@ func TestValidateCert_WildcardDomain(t *testing.T) {
 		domain  string
 		wantErr bool
 	}{
-		{"example.com", false},       // 精确匹配 SAN
-		{"www.example.com", false},   // 通配符匹配
-		{"sub.example.com", false},   // 通配符匹配
-		{"other.com", true},          // 不匹配
+		{"example.com", false},        // 精确匹配 SAN
+		{"www.example.com", false},    // 通配符匹配
+		{"sub.example.com", false},    // 通配符匹配
+		{"other.com", true},           // 不匹配
 		{"sub.sub.example.com", true}, // 通配符不匹配多级子域名
 	}
 

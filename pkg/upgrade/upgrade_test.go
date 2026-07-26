@@ -372,7 +372,7 @@ func TestDownloadVerifyInstall_NoChecksum(t *testing.T) {
 			Versions: []VersionInfo{
 				{
 					Version:    "2.0.0",
-					Checksums:  map[string]string{},                       // 没有校验和
+					Checksums:  map[string]string{}, // 没有校验和
 					Signatures: map[string]string{filename: sigStr},
 				},
 			},

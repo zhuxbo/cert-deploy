@@ -584,4 +584,3 @@ func TestJoinUnderDir_RealPath(t *testing.T) {
 		t.Errorf("result = %s, want %s", result, expected)
 	}
 }
-

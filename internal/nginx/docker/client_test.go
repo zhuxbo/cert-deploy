@@ -127,8 +127,8 @@ func TestFindMountForPath(t *testing.T) {
 		{Type: "bind", Source: "/host/nginx", Destination: "/etc/nginx", RW: true},
 		{Type: "bind", Source: "/host/ssl", Destination: "/etc/nginx/ssl", RW: true},
 		{Type: "bind", Source: "/host/www", Destination: "/var/www", RW: true},
-		{Type: "volume", Source: "data-vol", Destination: "/data", RW: true},       // volume 类型，应忽略
-		{Type: "bind", Source: "/host/ro", Destination: "/readonly", RW: false},     // 只读，应忽略
+		{Type: "volume", Source: "data-vol", Destination: "/data", RW: true},    // volume 类型，应忽略
+		{Type: "bind", Source: "/host/ro", Destination: "/readonly", RW: false}, // 只读，应忽略
 	}
 
 	tests := []struct {

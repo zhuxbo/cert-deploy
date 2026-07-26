@@ -120,7 +120,7 @@ func TestGenerateKeyAndCSR_ECDSA(t *testing.T) {
 		{"P256 prime256v1", "prime256v1", true},
 		{"P384 secp384r1", "secp384r1", true},
 		{"P521 secp521r1", "secp521r1", true},
-		{"默认曲线", "", true},       // 默认 P256
+		{"默认曲线", "", true}, // 默认 P256
 		{"未知曲线回退 P256", "unknown", true},
 	}
 

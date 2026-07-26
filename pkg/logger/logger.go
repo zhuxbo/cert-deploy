@@ -133,7 +133,7 @@ func New(logDir, name string) (*Logger, error) {
 	}
 
 	l := &Logger{
-		logDir:   logDir,
+		logDir: logDir,
 		name:   name,
 	}
 	l.minLevel.Store(int32(getLevelFromEnv()))

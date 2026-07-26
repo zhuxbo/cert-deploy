@@ -19,7 +19,7 @@ const (
 
 // VersionInfo 版本详细信息
 type VersionInfo struct {
-	Version    string            `json:"version"`              // 版本号（如 "1.2.0"，不带 v 前缀）
+	Version    string            `json:"version"`               // 版本号（如 "1.2.0"，不带 v 前缀）
 	ReleasedAt string            `json:"released_at,omitempty"` // 发布日期（YYYY-MM-DD）
 	Checksums  map[string]string `json:"checksums"`             // 按文件名索引的 SHA256 哈希
 	Signatures map[string]string `json:"signatures,omitempty"`  // 按文件名索引的 Ed25519 签名

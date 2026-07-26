@@ -9,7 +9,7 @@ import (
 
 // ScanOptions 扫描选项
 type ScanOptions struct {
-	SSLOnly   bool   // 仅扫描 SSL 站点
+	SSLOnly    bool   // 仅扫描 SSL 站点
 	ServerType string // 指定服务器类型：nginx, apache, auto
 }
 
@@ -51,4 +51,3 @@ type RenewResult struct {
 	Error       error
 	DeployCount int
 }
-

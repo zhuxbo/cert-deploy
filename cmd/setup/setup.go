@@ -42,6 +42,48 @@ type setupParams struct {
 	ctx            context.Context
 	cfgManager     *config.ConfigManager
 	log            *logger.Logger
+
+	// nonCriticalFails 非关键上报（部署结果回调 / toggleAutoReissue）的连续失败次数
+	nonCriticalFails int
+	// nonCriticalSkipped 熔断后跳过的非关键上报次数，结束时汇总
+	nonCriticalSkipped int
+}
+
+// nonCriticalFailureCap 非关键上报连续失败上限：达到即熔断，跳过本次 setup 剩余同类调用。
+//
+// 每个调用各有超时预算并不等于整体有边界：批量部署逐证书各调一次部署结果回调与
+// toggleAutoReissue，API 不可达时最坏耗时随证书数线性放大到数小时。而第一张证书失败时
+// 答案就已经确定，让后续每张证书各自重复一遍完整超时预算没有任何收益。
+const nonCriticalFailureCap = 3
+
+// nonCriticalTripped 判断是否已熔断；已熔断时顺带累计跳过次数
+func (p *setupParams) nonCriticalTripped() bool {
+	if p.nonCriticalFails < nonCriticalFailureCap {
+		return false
+	}
+	p.nonCriticalSkipped++
+	return true
+}
+
+// recordNonCritical 记录一次非关键上报结果。
+// 成功即清零而非累计：间歇性故障不该攒够次数后熔断，只有持续不可达才熔断。
+func (p *setupParams) recordNonCritical(err error) {
+	if err != nil {
+		p.nonCriticalFails++
+		return
+	}
+	p.nonCriticalFails = 0
+}
+
+// reportNonCriticalSkips 汇总熔断跳过情况（部署结果不受影响，但服务端状态会滞后）
+func (p *setupParams) reportNonCriticalSkips() {
+	if p.nonCriticalSkipped == 0 {
+		return
+	}
+	msg := fmt.Sprintf("非关键上报连续失败 %d 次后已熔断，跳过 %d 次上报；部署结果不受影响，但服务端状态可能滞后",
+		nonCriticalFailureCap, p.nonCriticalSkipped)
+	fmt.Fprintf(os.Stderr, "\n[!] %s\n", msg)
+	p.log.Warn("%s", msg)
 }
 
 // Run 运行 setup 命令
@@ -1077,6 +1119,10 @@ func extractDomainsFromCert(cert *x509.Certificate) []string {
 // 放到保存阶段会同时被两道关卡吃掉——全失败时 os.Exit(1) 直接结束，
 // 保存门禁又会跳过没有成功绑定的证书，而这两类恰恰是最该上报的。
 func sendSetupDeployCallback(p *setupParams, f *fetcher.Fetcher, orderID, successCount, failCount int) {
+	if p.nonCriticalTripped() {
+		return
+	}
+
 	req := &fetcher.CallbackRequest{
 		OrderID:    orderID,
 		Status:     "success",
@@ -1092,6 +1138,7 @@ func sendSetupDeployCallback(p *setupParams, f *fetcher.Fetcher, orderID, succes
 	defer cancel()
 
 	renewBeforeDays, err := f.CallbackNew(ctx, p.apiURL, p.token, req)
+	p.recordNonCritical(err)
 	if err != nil {
 		p.log.Warn("上报 setup 部署结果失败（不影响部署结果）: %v", err)
 		return
@@ -1100,8 +1147,20 @@ func sendSetupDeployCallback(p *setupParams, f *fetcher.Fetcher, orderID, succes
 }
 
 func notifyAutoReissue(p *setupParams, f *fetcher.Fetcher, orderID int, renewMode string) {
+	if p.nonCriticalTripped() {
+		return
+	}
+
 	autoReissue := renewMode != config.RenewModeLocal
-	renewBeforeDays, err := f.ToggleAutoReissue(p.ctx, p.apiURL, p.token, orderID, autoReissue)
+
+	// CLI ctx 无 deadline，显式限定预算，与其余非关键上报一致；此前裸用 p.ctx，
+	// 上界只剩传输层的 4 次尝试 × 60s POST 超时，是同类调用的 2.7 倍。
+	// 不同于部署结果回调：本调用不是结果的唯一出口，无需 WithoutCancel 脱离取消传播。
+	ctx, cancel := context.WithTimeout(p.ctx, certops.CallbackFallbackBudget)
+	defer cancel()
+
+	renewBeforeDays, err := f.ToggleAutoReissue(ctx, p.apiURL, p.token, orderID, autoReissue)
+	p.recordNonCritical(err)
 	if err != nil {
 		p.log.Warn("toggleAutoReissue 失败 (order_id=%d, auto_reissue=%v): %v", orderID, autoReissue, err)
 		return

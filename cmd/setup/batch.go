@@ -75,6 +75,10 @@ func runBatch(p *setupParams, query string) {
 		os.Exit(1)
 	}
 	fmt.Printf("  查询到 %d 个证书\n", len(certList))
+	// 单次请求不翻页：取满上限时如实提示，避免"只部署了一部分"被当成全量成功
+	if len(certList) >= fetcher.MaxBatchQueryItems {
+		fmt.Printf("  提示: 已达单次查询上限 %d 条，如有更多证书请用 --order 分批指定\n", fetcher.MaxBatchQueryItems)
+	}
 
 	// 过滤并验证证书
 	certValidator := validator.New("")
@@ -337,6 +341,8 @@ func runBatch(p *setupParams, query string) {
 
 	fmt.Print(deploymentStatusHint())
 
+	p.reportNonCriticalSkips()
+
 	// 检查 Docker 非卷挂载站点
 	if totalSiteSuccess > 0 {
 		for _, site := range sites {
@@ -511,6 +517,10 @@ func installSSLForBatch(site *matcher.ScannedSiteInfo, plan *certDeployPlan, p *
 // sendBatchDeployCallback 上报单张证书的 setup 部署结果（deploy-spec §5.1 步骤 6）。
 // 非关键路径，失败仅记日志。
 func sendBatchDeployCallback(p *setupParams, f *fetcher.Fetcher, orderID, successCount, failCount int) {
+	if p.nonCriticalTripped() {
+		return
+	}
+
 	req := &fetcher.CallbackRequest{
 		OrderID:    orderID,
 		Status:     "success",
@@ -526,6 +536,7 @@ func sendBatchDeployCallback(p *setupParams, f *fetcher.Fetcher, orderID, succes
 	defer cancel()
 
 	renewBeforeDays, err := f.CallbackNew(ctx, p.apiURL, p.token, req)
+	p.recordNonCritical(err)
 	if err != nil {
 		p.log.Warn("上报证书 order_id=%d 的部署结果失败（不影响部署结果）: %v", orderID, err)
 		return

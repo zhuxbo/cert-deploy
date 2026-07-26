@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/zhuxbo/sslctl/pkg/config"
@@ -127,6 +128,90 @@ func TestSendBatchDeployCallback(t *testing.T) {
 	}
 	if got[1].OrderID != 2 || got[1].Status != "failure" {
 		t.Errorf("第二条 = order=%d status=%q, 期望 order=2 status=failure", got[1].OrderID, got[1].Status)
+	}
+}
+
+// failingAPI 返回一个始终业务失败（code=0）的服务端与其请求计数。
+// code=0 走 HTTP 200，传输层不重试，因此一次调用恰对应一次请求。
+func failingAPI(t *testing.T) (*httptest.Server, *atomic.Int32) {
+	t.Helper()
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":0,"msg":"boom"}`))
+	}))
+	t.Cleanup(server.Close)
+	return server, &calls
+}
+
+// TestNonCriticalCircuitBreaker 非关键上报连续失败触顶后熔断，剩余调用不再发请求。
+// 无熔断时批量部署逐证书各等一份完整超时预算，最坏耗时随证书数线性放大到数小时。
+func TestNonCriticalCircuitBreaker(t *testing.T) {
+	server, calls := failingAPI(t)
+
+	p := newCallbackTestParams(t, server.URL)
+	f := fetcher.New()
+	const attempts = 10
+	for i := 1; i <= attempts; i++ {
+		sendBatchDeployCallback(p, f, i, 1, 0)
+	}
+
+	if got := calls.Load(); got != int32(nonCriticalFailureCap) {
+		t.Errorf("请求次数 = %d, 期望 %d（熔断后不再发请求）", got, nonCriticalFailureCap)
+	}
+	if want := attempts - nonCriticalFailureCap; p.nonCriticalSkipped != want {
+		t.Errorf("跳过次数 = %d, 期望 %d", p.nonCriticalSkipped, want)
+	}
+}
+
+// TestNonCriticalCircuitBreaker_SuccessResets 成功即清零：间歇性故障不该攒够次数后熔断
+func TestNonCriticalCircuitBreaker_SuccessResets(t *testing.T) {
+	var calls atomic.Int32
+	// 失败-失败-成功-失败-失败：连续失败数始终 < cap，全程不熔断
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		n := calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		if n == 3 {
+			_, _ = w.Write([]byte(`{"code":1,"msg":"ok"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"code":0,"msg":"boom"}`))
+	}))
+	defer server.Close()
+
+	p := newCallbackTestParams(t, server.URL)
+	f := fetcher.New()
+	for i := 1; i <= 5; i++ {
+		sendBatchDeployCallback(p, f, i, 1, 0)
+	}
+
+	if got := calls.Load(); got != 5 {
+		t.Errorf("请求次数 = %d, 期望 5（成功清零后不应熔断）", got)
+	}
+	if p.nonCriticalSkipped != 0 {
+		t.Errorf("跳过次数 = %d, 期望 0", p.nonCriticalSkipped)
+	}
+}
+
+// TestNonCriticalCircuitBreaker_SharedAcrossCallTypes 部署结果回调与 toggleAutoReissue
+// 共享同一熔断计数：API 整体不可达时两类调用都失败，分别计数会让熔断迟一倍才生效。
+func TestNonCriticalCircuitBreaker_SharedAcrossCallTypes(t *testing.T) {
+	server, calls := failingAPI(t)
+
+	p := newCallbackTestParams(t, server.URL)
+	f := fetcher.New()
+	sendBatchDeployCallback(p, f, 1, 1, 0)           // 失败 1
+	notifyAutoReissue(p, f, 1, config.RenewModePull) // 失败 2
+	sendBatchDeployCallback(p, f, 2, 1, 0)           // 失败 3，触顶
+	notifyAutoReissue(p, f, 2, config.RenewModePull) // 应跳过
+	sendBatchDeployCallback(p, f, 3, 1, 0)           // 应跳过
+
+	if got := calls.Load(); got != int32(nonCriticalFailureCap) {
+		t.Errorf("请求次数 = %d, 期望 %d（两类调用共享熔断计数）", got, nonCriticalFailureCap)
+	}
+	if p.nonCriticalSkipped != 2 {
+		t.Errorf("跳过次数 = %d, 期望 2", p.nonCriticalSkipped)
 	}
 }
 

@@ -756,17 +756,26 @@ func (f *Fetcher) ToggleAutoReissue(ctx context.Context, baseURL, token string, 
 	return data.RenewBeforeDays, nil
 }
 
-// QueryBatch 批量查询证书
+// MaxBatchQueryItems 单次批量查询的条数上限（deploy-spec §2.3）。
+// 同时用于逗号分隔项数校验与 page_size：服务端对空 order 固定返回最新 100 条、
+// 对逗号批量硬限 100 条，两侧一致。
+const MaxBatchQueryItems = 100
+
+// QueryBatch 批量查询证书（单次请求，不翻页）
 // query 非空时: GET {baseURL}/api/deploy?order={query}
-// query 为空时: GET {baseURL}/api/deploy（返回最新 100 条 active 证书）
-// 自动处理分页，返回全部结果
-// 返回: (certs, renewBeforeDays, error)，renewBeforeDays 取最后一页的值
+// query 为空时: GET {baseURL}/api/deploy（返回最新 MaxBatchQueryItems 条 active 证书）
+// 返回: (certs, renewBeforeDays, error)
+//
+// 不做分页：服务端对空 order 固定返回最新 100 条、对逗号批量硬限 100 条，一次即取完。
+// 此前按 total 翻页的循环没有页数与条数上限——终止只依赖服务端自报的 total 与非空页，
+// 两者同时失真（total 虚高且每页恒非空）即无限翻页，且 allCerts 内存同步无限增长，
+// 而唯一调用方 setup 传的是无 deadline 的 ctx，没有任何一侧能兜住。
 func (f *Fetcher) QueryBatch(ctx context.Context, baseURL, token, query string) ([]CertData, int, error) {
 	// 规范 2.3：批量查询上限 100
 	if query != "" {
-		if parts := strings.Split(query, ","); len(parts) > 100 {
+		if parts := strings.Split(query, ","); len(parts) > MaxBatchQueryItems {
 			return nil, 0, errors.NewNetworkError(
-				fmt.Sprintf("批量查询超过上限: %d（最大 100）", len(parts)), nil)
+				fmt.Sprintf("批量查询超过上限: %d（最大 %d）", len(parts), MaxBatchQueryItems), nil)
 		}
 	}
 
@@ -780,45 +789,28 @@ func (f *Fetcher) QueryBatch(ctx context.Context, baseURL, token, query string) 
 		return nil, 0, errors.NewNetworkError("invalid API URL", err)
 	}
 
-	const pageSize = 100
-	var allCerts []CertData
-	var lastRenewBeforeDays int
+	q := u.Query()
+	if query != "" {
+		q.Set("order", query)
+	}
+	q.Set("page_size", fmt.Sprintf("%d", MaxBatchQueryItems))
+	u.RawQuery = q.Encode()
+	fullURL := u.String()
 
-	for page := 1; ; page++ {
-		q := u.Query()
-		if query != "" {
-			q.Set("order", query)
-		}
-		q.Set("page_size", fmt.Sprintf("%d", pageSize))
-		q.Set("page", fmt.Sprintf("%d", page))
-		u.RawQuery = q.Encode()
-		fullURL := u.String()
-
-		newRequest := func() (*http.Request, error) {
-			req, err := http.NewRequestWithContext(ctx, http.MethodGet, fullURL, nil)
-			if err != nil {
-				return nil, err
-			}
-			req.Header.Set("Accept", "application/json")
-			req.Header.Set("Authorization", "Bearer "+token)
-			return req, nil
-		}
-
-		certs, total, renewBeforeDays, err := f.doAPICallBatch(ctx, newRequest, "failed to batch query")
+	newRequest := func() (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, fullURL, nil)
 		if err != nil {
-			return nil, 0, err
+			return nil, err
 		}
-
-		allCerts = append(allCerts, certs...)
-		if renewBeforeDays > 0 {
-			lastRenewBeforeDays = renewBeforeDays
-		}
-
-		// 已获取全部或无更多页
-		if len(allCerts) >= total || len(certs) == 0 {
-			break
-		}
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("Authorization", "Bearer "+token)
+		return req, nil
 	}
 
-	return allCerts, lastRenewBeforeDays, nil
+	certs, _, renewBeforeDays, err := f.doAPICallBatch(ctx, newRequest, "failed to batch query")
+	if err != nil {
+		return nil, 0, err
+	}
+
+	return certs, renewBeforeDays, nil
 }

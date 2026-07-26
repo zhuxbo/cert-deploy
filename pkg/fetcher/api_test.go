@@ -1254,60 +1254,53 @@ func TestQueryBatch(t *testing.T) {
 	}
 }
 
-// TestQueryBatch_Pagination 测试批量查询自动翻页
-func TestQueryBatch_Pagination(t *testing.T) {
+// TestQueryBatch_SingleRequestNoPagination 锁死「单次请求、绝不翻页」这个边界不变式。
+//
+// 服务端谎报 total 极大且返回满页——旧的按 total 翻页实现在这个输入下会无限请求下去
+// （终止只依赖 total 与非空页，两者同时失真即失效），且累积切片同步无限增长。
+// 本用例断言客户端只发一次请求、不带 page 参数，防止分页循环被重新引入。
+func TestQueryBatch_SingleRequestNoPagination(t *testing.T) {
 	callCount := 0
+	var gotPage, gotPageSize string
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		callCount++
-		page := r.URL.Query().Get("page")
+		gotPage = r.URL.Query().Get("page")
+		gotPageSize = r.URL.Query().Get("page_size")
 
-		var data []map[string]interface{}
-		total := 3
-		pageNum := 1
-		if page == "2" {
-			pageNum = 2
-		}
-
-		switch page {
-		case "1":
-			cert1 := mockCertData()
-			cert1["order_id"] = 1
-			cert2 := mockCertData()
-			cert2["order_id"] = 2
-			data = []map[string]interface{}{cert1, cert2}
-		case "2":
-			cert3 := mockCertData()
-			cert3["order_id"] = 3
-			data = []map[string]interface{}{cert3}
-		default:
-			data = []map[string]interface{}{}
-		}
+		cert1 := mockCertData()
+		cert1["order_id"] = 1
+		cert2 := mockCertData()
+		cert2["order_id"] = 2
 
 		resp := mockResponse{
 			Code: 1,
 			Data: map[string]interface{}{
-				"total":     total,
-				"page":      pageNum,
-				"page_size": 2,
-				"data":      data,
+				"total":     999999, // 谎报总数：旧实现据此继续翻页
+				"page":      1,
+				"page_size": MaxBatchQueryItems,
+				"data":      []map[string]interface{}{cert1, cert2},
 			},
 		}
 		_ = json.NewEncoder(w).Encode(resp)
 	}))
 	defer server.Close()
 
-	f := New()
-	ctx := context.Background()
-
-	certs, _, err := f.QueryBatch(ctx, server.URL, "token", "")
+	certs, _, err := New().QueryBatch(context.Background(), server.URL, "token", "")
 	if err != nil {
 		t.Fatalf("QueryBatch() error = %v", err)
 	}
-	if len(certs) != 3 {
-		t.Errorf("got %d certs, want 3", len(certs))
+	if callCount != 1 {
+		t.Errorf("API called %d times, want exactly 1 (must not paginate)", callCount)
 	}
-	if callCount != 2 {
-		t.Errorf("API called %d times, want 2 (pagination)", callCount)
+	if len(certs) != 2 {
+		t.Errorf("got %d certs, want 2 (single response as-is)", len(certs))
+	}
+	if gotPage != "" {
+		t.Errorf("page param = %q, want absent (pagination removed)", gotPage)
+	}
+	if gotPageSize != fmt.Sprintf("%d", MaxBatchQueryItems) {
+		t.Errorf("page_size param = %q, want %d", gotPageSize, MaxBatchQueryItems)
 	}
 }
 

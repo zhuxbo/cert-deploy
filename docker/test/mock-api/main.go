@@ -68,7 +68,8 @@ type APIResponse struct {
 	Data    interface{} `json:"data"`
 }
 
-// PaginatedData 分页数据（与 fetcher.PaginatedResponse 字段名匹配）
+// PaginatedData 查询响应数据（fetcher.QueryResponse 消费 data/renew_before_days，
+// 其余分页字段作为多余字段被忽略，保留以模拟旧服务端形态）
 type PaginatedData struct {
 	Total           int         `json:"total"`
 	CurrentPage     int         `json:"page"`

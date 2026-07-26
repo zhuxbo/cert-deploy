@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -48,6 +49,9 @@ type setupParams struct {
 	// nonCriticalSkipped 熔断后跳过的非关键上报次数，结束时汇总
 	nonCriticalSkipped int
 }
+
+// orderPattern --order 参数形态（deploy-spec §2.3）：仅订单 ID，单个或英文逗号分隔多个
+var orderPattern = regexp.MustCompile(`^\d+(,\d+)*$`)
 
 // nonCriticalFailureCap 非关键上报连续失败上限：达到即熔断，跳过本次 setup 剩余同类调用。
 //
@@ -91,7 +95,7 @@ func Run(args []string, debug bool) {
 	fs := flag.NewFlagSet("setup", flag.ExitOnError)
 	apiURL := fs.String("url", "", "证书 API 基础地址")
 	token := fs.String("token", "", "API 认证 Token")
-	order := fs.String("order", "", "订单 ID 或批量查询（支持 ID/域名/逗号分隔混合，不传则查询全部）")
+	order := fs.String("order", "", "订单 ID（必填），单个或英文逗号分隔多个（最多 100）")
 	localKey := fs.Bool("local-key", false, "使用本机提交")
 	keyFile := fs.String("key", "", "私钥文件路径（隐含 --local-key）")
 	fileValidation := fs.Bool("file-validation", false, "启用文件验证（隐含 --local-key）")
@@ -104,8 +108,7 @@ func Run(args []string, debug bool) {
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, "用法:\n")
 		fmt.Fprintf(os.Stderr, "  sslctl setup --url <base_url> --token <token> --order <order_id>          # 单证书部署\n")
-		fmt.Fprintf(os.Stderr, "  sslctl setup --url <base_url> --token <token> --order \"123,example.com\"    # 批量部署\n")
-		fmt.Fprintf(os.Stderr, "  sslctl setup --url <base_url> --token <token>                             # 部署所有证书\n")
+		fmt.Fprintf(os.Stderr, "  sslctl setup --url <base_url> --token <token> --order \"123,456\"           # 批量部署（订单 ID，逗号分隔）\n")
 		fmt.Fprintf(os.Stderr, "  sslctl setup --key /path/key.pem --webroot /var/www/html --url <url> ...  # 指定私钥+文件验证\n")
 		fmt.Fprintf(os.Stderr, "\n选项:\n")
 		fs.PrintDefaults()
@@ -133,6 +136,18 @@ func Run(args []string, debug bool) {
 
 	if *apiURL == "" || *token == "" {
 		fs.Usage()
+		os.Exit(1)
+	}
+
+	// --order 必填且只接受订单 ID（deploy-spec §2.3）：域名与空参数形态已从协议移除
+	orderStr := strings.TrimSpace(*order)
+	if orderStr == "" {
+		fmt.Fprintln(os.Stderr, "--order 必填（订单 ID，多个用英文逗号分隔）")
+		fs.Usage()
+		os.Exit(1)
+	}
+	if !orderPattern.MatchString(orderStr) {
+		fmt.Fprintf(os.Stderr, "--order 只接受订单 ID（纯数字，英文逗号分隔）: %s\n", orderStr)
 		os.Exit(1)
 	}
 
@@ -202,8 +217,7 @@ func Run(args []string, debug bool) {
 		log:            log,
 	}
 
-	// 路由：纯数字走单订单旧路径，其他走批量
-	orderStr := strings.TrimSpace(*order)
+	// 路由：单个 ID 走单订单路径，逗号分隔多 ID 走批量（形态已在入口校验）
 	if orderID, err := strconv.Atoi(orderStr); err == nil && orderID > 0 {
 		runSingle(params, orderID)
 	} else {

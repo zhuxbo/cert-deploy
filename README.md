@@ -286,8 +286,7 @@ sslctl status
 
 | 方法 | 路径                       | 说明                            |
 | ---- | -------------------------- | ------------------------------- |
-| GET  | `/api/deploy?order_id=xxx` | 按订单 ID 查询（推荐）          |
-| GET  | `/api/deploy?domain=xxx`   | 按域名查询（首次获取 order_id） |
+| GET  | `/api/deploy?order=xxx`    | 查询证书（订单 ID，批量用逗号分隔，上限 100） |
 | POST | `/api/deploy`              | 更新/续费证书（需要 order_id）  |
 | POST | `/api/deploy/callback`     | 部署结果回调                    |
 

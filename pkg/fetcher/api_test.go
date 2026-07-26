@@ -36,7 +36,7 @@ func mockCertData() map[string]interface{} {
 	}
 }
 
-func mockPaginatedData(certData ...map[string]interface{}) map[string]interface{} {
+func mockQueryData(certData ...map[string]interface{}) map[string]interface{} {
 	return map[string]interface{}{
 		"total":     len(certData),
 		"page":      1,
@@ -151,36 +151,6 @@ func TestQueryOrder_HTTPError(t *testing.T) {
 	}
 }
 
-// TestQuery 测试按域名查询
-func TestQuery(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// 验证 order 参数
-		order := r.URL.Query().Get("order")
-		if order != "test.example.com" {
-			t.Errorf("order query param = %s, want test.example.com", order)
-		}
-
-		resp := mockResponse{
-			Code: 1,
-			Data: mockPaginatedData(mockCertData()),
-		}
-		_ = json.NewEncoder(w).Encode(resp)
-	}))
-	defer server.Close()
-
-	f := New()
-	ctx := context.Background()
-
-	data, _, err := f.Query(ctx, server.URL, "token", "test.example.com")
-	if err != nil {
-		t.Fatalf("Query() error = %v", err)
-	}
-
-	if data.OrderID != 12345 {
-		t.Errorf("OrderID = %d, want 12345", data.OrderID)
-	}
-}
-
 // TestQueryOrder 测试按订单 ID 查询
 func TestQueryOrder(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -192,7 +162,7 @@ func TestQueryOrder(t *testing.T) {
 
 		resp := mockResponse{
 			Code: 1,
-			Data: mockPaginatedData(mockCertData()),
+			Data: mockQueryData(mockCertData()),
 		}
 		_ = json.NewEncoder(w).Encode(resp)
 	}))
@@ -607,7 +577,7 @@ func TestQueryOrder_Retry(t *testing.T) {
 		// 第三次成功
 		resp := mockResponse{
 			Code: 1,
-			Data: mockPaginatedData(mockCertData()),
+			Data: mockQueryData(mockCertData()),
 		}
 		_ = json.NewEncoder(w).Encode(resp)
 	}))
@@ -685,7 +655,7 @@ func TestQueryOrder_RetryBoundary(t *testing.T) {
 					w.WriteHeader(http.StatusInternalServerError)
 					return
 				}
-				resp := mockResponse{Code: 1, Data: mockPaginatedData(mockCertData())}
+				resp := mockResponse{Code: 1, Data: mockQueryData(mockCertData())}
 				_ = json.NewEncoder(w).Encode(resp)
 			}))
 			defer server.Close()
@@ -1126,38 +1096,38 @@ func TestUpdate_WithDomains(t *testing.T) {
 	}
 }
 
-// TestAPIResponse_ParsePaginatedData 测试分页响应解析
-func TestAPIResponse_ParsePaginatedData(t *testing.T) {
+// TestAPIResponse_ParseQueryData 测试查询响应解析
+func TestAPIResponse_ParseQueryData(t *testing.T) {
 	tests := []struct {
 		name      string
 		data      string
 		wantCount int
-		wantTotal int
 		wantErr   bool
 	}{
 		{
-			name:      "分页响应",
-			data:      `{"total":2,"page":1,"page_size":100,"data":[{"order_id":1,"status":"active"},{"order_id":2,"status":"active"}]}`,
+			name:      "标准查询响应",
+			data:      `{"renew_before_days":14,"data":[{"order_id":1,"status":"active"},{"order_id":2,"status":"active"}]}`,
 			wantCount: 2,
-			wantTotal: 2,
 		},
 		{
-			name:      "分页响应空数据",
-			data:      `{"total":0,"page":1,"page_size":100,"data":[]}`,
+			name:      "查询响应空数据",
+			data:      `{"renew_before_days":14,"data":[]}`,
 			wantCount: 0,
-			wantTotal: 0,
+		},
+		{
+			name:      "带旧分页字段的响应（多余字段被忽略）",
+			data:      `{"total":2,"page":1,"page_size":100,"data":[{"order_id":1,"status":"active"},{"order_id":2,"status":"active"}]}`,
+			wantCount: 2,
 		},
 		{
 			name:      "兼容单对象",
 			data:      `{"order_id":123,"status":"issued"}`,
 			wantCount: 1,
-			wantTotal: 1,
 		},
 		{
 			name:      "兼容数组",
 			data:      `[{"order_id":1,"status":"active"},{"order_id":2,"status":"active"}]`,
 			wantCount: 2,
-			wantTotal: 2,
 		},
 		{
 			name:    "空数据",
@@ -1178,9 +1148,9 @@ func TestAPIResponse_ParsePaginatedData(t *testing.T) {
 				Data: json.RawMessage(tt.data),
 			}
 
-			certs, total, _, err := resp.ParsePaginatedData()
+			certs, _, err := resp.ParseQueryData()
 			if (err != nil) != tt.wantErr {
-				t.Errorf("ParsePaginatedData() error = %v, wantErr %v", err, tt.wantErr)
+				t.Errorf("ParseQueryData() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
 			if err != nil {
@@ -1189,9 +1159,6 @@ func TestAPIResponse_ParsePaginatedData(t *testing.T) {
 			if len(certs) != tt.wantCount {
 				t.Errorf("certs count = %d, want %d", len(certs), tt.wantCount)
 			}
-			if total != tt.wantTotal {
-				t.Errorf("total = %d, want %d", total, tt.wantTotal)
-			}
 		})
 	}
 }
@@ -1199,66 +1166,64 @@ func TestAPIResponse_ParsePaginatedData(t *testing.T) {
 // TestQueryBatch 测试批量查询
 func TestQueryBatch(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		queryParam := r.URL.Query().Get("order")
-		pageSize := r.URL.Query().Get("page_size")
-
-		if pageSize != "100" {
-			t.Errorf("pageSize = %s, want 100", pageSize)
+		if got := r.URL.Query().Get("order"); got != "123,456" {
+			t.Errorf("order query param = %s, want 123,456", got)
 		}
 
-		var data []map[string]interface{}
-		if queryParam == "" {
-			// 无参数：返回全部
-			data = []map[string]interface{}{mockCertData()}
-		} else if queryParam == "123,example.com" {
-			// 混合查询
-			cert1 := mockCertData()
-			cert1["order_id"] = 123
-			cert2 := mockCertData()
-			cert2["order_id"] = 456
-			data = []map[string]interface{}{cert1, cert2}
-		}
-
+		cert1 := mockCertData()
+		cert1["order_id"] = 123
+		cert2 := mockCertData()
+		cert2["order_id"] = 456
 		resp := mockResponse{
 			Code: 1,
 			Data: map[string]interface{}{
-				"total":     len(data),
-				"page":      1,
-				"page_size": 100,
-				"data":      data,
+				"renew_before_days": 14,
+				"data":              []map[string]interface{}{cert1, cert2},
 			},
 		}
 		_ = json.NewEncoder(w).Encode(resp)
 	}))
 	defer server.Close()
 
-	f := New()
-	ctx := context.Background()
-
-	// 测试无参数查询
-	certs, _, err := f.QueryBatch(ctx, server.URL, "token", "")
+	certs, _, err := queryBatchHelper(t, server.URL, "123,456")
 	if err != nil {
-		t.Fatalf("QueryBatch('') error = %v", err)
-	}
-	if len(certs) != 1 {
-		t.Errorf("QueryBatch('') got %d certs, want 1", len(certs))
-	}
-
-	// 测试混合查询
-	certs, _, err = f.QueryBatch(ctx, server.URL, "token", "123,example.com")
-	if err != nil {
-		t.Fatalf("QueryBatch('123,example.com') error = %v", err)
+		t.Fatalf("QueryBatch('123,456') error = %v", err)
 	}
 	if len(certs) != 2 {
-		t.Errorf("QueryBatch('123,example.com') got %d certs, want 2", len(certs))
+		t.Errorf("QueryBatch('123,456') got %d certs, want 2", len(certs))
+	}
+}
+
+// queryBatchHelper 测试辅助：以默认 Fetcher 执行批量查询
+func queryBatchHelper(t *testing.T, baseURL, query string) ([]CertData, int, error) {
+	t.Helper()
+	return New().QueryBatch(context.Background(), baseURL, "token", query)
+}
+
+// TestQueryBatch_RejectsInvalidQuery 形态非法的 query 本地拒绝，不发请求（deploy-spec §2.3）
+func TestQueryBatch_RejectsInvalidQuery(t *testing.T) {
+	called := false
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		called = true
+	}))
+	defer server.Close()
+
+	for _, query := range []string{"", "example.com", "123,example.com", "12 34", "123,"} {
+		if _, _, err := queryBatchHelper(t, server.URL, query); err == nil {
+			t.Errorf("QueryBatch(%q) error = nil, want invalid-query rejection", query)
+		}
+	}
+	if called {
+		t.Error("server was called, want local rejection before any request")
 	}
 }
 
 // TestQueryBatch_SingleRequestNoPagination 锁死「单次请求、绝不翻页」这个边界不变式。
 //
-// 服务端谎报 total 极大且返回满页——旧的按 total 翻页实现在这个输入下会无限请求下去
-// （终止只依赖 total 与非空页，两者同时失真即失效），且累积切片同步无限增长。
-// 本用例断言客户端只发一次请求、不带 page 参数，防止分页循环被重新引入。
+// 服务端（或异常实现）返回带旧分页字段且 total 谎报极大——旧的按 total 翻页实现
+// 在这个输入下会无限请求下去（终止只依赖 total 与非空页，两者同时失真即失效），
+// 且累积切片同步无限增长。本用例断言客户端只发一次请求、不带任何分页参数，
+// 防止分页循环被重新引入。
 func TestQueryBatch_SingleRequestNoPagination(t *testing.T) {
 	callCount := 0
 	var gotPage, gotPageSize string
@@ -1286,7 +1251,7 @@ func TestQueryBatch_SingleRequestNoPagination(t *testing.T) {
 	}))
 	defer server.Close()
 
-	certs, _, err := New().QueryBatch(context.Background(), server.URL, "token", "")
+	certs, _, err := queryBatchHelper(t, server.URL, "1,2")
 	if err != nil {
 		t.Fatalf("QueryBatch() error = %v", err)
 	}
@@ -1297,10 +1262,10 @@ func TestQueryBatch_SingleRequestNoPagination(t *testing.T) {
 		t.Errorf("got %d certs, want 2 (single response as-is)", len(certs))
 	}
 	if gotPage != "" {
-		t.Errorf("page param = %q, want absent (pagination removed)", gotPage)
+		t.Errorf("page param = %q, want absent (no pagination in protocol)", gotPage)
 	}
-	if gotPageSize != fmt.Sprintf("%d", MaxBatchQueryItems) {
-		t.Errorf("page_size param = %q, want %d", gotPageSize, MaxBatchQueryItems)
+	if gotPageSize != "" {
+		t.Errorf("page_size param = %q, want absent (no pagination in protocol)", gotPageSize)
 	}
 }
 
@@ -1315,7 +1280,7 @@ func TestQueryBatch_APIError(t *testing.T) {
 	f := NewWithRetry(RetryConfig{MaxRetries: 0})
 	ctx := context.Background()
 
-	_, _, err := f.QueryBatch(ctx, server.URL, "bad-token", "")
+	_, _, err := f.QueryBatch(ctx, server.URL, "bad-token", "12345")
 	if err == nil {
 		t.Fatal("QueryBatch() should return error for API error")
 	}
@@ -1356,8 +1321,8 @@ func TestQueryBatch_ExceedsLimit(t *testing.T) {
 	}
 }
 
-// TestParsePaginatedData_RenewBeforeDays 验证分页响应中 renew_before_days 字段解析
-func TestParsePaginatedData_RenewBeforeDays(t *testing.T) {
+// TestParseQueryData_RenewBeforeDays 验证查询响应中 renew_before_days 字段解析
+func TestParseQueryData_RenewBeforeDays(t *testing.T) {
 	tests := []struct {
 		name                string
 		dataJSON            string
@@ -1365,17 +1330,17 @@ func TestParsePaginatedData_RenewBeforeDays(t *testing.T) {
 	}{
 		{
 			name:                "包含 renew_before_days",
-			dataJSON:            `{"total":1,"page":1,"page_size":100,"renew_before_days":14,"data":[{"order_id":123,"status":"active"}]}`,
+			dataJSON:            `{"renew_before_days":14,"data":[{"order_id":123,"status":"active"}]}`,
 			wantRenewBeforeDays: 14,
 		},
 		{
 			name:                "renew_before_days 为 0",
-			dataJSON:            `{"total":1,"page":1,"page_size":100,"renew_before_days":0,"data":[{"order_id":123,"status":"active"}]}`,
+			dataJSON:            `{"renew_before_days":0,"data":[{"order_id":123,"status":"active"}]}`,
 			wantRenewBeforeDays: 0,
 		},
 		{
 			name:                "不含 renew_before_days 字段",
-			dataJSON:            `{"total":1,"page":1,"page_size":100,"data":[{"order_id":123,"status":"active"}]}`,
+			dataJSON:            `{"data":[{"order_id":123,"status":"active"}]}`,
 			wantRenewBeforeDays: 0,
 		},
 	}
@@ -1386,9 +1351,9 @@ func TestParsePaginatedData_RenewBeforeDays(t *testing.T) {
 				Code: 1,
 				Data: json.RawMessage(tt.dataJSON),
 			}
-			_, _, renewBeforeDays, err := resp.ParsePaginatedData()
+			_, renewBeforeDays, err := resp.ParseQueryData()
 			if err != nil {
-				t.Fatalf("ParsePaginatedData() error = %v", err)
+				t.Fatalf("ParseQueryData() error = %v", err)
 			}
 			if renewBeforeDays != tt.wantRenewBeforeDays {
 				t.Errorf("renewBeforeDays = %d, want %d", renewBeforeDays, tt.wantRenewBeforeDays)
@@ -1397,7 +1362,7 @@ func TestParsePaginatedData_RenewBeforeDays(t *testing.T) {
 	}
 }
 
-func TestParsePaginatedDataRejectsOversizedCertificateMaterial(t *testing.T) {
+func TestParseQueryDataRejectsOversizedCertificateMaterial(t *testing.T) {
 	tests := []struct {
 		name string
 		data CertData
@@ -1414,12 +1379,12 @@ func TestParsePaginatedDataRejectsOversizedCertificateMaterial(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			raw, err := json.Marshal(PaginatedResponse{Total: 1, Data: []CertData{tt.data}})
+			raw, err := json.Marshal(QueryResponse{Data: []CertData{tt.data}})
 			if err != nil {
 				t.Fatal(err)
 			}
 			resp := APIResponse{Code: 1, Data: raw}
-			if _, _, _, err := resp.ParsePaginatedData(); err == nil {
+			if _, _, err := resp.ParseQueryData(); err == nil {
 				t.Fatal("oversized certificate material must be rejected")
 			}
 		})
@@ -1455,44 +1420,12 @@ func TestQueryOrder_RenewBeforeDays(t *testing.T) {
 	}
 }
 
-// TestQuery_RenewBeforeDays 验证 Query 能正确传递 renew_before_days
-func TestQuery_RenewBeforeDays(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		resp := mockResponse{
-			Code: 1,
-			Data: map[string]interface{}{
-				"total":             1,
-				"page":              1,
-				"page_size":         100,
-				"renew_before_days": 14,
-				"data":              []interface{}{mockCertData()},
-			},
-		}
-		_ = json.NewEncoder(w).Encode(resp)
-	}))
-	defer server.Close()
-
-	f := New()
-	ctx := context.Background()
-
-	_, renewBeforeDays, err := f.Query(ctx, server.URL, "token", "example.com")
-	if err != nil {
-		t.Fatalf("Query() error = %v", err)
-	}
-	if renewBeforeDays != 14 {
-		t.Errorf("renewBeforeDays = %d, want 14", renewBeforeDays)
-	}
-}
-
 // TestQueryBatch_RenewBeforeDays 验证 QueryBatch 能正确传递 renew_before_days
 func TestQueryBatch_RenewBeforeDays(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		resp := mockResponse{
 			Code: 1,
 			Data: map[string]interface{}{
-				"total":             1,
-				"page":              1,
-				"page_size":         100,
 				"renew_before_days": 14,
 				"data":              []interface{}{mockCertData()},
 			},
@@ -1501,10 +1434,7 @@ func TestQueryBatch_RenewBeforeDays(t *testing.T) {
 	}))
 	defer server.Close()
 
-	f := New()
-	ctx := context.Background()
-
-	_, renewBeforeDays, err := f.QueryBatch(ctx, server.URL, "token", "")
+	_, renewBeforeDays, err := queryBatchHelper(t, server.URL, "12345")
 	if err != nil {
 		t.Fatalf("QueryBatch() error = %v", err)
 	}

@@ -247,31 +247,6 @@ func TestIntegration_DomainMatch(t *testing.T) {
 	t.Logf("✓ 域名匹配: %s", expectDomain)
 }
 
-// TestIntegration_QueryByDomain 测试按域名查询
-func TestIntegration_QueryByDomain(t *testing.T) {
-	apiURL, token := getTestAPIConfig(t)
-	expectDomain := getTestAPIDomain(t)
-
-	f := fetcher.New()
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-
-	certData, _, err := f.Query(ctx, apiURL, token, expectDomain)
-	if err != nil {
-		t.Fatalf("Query() 失败: %v", err)
-	}
-
-	if certData == nil {
-		t.Fatal("Query() 返回空数据")
-	}
-
-	candidates := splitDomains(certData.Domains)
-
-	if !containsDomain(candidates, expectDomain) {
-		t.Fatalf("查询结果域名不匹配: want %q, got %v", expectDomain, candidates)
-	}
-}
-
 // TestIntegration_UpdateWithCSR 测试更新/续费接口（需显式允许写入）
 func TestIntegration_UpdateWithCSR(t *testing.T) {
 	requireWriteAccess(t)

@@ -41,7 +41,7 @@ type siteCandidate struct {
 	orderID      int              // 订单 ID（越大越新）
 }
 
-// runBatch 批量部署
+// runBatch 批量部署（query 为逗号分隔的订单 ID，形态已在入口校验）
 func runBatch(p *setupParams, query string) {
 	// 1/7: 检测 Web 服务并扫描站点（宿主机 + Docker）
 	fmt.Println("步骤 1/7: 检测 Web 服务并扫描站点...")
@@ -75,9 +75,10 @@ func runBatch(p *setupParams, query string) {
 		os.Exit(1)
 	}
 	fmt.Printf("  查询到 %d 个证书\n", len(certList))
-	// 单次请求不翻页：取满上限时如实提示，避免"只部署了一部分"被当成全量成功
-	if len(certList) >= fetcher.MaxBatchQueryItems {
-		fmt.Printf("  提示: 已达单次查询上限 %d 条，如有更多证书请用 --order 分批指定\n", fetcher.MaxBatchQueryItems)
+	// 不存在的 ID 被服务端静默跳过（deploy-spec §2.3），条数少于请求数时如实提示
+	if requested := len(strings.Split(query, ",")); len(certList) < requested {
+		fmt.Printf("  提示: 请求 %d 个订单，%d 个未命中（不存在或不在当前 Token 可见范围）\n",
+			requested, requested-len(certList))
 	}
 
 	// 过滤并验证证书

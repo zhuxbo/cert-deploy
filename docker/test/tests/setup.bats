@@ -23,14 +23,20 @@ setup() {
 
 @test "setup: 批量部署" {
   mock_set_scenario batch
-  run sslctl setup --url "$MOCK_URL" --token "$TOKEN" --order "1001,test.example.com" --no-service --yes
+  run sslctl setup --url "$MOCK_URL" --token "$TOKEN" --order "1001,1002" --no-service --yes
   assert_success
 }
 
-@test "setup: 全部部署" {
-  mock_set_scenario batch
+@test "setup: 缺少 --order 报错" {
   run sslctl setup --url "$MOCK_URL" --token "$TOKEN" --no-service --yes
-  assert_success
+  assert_failure
+  assert_output_contains "order 必填"
+}
+
+@test "setup: --order 含域名报错" {
+  run sslctl setup --url "$MOCK_URL" --token "$TOKEN" --order "1001,test.example.com" --no-service --yes
+  assert_failure
+  assert_output_contains "只接受订单 ID"
 }
 
 @test "setup: 指定私钥" {

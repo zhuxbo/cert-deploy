@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 
@@ -112,48 +113,45 @@ func (r *APIResponse) ParseData() (*CertData, error) {
 	return &list[0], nil
 }
 
-// PaginatedResponse 批量查询分页响应结构
-type PaginatedResponse struct {
-	Total           int        `json:"total"`
-	CurrentPage     int        `json:"page"`
-	PageSize        int        `json:"page_size"`
+// QueryResponse 查询接口的 data 字段结构（deploy-spec §2.3，无分页）
+type QueryResponse struct {
 	RenewBeforeDays int        `json:"renew_before_days"`
 	Data            []CertData `json:"data"`
 }
 
-// ParsePaginatedData 解析批量查询的分页响应
-// 批量响应格式: {"total": N, "page": 1, "page_size": 100, "renew_before_days": 14, "data": [...]}
-// 兼容单对象格式: 包装成单元素切片返回
-// 返回: (certs, total, renewBeforeDays, error)
-func (r *APIResponse) ParsePaginatedData() ([]CertData, int, int, error) {
+// ParseQueryData 解析查询响应
+// 标准格式: {"renew_before_days": 14, "data": [...]}；服务端不分页，单次取完。
+// 兼容单对象与裸数组格式: 包装成切片返回
+// 返回: (certs, renewBeforeDays, error)
+func (r *APIResponse) ParseQueryData() ([]CertData, int, error) {
 	if len(r.Data) == 0 {
-		return nil, 0, 0, fmt.Errorf("empty data field")
+		return nil, 0, fmt.Errorf("empty data field")
 	}
-	// 尝试解析为分页响应
-	var paginated PaginatedResponse
-	if err := json.Unmarshal(r.Data, &paginated); err == nil && paginated.Data != nil {
-		if err := validateCertDataList(paginated.Data); err != nil {
-			return nil, 0, 0, err
+	// 尝试解析为标准查询响应
+	var listResp QueryResponse
+	if err := json.Unmarshal(r.Data, &listResp); err == nil && listResp.Data != nil {
+		if err := validateCertDataList(listResp.Data); err != nil {
+			return nil, 0, err
 		}
-		return paginated.Data, paginated.Total, paginated.RenewBeforeDays, nil
+		return listResp.Data, listResp.RenewBeforeDays, nil
 	}
 	// 兼容：尝试解析为单个对象
 	var single CertData
 	if err := json.Unmarshal(r.Data, &single); err == nil && single.OrderID != 0 {
 		if err := validateCertDataSizes(&single); err != nil {
-			return nil, 0, 0, err
+			return nil, 0, err
 		}
-		return []CertData{single}, 1, 0, nil
+		return []CertData{single}, 0, nil
 	}
 	// 兼容：尝试解析为数组
 	var list []CertData
 	if err := json.Unmarshal(r.Data, &list); err == nil {
 		if err := validateCertDataList(list); err != nil {
-			return nil, 0, 0, err
+			return nil, 0, err
 		}
-		return list, len(list), 0, nil
+		return list, 0, nil
 	}
-	return nil, 0, 0, fmt.Errorf("failed to parse paginated data")
+	return nil, 0, fmt.Errorf("failed to parse query data")
 }
 
 // UpdateRequest 更新/续费证书请求
@@ -460,23 +458,23 @@ func (f *Fetcher) doWithRetry(ctx context.Context, newRequest func() (*http.Requ
 	return 0, nil, lastErr
 }
 
-// doAPICallBatch 批量查询的 API 调用流程，返回证书列表、总数和 renewBeforeDays
-func (f *Fetcher) doAPICallBatch(ctx context.Context, newRequest func() (*http.Request, error), errMsg string) ([]CertData, int, int, error) {
+// doAPICallQuery 查询接口的 API 调用流程，返回证书列表和 renewBeforeDays
+func (f *Fetcher) doAPICallQuery(ctx context.Context, newRequest func() (*http.Request, error), errMsg string) ([]CertData, int, error) {
 	statusCode, body, err := f.doWithRetry(ctx, newRequest, batchMaxResponseSize)
 	if err != nil {
-		return nil, 0, 0, errors.NewNetworkError(errMsg, err)
+		return nil, 0, errors.NewNetworkError(errMsg, err)
 	}
 	if statusCode != http.StatusOK {
-		return nil, 0, 0, errors.NewNetworkError(fmt.Sprintf("unexpected status code: %d", statusCode), nil)
+		return nil, 0, errors.NewNetworkError(fmt.Sprintf("unexpected status code: %d", statusCode), nil)
 	}
 	var apiResp APIResponse
 	if err := json.Unmarshal(body, &apiResp); err != nil {
-		return nil, 0, 0, errors.NewNetworkError("failed to parse JSON response", err)
+		return nil, 0, errors.NewNetworkError("failed to parse JSON response", err)
 	}
 	if apiResp.Code != APICodeSuccess {
-		return nil, 0, 0, errors.NewNetworkError(fmt.Sprintf("API error: %s", apiResp.Message), nil)
+		return nil, 0, errors.NewNetworkError(fmt.Sprintf("API error: %s", apiResp.Message), nil)
 	}
-	return apiResp.ParsePaginatedData()
+	return apiResp.ParseQueryData()
 }
 
 // mustValidURL 校验 URL 是否有效。
@@ -546,45 +544,6 @@ func buildAPIURL(baseURL, path string) string {
 	}
 	// 否则使用默认的 /api/deploy 路径
 	return baseURL + "/api/deploy" + path
-}
-
-// Query 查询证书（新 API：GET {baseURL}/api/deploy?order=xxx）
-// API 返回分页格式，取第一条结果
-// 返回: (certData, renewBeforeDays, error)
-func (f *Fetcher) Query(ctx context.Context, baseURL, token, domain string) (*CertData, int, error) {
-	apiURL := buildAPIURL(baseURL, "")
-	if err := mustValidURL(apiURL); err != nil {
-		return nil, 0, errors.NewNetworkError("invalid API URL", err)
-	}
-
-	// 构建带 order 参数的 URL
-	u, err := url.Parse(apiURL)
-	if err != nil {
-		return nil, 0, errors.NewNetworkError("invalid API URL", err)
-	}
-	q := u.Query()
-	q.Set("order", domain)
-	u.RawQuery = q.Encode()
-	fullURL := u.String()
-
-	newRequest := func() (*http.Request, error) {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, fullURL, nil)
-		if err != nil {
-			return nil, err
-		}
-		req.Header.Set("Accept", "application/json")
-		req.Header.Set("Authorization", "Bearer "+token)
-		return req, nil
-	}
-
-	certs, _, renewBeforeDays, err := f.doAPICallBatch(ctx, newRequest, "failed to query certificate")
-	if err != nil {
-		return nil, 0, err
-	}
-	if len(certs) == 0 {
-		return nil, 0, errors.NewNetworkError("no certificate found", nil)
-	}
-	return &certs[0], renewBeforeDays, nil
 }
 
 // Update 更新/续费证书（新 API：POST {baseURL}/api/deploy）
@@ -658,7 +617,7 @@ func (f *Fetcher) CallbackNew(ctx context.Context, baseURL, token string, callba
 
 // QueryOrder 按 OrderID 查询订单状态
 // GET {baseURL}/api/deploy?order=xxx
-// API 返回分页格式，取第一条结果
+// 取第一条结果
 // 返回: (certData, renewBeforeDays, error)
 func (f *Fetcher) QueryOrder(ctx context.Context, baseURL, token string, orderID int) (*CertData, int, error) {
 	apiURL := buildAPIURL(baseURL, "")
@@ -686,7 +645,7 @@ func (f *Fetcher) QueryOrder(ctx context.Context, baseURL, token string, orderID
 		return req, nil
 	}
 
-	certs, _, renewBeforeDays, err := f.doAPICallBatch(ctx, newRequest, "failed to query order")
+	certs, renewBeforeDays, err := f.doAPICallQuery(ctx, newRequest, "failed to query order")
 	if err != nil {
 		return nil, 0, err
 	}
@@ -756,27 +715,29 @@ func (f *Fetcher) ToggleAutoReissue(ctx context.Context, baseURL, token string, 
 	return data.RenewBeforeDays, nil
 }
 
-// MaxBatchQueryItems 单次批量查询的条数上限（deploy-spec §2.3）。
-// 同时用于逗号分隔项数校验与 page_size：服务端对空 order 固定返回最新 100 条、
-// 对逗号批量硬限 100 条，两侧一致。
+// MaxBatchQueryItems 单次批量查询的订单 ID 项数上限（deploy-spec §2.3）
 const MaxBatchQueryItems = 100
 
-// QueryBatch 批量查询证书（单次请求，不翻页）
-// query 非空时: GET {baseURL}/api/deploy?order={query}
-// query 为空时: GET {baseURL}/api/deploy（返回最新 MaxBatchQueryItems 条 active 证书）
+// batchQueryPattern 批量查询形态（deploy-spec §2.3）：仅订单 ID，单个或逗号分隔多个。
+// 与服务端校验一致；本地先拒绝可以少发一次注定失败的请求。
+var batchQueryPattern = regexp.MustCompile(`^\d+(,\d+)*$`)
+
+// QueryBatch 批量查询证书（单次请求，无分页）
+// GET {baseURL}/api/deploy?order={id1,id2,...}
+// query 必填且只接受订单 ID（单个或英文逗号分隔，上限 MaxBatchQueryItems）。
+// 不存在的 ID 被服务端静默跳过，全部未命中返回空切片，由调用方决定语义。
 // 返回: (certs, renewBeforeDays, error)
 //
-// 不做分页：服务端对空 order 固定返回最新 100 条、对逗号批量硬限 100 条，一次即取完。
-// 此前按 total 翻页的循环没有页数与条数上限——终止只依赖服务端自报的 total 与非空页，
-// 两者同时失真（total 虚高且每页恒非空）即无限翻页，且 allCerts 内存同步无限增长，
-// 而唯一调用方 setup 传的是无 deadline 的 ctx，没有任何一侧能兜住。
+// 协议无分页（不发也不认 page / page_size / total），单次取完即止：
+// 翻页循环的终止只依赖服务端自报的计数与非空页，一旦失真即无限翻页且累积内存无界。
 func (f *Fetcher) QueryBatch(ctx context.Context, baseURL, token, query string) ([]CertData, int, error) {
-	// 规范 2.3：批量查询上限 100
-	if query != "" {
-		if parts := strings.Split(query, ","); len(parts) > MaxBatchQueryItems {
-			return nil, 0, errors.NewNetworkError(
-				fmt.Sprintf("批量查询超过上限: %d（最大 %d）", len(parts), MaxBatchQueryItems), nil)
-		}
+	if !batchQueryPattern.MatchString(query) {
+		return nil, 0, errors.NewBusinessError(
+			fmt.Sprintf("批量查询只接受订单 ID（纯数字，英文逗号分隔）: %q", query), nil)
+	}
+	if parts := strings.Split(query, ","); len(parts) > MaxBatchQueryItems {
+		return nil, 0, errors.NewBusinessError(
+			fmt.Sprintf("批量查询超过上限: %d（最大 %d）", len(parts), MaxBatchQueryItems), nil)
 	}
 
 	apiURL := buildAPIURL(baseURL, "")
@@ -790,10 +751,7 @@ func (f *Fetcher) QueryBatch(ctx context.Context, baseURL, token, query string) 
 	}
 
 	q := u.Query()
-	if query != "" {
-		q.Set("order", query)
-	}
-	q.Set("page_size", fmt.Sprintf("%d", MaxBatchQueryItems))
+	q.Set("order", query)
 	u.RawQuery = q.Encode()
 	fullURL := u.String()
 
@@ -807,10 +765,5 @@ func (f *Fetcher) QueryBatch(ctx context.Context, baseURL, token, query string) 
 		return req, nil
 	}
 
-	certs, _, renewBeforeDays, err := f.doAPICallBatch(ctx, newRequest, "failed to batch query")
-	if err != nil {
-		return nil, 0, err
-	}
-
-	return certs, renewBeforeDays, nil
+	return f.doAPICallQuery(ctx, newRequest, "failed to batch query")
 }

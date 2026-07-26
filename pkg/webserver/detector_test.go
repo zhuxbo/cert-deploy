@@ -187,7 +187,7 @@ func TestDetectDockerServer_InputValidation(t *testing.T) {
 		{"包含换行符", "my\ncontainer", TypeUnknown},
 		{"包含 tab", "my\tcontainer", TypeUnknown},
 		{"包含中文", "我的容器", TypeUnknown},
-		{"合法的短 ID", "abc123", TypeUnknown},                   // 格式合法但容器不存在
+		{"合法的短 ID", "abc123", TypeUnknown},                    // 格式合法但容器不存在
 		{"合法的完整 ID", "abc123def456789012345678", TypeUnknown}, // 格式合法但容器不存在
 		{"合法的容器名（含下划线）", "my_container", TypeUnknown},
 		{"合法的容器名（含短横线）", "my-container", TypeUnknown},

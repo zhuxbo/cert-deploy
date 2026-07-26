@@ -314,13 +314,13 @@ func TestCheckExpiry_ExpiredMessage(t *testing.T) {
 // TestSyncOrderID 测试同步 API 返回的订单号到本地配置
 func TestSyncOrderID(t *testing.T) {
 	tests := []struct {
-		name          string
-		certOrderID   int
-		certName      string
-		apiOrderID    int
-		wantOrderID   int
-		wantCertName  string // 期望的 cert_name（fixCertName 可能修改）
-		wantRenamed   bool   // 是否期望触发重命名
+		name         string
+		certOrderID  int
+		certName     string
+		apiOrderID   int
+		wantOrderID  int
+		wantCertName string // 期望的 cert_name（fixCertName 可能修改）
+		wantRenamed  bool   // 是否期望触发重命名
 	}{
 		{
 			name:         "订单号变化时更新",
@@ -663,4 +663,3 @@ func TestPickKeyPath(t *testing.T) {
 		})
 	}
 }
-

@@ -136,6 +136,12 @@ func TestCheckAndRenewAll_ZeroExpiryRefillsFromAPI(t *testing.T) {
 		Domains:  []string{"zero.example.com"},
 		API:      config.APIConfig{URL: server.URL, Token: "test-token"},
 		// CertExpiresAt 零值：模拟部署成功但元数据保存失败/带外换证
+		// 回填路径要求证书有启用绑定：零绑定证书由闸门在回填之前拦截（零 API 请求）
+		Bindings: []config.SiteBinding{{
+			ServerName: "zero.example.com",
+			ServerType: config.ServerTypeNginx,
+			Enabled:    true,
+		}},
 	}
 	if err := cm.AddCert(cert); err != nil {
 		t.Fatalf("添加证书失败: %v", err)

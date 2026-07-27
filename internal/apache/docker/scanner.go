@@ -4,7 +4,7 @@ package docker
 import (
 	"context"
 	"fmt"
-	"path/filepath"
+	"path"
 	"regexp"
 	"strings"
 
@@ -109,7 +109,7 @@ func (s *Scanner) DetectApacheConfig(ctx context.Context) (configPath, serverRoo
 		}
 		if matches := configRe.FindStringSubmatch(output); len(matches) > 1 {
 			configFile := matches[1]
-			if filepath.IsAbs(configFile) {
+			if path.IsAbs(configFile) {
 				configPath = configFile
 			} else if serverRoot != "" {
 				configPath = serverRoot + "/" + configFile
@@ -154,6 +154,11 @@ func (s *Scanner) scanConfigFile(ctx context.Context, configPath string, info *C
 	if err != nil {
 		return nil, nil
 	}
+	if depth == 0 {
+		if root, ok := serverRootFromConfigContent(content, s.serverRoot); ok {
+			s.serverRoot = root
+		}
+	}
 
 	var sites []*SSLSite
 
@@ -178,7 +183,7 @@ func (s *Scanner) readContainerFile(ctx context.Context, filePath string) (strin
 
 // findIncludes 查找 Include/IncludeOptional 指令
 func (s *Scanner) findIncludes(ctx context.Context, content, configPath string) []string {
-	configDir := filepath.Dir(configPath)
+	configDir := path.Dir(configPath)
 	var includes []string
 
 	includeRe := regexp.MustCompile(`(?im)^\s*Include(?:Optional)?\s+(.+)$`)
@@ -203,8 +208,8 @@ func (s *Scanner) findIncludes(ctx context.Context, content, configPath string) 
 
 		// 处理 glob 模式
 		if strings.Contains(pattern, "*") {
-			dir := filepath.Dir(pattern)
-			base := filepath.Base(pattern)
+			dir := path.Dir(pattern)
+			base := path.Base(pattern)
 			// 用 ls 列出匹配文件
 			output, err := s.client.Exec(ctx, fmt.Sprintf("ls -1 %s/%s 2>/dev/null", util.ShellQuote(dir), base))
 			if err == nil && output != "" {
@@ -325,6 +330,7 @@ func (s *Scanner) parseConfig(content, configPath string, info *ContainerInfo) [
 // 若配置了 SSLCertificateChainFile，则证书链也必须解析出宿主机路径。任一未挂载都判为非卷模式，
 // 交由 config.ValidateDockerBinding 明确报错并计为失败，避免把未挂载文件写到宿主机错误位置后误报成功。
 func (s *Scanner) resolveHostPaths(site *SSLSite) {
+	s.resolveContainerPaths(site)
 	if m := s.client.FindMountForPath(s.mounts, site.CertificatePath); m != nil {
 		site.HostCertPath = s.client.ResolveHostPath(site.CertificatePath, m)
 	}
@@ -344,4 +350,47 @@ func (s *Scanner) resolveHostPaths(site *SSLSite) {
 			site.HostWebroot = s.client.ResolveHostPath(site.Webroot, m)
 		}
 	}
+}
+
+func (s *Scanner) resolveContainerPaths(site *SSLSite) {
+	if s.serverRoot == "" {
+		return
+	}
+	if site.CertificatePath != "" && !path.IsAbs(site.CertificatePath) {
+		site.CertificatePath = path.Join(s.serverRoot, site.CertificatePath)
+	}
+	if site.PrivateKeyPath != "" && !path.IsAbs(site.PrivateKeyPath) {
+		site.PrivateKeyPath = path.Join(s.serverRoot, site.PrivateKeyPath)
+	}
+	if site.ChainPath != "" && !path.IsAbs(site.ChainPath) {
+		site.ChainPath = path.Join(s.serverRoot, site.ChainPath)
+	}
+	if site.Webroot != "" && !path.IsAbs(site.Webroot) {
+		site.Webroot = path.Join(s.serverRoot, site.Webroot)
+	}
+}
+
+func serverRootFromConfigContent(content, initialRoot string) (string, bool) {
+	serverRootRe := regexp.MustCompile(`(?i)^\s*ServerRoot\s+(.+?)\s*$`)
+	root := ""
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		matches := serverRootRe.FindStringSubmatch(line)
+		if len(matches) < 2 {
+			continue
+		}
+		value := strings.Trim(strings.TrimSpace(matches[1]), `"'`)
+		if value == "" {
+			continue
+		}
+		if path.IsAbs(value) {
+			root = path.Clean(value)
+		} else if initialRoot != "" && path.IsAbs(initialRoot) {
+			root = path.Join(initialRoot, value)
+		}
+	}
+	return root, root != ""
 }

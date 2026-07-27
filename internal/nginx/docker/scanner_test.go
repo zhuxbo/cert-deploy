@@ -1,6 +1,7 @@
 package docker
 
 import (
+	"context"
 	"testing"
 )
 
@@ -45,6 +46,54 @@ server {
 	}
 	if site.ContainerID != "abc123" {
 		t.Errorf("ContainerID = %q", site.ContainerID)
+	}
+}
+
+func TestParseConfig_RelativeCertificatesUseMainConfigDirectory(t *testing.T) {
+	s := makeTestScanner("abc123", "test-nginx")
+	s.configRoot = "/etc/nginx"
+	s.mounts = []MountInfo{
+		{Type: "bind", Source: "/host/nginx", Destination: "/etc/nginx", RW: true},
+	}
+	info := &ContainerInfo{ID: "abc123", Name: "test-nginx"}
+
+	config := `
+server {
+    listen 443 ssl;
+    server_name example.com;
+    ssl_certificate ssl/cert.pem;
+    ssl_certificate_key ssl/key.pem;
+}
+`
+	sites := s.parseConfig(config, "/etc/nginx/sites/example.conf", info)
+	if len(sites) != 1 {
+		t.Fatalf("expected 1 site, got %d", len(sites))
+	}
+	if sites[0].CertificatePath != "/etc/nginx/ssl/cert.pem" {
+		t.Errorf("CertificatePath = %q", sites[0].CertificatePath)
+	}
+	if sites[0].PrivateKeyPath != "/etc/nginx/ssl/key.pem" {
+		t.Errorf("PrivateKeyPath = %q", sites[0].PrivateKeyPath)
+	}
+	if sites[0].HostCertPath != "/host/nginx/ssl/cert.pem" {
+		t.Errorf("HostCertPath = %q", sites[0].HostCertPath)
+	}
+	if sites[0].HostKeyPath != "/host/nginx/ssl/key.pem" {
+		t.Errorf("HostKeyPath = %q", sites[0].HostKeyPath)
+	}
+}
+
+func TestFindIncludes_NestedFileUsesMainConfigDirectory(t *testing.T) {
+	s := makeTestScanner("abc123", "test-nginx")
+	s.configRoot = "/etc/nginx"
+
+	includes := s.findIncludes(
+		context.Background(),
+		"include snippets/tls.conf;",
+		"/etc/nginx/sites/example.conf",
+	)
+	if len(includes) != 1 || includes[0] != "/etc/nginx/snippets/tls.conf" {
+		t.Fatalf("includes = %v", includes)
 	}
 }
 

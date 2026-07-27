@@ -2,6 +2,7 @@
 package webserver
 
 import (
+	"context"
 	"testing"
 )
 
@@ -38,10 +39,10 @@ type mockScanner struct {
 	serverType ServerType
 }
 
-func (m *mockScanner) Scan() ([]Site, error)      { return nil, nil }
-func (m *mockScanner) ScanLocal() ([]Site, error) { return nil, nil }
+func (m *mockScanner) Scan() ([]Site, error)       { return nil, nil }
+func (m *mockScanner) ScanLocal() ([]Site, error)  { return nil, nil }
 func (m *mockScanner) ScanDocker() ([]Site, error) { return nil, nil }
-func (m *mockScanner) ServerType() ServerType     { return m.serverType }
+func (m *mockScanner) ServerType() ServerType      { return m.serverType }
 
 // mockInstaller 测试用 mock 安装器
 type mockInstaller struct{}
@@ -54,10 +55,12 @@ func (m *mockInstaller) Rollback(backupPath string) error { return nil }
 // mockDeployer 测试用 mock 部署器
 type mockDeployer struct{}
 
-func (m *mockDeployer) Deploy(cert, chain, key string) error                           { return nil }
-func (m *mockDeployer) Reload() error                                                  { return nil }
-func (m *mockDeployer) Test() error                                                    { return nil }
-func (m *mockDeployer) Rollback(backupCertPath, backupKeyPath, backupChainPath string) error { return nil }
+func (m *mockDeployer) Deploy(_ context.Context, cert, chain, key string) error { return nil }
+func (m *mockDeployer) Reload(_ context.Context) error                          { return nil }
+func (m *mockDeployer) Test(_ context.Context) error                            { return nil }
+func (m *mockDeployer) Rollback(_ context.Context, backupCertPath, backupKeyPath, backupChainPath string) error {
+	return nil
+}
 
 // TestNewScanner_Nginx 测试创建 Nginx 扫描器
 func TestNewScanner_Nginx(t *testing.T) {
@@ -225,7 +228,7 @@ func TestNginxDeployerWrapper_Methods(t *testing.T) {
 	}
 
 	// Deploy 应该失败（没有有效证书）
-	err = deployer.Deploy("invalid-cert", "", "invalid-key")
+	err = deployer.Deploy(context.Background(), "invalid-cert", "", "invalid-key")
 	if err == nil {
 		t.Log("Deploy 成功（意外）")
 	} else {
@@ -233,13 +236,13 @@ func TestNginxDeployerWrapper_Methods(t *testing.T) {
 	}
 
 	// Test 应该失败或跳过（没有配置测试命令）
-	err = deployer.Test()
+	err = deployer.Test(context.Background())
 	if err != nil {
 		t.Logf("Test 失败（预期，无测试命令）: %v", err)
 	}
 
 	// Reload 应该失败或跳过（没有配置重载命令）
-	err = deployer.Reload()
+	err = deployer.Reload(context.Background())
 	if err != nil {
 		t.Logf("Reload 失败（预期，无重载命令）: %v", err)
 	}
@@ -265,7 +268,7 @@ func TestApacheDeployerWrapper_Methods(t *testing.T) {
 	}
 
 	// Deploy 应该失败（没有有效证书）
-	err = deployer.Deploy("invalid-cert", "invalid-chain", "invalid-key")
+	err = deployer.Deploy(context.Background(), "invalid-cert", "invalid-chain", "invalid-key")
 	if err == nil {
 		t.Log("Deploy 成功（意外）")
 	} else {
@@ -273,13 +276,13 @@ func TestApacheDeployerWrapper_Methods(t *testing.T) {
 	}
 
 	// Test 应该失败或跳过（没有配置测试命令）
-	err = deployer.Test()
+	err = deployer.Test(context.Background())
 	if err != nil {
 		t.Logf("Test 失败（预期，无测试命令）: %v", err)
 	}
 
 	// Reload 应该失败或跳过（没有配置重载命令）
-	err = deployer.Reload()
+	err = deployer.Reload(context.Background())
 	if err != nil {
 		t.Logf("Reload 失败（预期，无重载命令）: %v", err)
 	}

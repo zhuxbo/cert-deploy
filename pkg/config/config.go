@@ -84,11 +84,46 @@ type CertMetadata struct {
 	// DeployStartedAt 部署尝试崩溃安全标记：置位表示已持久化一个部署意图但结果未落盘，
 	// 重启时据此复验并重放同一尝试，不再重复递增 DeployAttemptCount（deploy-spec §5.1）
 	DeployStartedAt time.Time `json:"deploy_started_at,omitempty"`
-	// CappedPhase 触顶阶段：issue / deploy / legacy（仅 LastIssueState==CAPPED 时有意义）
+	// CappedPhase 触顶阶段：issue / deploy / stalled / legacy（仅 LastIssueState==CAPPED 时有意义）
 	CappedPhase string `json:"capped_phase,omitempty"`
+	// LastOrderStatus 服务端最近一次返回的订单状态，**展示专用、不参与任何门禁判定**。
+	// 与 LastIssueState 分离（deploy-spec §3.4）：后者的真实作用是区分「有无在途订单」，
+	// 把 cancelled 这类订单终态写进去会让两个概念混在一个字段里，
+	// 而 pull 模式从不 POST、根本不需要该区分。
+	LastOrderStatus string `json:"last_order_status,omitempty"`
+	// LastDeployBlockReason 最近一次环境阻断的原因（Web 配置本就损坏等非本次部署导致的失败）。
+	// 环境恢复时清空。用于边沿触发上报：原因未变化时不重复上报。
+	LastDeployBlockReason string `json:"last_deploy_block_reason,omitempty"`
+	// LastDeployBlockAt 最近一次环境阻断的时间
+	LastDeployBlockAt time.Time `json:"last_deploy_block_at,omitempty"`
+	// BlockReportCount 环境阻断上报累计次数，>= 10 后转静默（deploy-spec §2.8）。
+	// 阻断不递增 DeployAttemptCount（修好即自动恢复、无需人工解除 CAPPED），
+	// 故若无此上限，整条阻断回调路径就没有任何边界。环境恢复时清零。
+	BlockReportCount int `json:"block_report_count,omitempty"`
+	// UnchangedCertRounds 服务端连续返回同一张证书（序列号未变）的轮数（平台扩展字段）。
+	// 部署"成功"会清零全部计数，若服务端一直不换证，三重边界同时失效：
+	// 计数每轮清零永不触顶、部署发生算进展使无进展计时也清零、到期闸门要等真过期。
+	// 每轮还会真实改写证书文件并 reload Web 服务，服务端看到的却是一切正常。
+	UnchangedCertRounds int `json:"unchanged_cert_rounds,omitempty"`
+	// NoProgressSince 首次「本轮只查询、无任何进展」的时间（deploy-spec §3.2）。
+	// 锚定首次、不滑动：每轮刷新等于永远达不到时限，那正是要修的问题。
+	// 纯 GET 轮询不递增任何尝试计数，而到期闸门在 CertExpiresAt 为空时整段失效
+	// （新证书默认为空，只有部署成功才回填），故需要这条与计数正交的绝对边界。
+	NoProgressSince time.Time `json:"no_progress_since,omitempty"`
 	// 部署失败的绑定列表（ServerName），下次检查时重试
 	FailedBindings   []string  `json:"failed_bindings,omitempty"`
 	FailedBindingsAt time.Time `json:"failed_bindings_at,omitempty"` // 首次记录失败绑定的时间
+	// RetryAttemptCount 失败绑定重试计数（平台扩展字段，deploy-spec §1.6）。
+	// 与证书级 DeployAttemptCount 分离：绑定级重试是规范未建模的平台扩展，
+	// 共用公共计数会让单个坏站点把整张证书打进 CAPPED，健康站点跟着过期。
+	RetryAttemptCount int `json:"retry_attempt_count,omitempty"`
+	// NoBindingBlockedAt 零启用绑定阻断标记（平台扩展字段，deploy-spec §1.6）。
+	// 证书 enabled 但无任何启用绑定时置位：退出自动流程、不发请求、不回调，等待人工处理；
+	// 绑定恢复后自动清除。不占用公共字段 last_issue_state，避免覆盖在途签发状态。
+	NoBindingBlockedAt time.Time `json:"no_binding_blocked_at,omitempty"`
+	// StaleBindings 长期未部署成功的绑定（平台扩展字段）：语义为"该绑定当前未持有本证书的最新证书"。
+	StaleBindings []string  `json:"stale_bindings,omitempty"`
+	StaleSince    time.Time `json:"stale_since,omitempty"`
 	// 文件验证相关
 	ValidationFiles []string `json:"validation_files,omitempty"` // 已写入的验证文件路径（部署成功后清理）
 }
@@ -219,6 +254,18 @@ func (c *CertConfig) IsIllegalIPConfig(schedule *ScheduleConfig) bool {
 	}
 	if c.ValidationMethod == ValidationMethodDelegation {
 		return true // IP + delegation
+	}
+	return false
+}
+
+// HasEnabledBinding 是否存在启用的站点绑定。
+// 证书 enabled 但零启用绑定属配置异常（站点被改绑到其它证书、人工禁用等）：
+// 无部署目标，不应进入自动续签/部署流程，更不应向服务端上报"部署成功"。
+func (c *CertConfig) HasEnabledBinding() bool {
+	for i := range c.Bindings {
+		if c.Bindings[i].Enabled {
+			return true
+		}
 	}
 	return false
 }

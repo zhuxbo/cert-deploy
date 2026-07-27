@@ -2,6 +2,7 @@
 package deploy
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -67,7 +68,7 @@ func TestDeployToBinding_Nginx(t *testing.T) {
 		IntermediateCert: "",
 	}
 
-	err = deployToBinding(binding, certData, testCert.KeyPEM, backup.NewManager(t.TempDir(), 5), nil)
+	err = deployToBinding(context.Background(), binding, certData, testCert.KeyPEM, backup.NewManager(t.TempDir(), 5), nil)
 	if err != nil {
 		t.Fatalf("deployToBinding() error = %v", err)
 	}
@@ -124,7 +125,7 @@ func TestDeployToBinding_Apache(t *testing.T) {
 		IntermediateCert: intermediateCert.CertPEM,
 	}
 
-	err = deployToBinding(binding, certData, testCert.KeyPEM, backup.NewManager(t.TempDir(), 5), nil)
+	err = deployToBinding(context.Background(), binding, certData, testCert.KeyPEM, backup.NewManager(t.TempDir(), 5), nil)
 	if err != nil {
 		t.Fatalf("deployToBinding() error = %v", err)
 	}
@@ -157,7 +158,7 @@ func TestDeployToBinding_UnsupportedType(t *testing.T) {
 		Cert: testCert.CertPEM,
 	}
 
-	err := deployToBinding(binding, certData, testCert.KeyPEM, backup.NewManager(t.TempDir(), 5), nil)
+	err := deployToBinding(context.Background(), binding, certData, testCert.KeyPEM, backup.NewManager(t.TempDir(), 5), nil)
 	if err == nil {
 		t.Error("期望返回错误，但实际成功")
 	}
@@ -186,7 +187,7 @@ func TestDeployToBinding_CreateDirectory(t *testing.T) {
 		Cert: testCert.CertPEM,
 	}
 
-	err := deployToBinding(binding, certData, testCert.KeyPEM, backup.NewManager(t.TempDir(), 5), nil)
+	err := deployToBinding(context.Background(), binding, certData, testCert.KeyPEM, backup.NewManager(t.TempDir(), 5), nil)
 	if err != nil {
 		t.Fatalf("deployToBinding() error = %v", err)
 	}
@@ -218,7 +219,7 @@ func TestDeployToBinding_DockerNginx_RejectsUnsafe(t *testing.T) {
 
 	certData := &fetcher.CertData{Cert: testCert.CertPEM}
 
-	err := deployToBinding(binding, certData, testCert.KeyPEM, backup.NewManager(t.TempDir(), 5), nil)
+	err := deployToBinding(context.Background(), binding, certData, testCert.KeyPEM, backup.NewManager(t.TempDir(), 5), nil)
 	if err == nil {
 		t.Fatal("非挂载卷 Docker 绑定应被拒绝部署")
 	}
@@ -247,7 +248,7 @@ func TestDeployToBinding_DockerApache_RejectsUnsafe(t *testing.T) {
 
 	certData := &fetcher.CertData{Cert: testCert.CertPEM}
 
-	err := deployToBinding(binding, certData, testCert.KeyPEM, backup.NewManager(t.TempDir(), 5), nil)
+	err := deployToBinding(context.Background(), binding, certData, testCert.KeyPEM, backup.NewManager(t.TempDir(), 5), nil)
 	if err == nil {
 		t.Fatal("非挂载卷 Docker 绑定应被拒绝部署")
 	}
@@ -284,8 +285,9 @@ func TestDeployToBindings_ReturnsErrorWhenAnyBindingFails(t *testing.T) {
 		},
 	}
 
-	successCount, err := deployToBindings(
-		bindings,
+	cert := &config.CertConfig{CertName: "example.com-1", Bindings: bindings}
+	successCount, failedNames, err := deployToBindings(context.Background(),
+		cert,
 		&fetcher.CertData{Cert: testCert.CertPEM},
 		testCert.KeyPEM,
 		backup.NewManager(t.TempDir(), 5),
@@ -296,6 +298,11 @@ func TestDeployToBindings_ReturnsErrorWhenAnyBindingFails(t *testing.T) {
 	}
 	if successCount != 1 {
 		t.Fatalf("successCount = %d, want 1", successCount)
+	}
+	// 仍失败的站点必须原样返回，供调用方记入 FailedBindings 交守护进程接手；
+	// 清空会制造"手动部署部分成功 → 剩下的永远没人管"的新洞
+	if len(failedNames) != 1 || failedNames[0] != "failed.example.com" {
+		t.Fatalf("failedNames = %v, want [failed.example.com]", failedNames)
 	}
 	if !strings.Contains(err.Error(), "failed.example.com") {
 		t.Fatalf("错误应包含失败站点，got %v", err)

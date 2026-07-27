@@ -8,10 +8,10 @@ import (
 // TestParseCommand 测试命令解析
 func TestParseCommand(t *testing.T) {
 	tests := []struct {
-		name         string
-		input        string
-		wantExec     string
-		wantArgsLen  int
+		name        string
+		input       string
+		wantExec    string
+		wantArgsLen int
 	}{
 		{"空命令", "", "", 0},
 		{"单个命令", "nginx", "nginx", 0},

@@ -84,6 +84,12 @@ func TestCheckAndRenewAll_PrepareFailureNoCallback(t *testing.T) {
 		Metadata: config.CertMetadata{
 			CertExpiresAt: time.Now().Add(3 * 24 * time.Hour), // 临期，需要续签
 		},
+		// 必须有启用绑定，否则先被零绑定闸门拦截，测不到签发阶段
+		Bindings: []config.SiteBinding{{
+			ServerName: "prep.example.com",
+			ServerType: config.ServerTypeNginx,
+			Enabled:    true,
+		}},
 	}
 	if err := cm.AddCert(cert); err != nil {
 		t.Fatalf("添加证书失败: %v", err)

@@ -100,7 +100,6 @@ func TestScannedSite_DockerSite(t *testing.T) {
 	}
 }
 
-
 // TestScanService_Creation 测试扫描服务创建
 func TestScanService_Creation(t *testing.T) {
 	tmpDir := t.TempDir()
@@ -419,7 +418,6 @@ func TestScanResult_TimeFormat(t *testing.T) {
 		t.Errorf("日期 = %d, 期望 15", result.ScanTime.Day())
 	}
 }
-
 
 // TestScanOptions_AllServerTypes 测试所有服务器类型选项
 func TestScanOptions_AllServerTypes(t *testing.T) {

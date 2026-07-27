@@ -1,6 +1,7 @@
 package scanner
 
 import (
+	"bufio"
 	"context"
 	"os"
 	"os/exec"
@@ -44,8 +45,8 @@ func prefixCandidates(binaryPath string) []string {
 	if !filepath.IsAbs(binaryPath) {
 		return nil
 	}
-	binDir := filepath.Dir(binaryPath)             // <install>/bin
-	installDir := filepath.Dir(binDir)             // <install>
+	binDir := filepath.Dir(binaryPath) // <install>/bin
+	installDir := filepath.Dir(binDir) // <install>
 	return []string{
 		installDir + string(filepath.Separator),
 		filepath.Join(installDir, "conf") + string(filepath.Separator),
@@ -58,26 +59,32 @@ func prefixCandidates(binaryPath string) []string {
 //   - candidates: 常见候选路径（失败时供提示）
 //   - ok: 是否可信地确定了 prefix
 //
-// 策略优先级：显式 override > Scanner 已检测到的 ServerRoot > httpd -V HTTPD_ROOT >
-//              运行进程 -d 参数 > error_log 启发式
+// 策略优先级：显式 override > 配置解析/apachectl 的最终 ServerRoot > 运行进程 -d 参数 >
+//
+//	Scanner 已检测到的 HTTPD_ROOT > httpd -V HTTPD_ROOT > error_log 启发式
 func (s *Scanner) getApachePrefix(binaryPath string) (prefix string, candidates []string, ok bool) {
 	// 1. 显式 override（--apache-prefix）
 	if p := getPrefixOverride(); p != "" {
 		return p, nil, true
 	}
 
-	// 2. Scanner 结构体已填充的 serverRoot（DetectApache 从 httpd -V 读到的）
+	// 2. 配置文件或 apachectl 输出给出的最终有效 ServerRoot
+	if s.serverRootEffective && s.serverRoot != "" && filepath.IsAbs(s.serverRoot) {
+		return s.serverRoot, nil, true
+	}
+
+	// 3. 运行进程的 -d 是运行时初始 ServerRoot，优先于编译期 HTTPD_ROOT
+	if p := getServerRootFromProcessCmdline(); p != "" {
+		return p, nil, true
+	}
+
+	// 4. Scanner 结构体已填充的 serverRoot（DetectApache 从 httpd -V 读到的）
 	if s.serverRoot != "" && filepath.IsAbs(s.serverRoot) {
 		return s.serverRoot, nil, true
 	}
 
-	// 3. httpd -V HTTPD_ROOT（作为独立入口，适配 scanWithApacheCtl 场景）
+	// 5. httpd -V HTTPD_ROOT（作为独立入口，适配 scanWithApacheCtl 场景）
 	if p := getServerRootFromVersion(); p != "" {
-		return p, nil, true
-	}
-
-	// 4. 运行进程命令行的 -d 参数
-	if p := getServerRootFromProcessCmdline(); p != "" {
 		return p, nil, true
 	}
 
@@ -107,6 +114,82 @@ func (s *Scanner) getApachePrefix(binaryPath string) (prefix string, candidates 
 
 	// 全部策略失败
 	return "", candidates, false
+}
+
+func (s *Scanner) setEffectiveServerRoot(root string) {
+	root = filepath.Clean(strings.TrimSpace(root))
+	if root == "." || !filepath.IsAbs(root) {
+		return
+	}
+	s.serverRoot = root
+	s.serverRootEffective = true
+}
+
+// prepareServerRoot 按 Apache 生效顺序确定 ServerRoot：命令行 -d/编译期默认值提供初始值，
+// 主配置里的 ServerRoot 再覆盖；--apache-prefix 始终作为用户显式覆盖。
+func (s *Scanner) prepareServerRoot(configPath string) {
+	if override := getPrefixOverride(); override != "" {
+		s.setEffectiveServerRoot(override)
+		return
+	}
+
+	initialRoot := getServerRootFromProcessCmdline()
+	if initialRoot == "" {
+		initialRoot = s.serverRoot
+	}
+	if initialRoot == "" {
+		initialRoot = getServerRootFromVersion()
+	}
+	if initialRoot != "" && filepath.IsAbs(initialRoot) {
+		s.serverRoot = filepath.Clean(initialRoot)
+	}
+
+	content, err := os.ReadFile(configPath)
+	if err != nil {
+		return
+	}
+	if root, ok := serverRootFromConfigContent(string(content), initialRoot); ok {
+		s.setEffectiveServerRoot(root)
+	}
+}
+
+func serverRootFromConfigContent(content, initialRoot string) (string, bool) {
+	serverRootRe := regexp.MustCompile(`(?i)^\s*ServerRoot\s+(.+?)\s*$`)
+	root := ""
+	scanner := bufio.NewScanner(strings.NewReader(content))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		matches := serverRootRe.FindStringSubmatch(line)
+		if len(matches) < 2 {
+			continue
+		}
+		value := strings.Trim(strings.TrimSpace(matches[1]), `"'`)
+		if value == "" {
+			continue
+		}
+		if filepath.IsAbs(value) {
+			root = filepath.Clean(value)
+		} else if initialRoot != "" && filepath.IsAbs(initialRoot) {
+			root = filepath.Join(initialRoot, value)
+		}
+	}
+	return root, root != ""
+}
+
+func parseServerRootFromApacheCtlOutput(output string) string {
+	re := regexp.MustCompile(`(?im)^ServerRoot:\s*["']?([^"'\r\n]+)`)
+	matches := re.FindStringSubmatch(output)
+	if len(matches) < 2 {
+		return ""
+	}
+	root := strings.TrimSpace(matches[1])
+	if !filepath.IsAbs(root) {
+		return ""
+	}
+	return filepath.Clean(root)
 }
 
 // getServerRootFromVersion 通过 httpd -V 输出解析 HTTPD_ROOT
@@ -230,8 +313,8 @@ func tokenizeCmdline(s string) []string {
 	return tokens
 }
 
-// hasRelativeCertPath 判断站点的证书/私钥/证书链路径是否存在相对路径
-func hasRelativeCertPath(site *Site) bool {
+// hasRelativeSitePath 判断站点中受 ServerRoot 影响的路径是否存在相对路径。
+func hasRelativeSitePath(site *Site) bool {
 	if site.CertificatePath != "" && !filepath.IsAbs(site.CertificatePath) {
 		return true
 	}
@@ -239,6 +322,9 @@ func hasRelativeCertPath(site *Site) bool {
 		return true
 	}
 	if site.ChainPath != "" && !filepath.IsAbs(site.ChainPath) {
+		return true
+	}
+	if site.Webroot != "" && !filepath.IsAbs(site.Webroot) {
 		return true
 	}
 	return false

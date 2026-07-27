@@ -3,6 +3,7 @@ package errors
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 )
 
@@ -240,28 +241,52 @@ func TestStructuredDeployError_Unwrap(t *testing.T) {
 	}
 }
 
-// TestStructuredDeployError_Retryable 测试可重试判断
-func TestStructuredDeployError_Retryable(t *testing.T) {
+// TestIsPermanentDeployError 测试永久性部署错误判定：
+// 只有绑定配置本身有问题才算永久，其余保持可重试交给 daemon 自愈
+func TestIsPermanentDeployError(t *testing.T) {
 	tests := []struct {
 		name      string
-		errType   DeployErrorType
-		retryable bool
+		err       error
+		permanent bool
 	}{
-		{"Network 可重试", DeployErrorNetwork, true},
-		{"Reload 可重试", DeployErrorReload, true},
-		{"Config 不可重试", DeployErrorConfig, false},
-		{"Permission 不可重试", DeployErrorPermission, false},
-		{"Validation 不可重试", DeployErrorValidation, false},
-		{"Unknown 不可重试", DeployErrorUnknown, false},
+		{"Docker 绑定校验失败 / 创建部署器失败", NewStructuredDeployError(DeployErrorConfig, PhaseWriteCert, "test", nil), true},
+		{"证书或私钥不匹配", NewStructuredDeployError(DeployErrorValidation, PhaseValidate, "test", nil), true},
+		// nginx -t 失败构造的正是 Config@test_config，是最典型的可修复情形，
+		// 若判为永久会把它直接禁用——恰是 P1-2 立项要解决的问题
+		{"配置测试失败", NewStructuredDeployError(DeployErrorConfig, PhaseTest, "test", nil), false},
+		{"回滚阶段创建部署器失败", NewStructuredDeployError(DeployErrorConfig, PhaseRollback, "test", nil), false},
+		{"重载失败", NewStructuredDeployError(DeployErrorReload, PhaseReload, "test", nil), false},
+		{"回滚重载失败", NewStructuredDeployError(DeployErrorReload, PhaseRollback, "test", nil), false},
+		{"权限错误（写证书）", NewStructuredDeployError(DeployErrorPermission, PhaseWriteCert, "test", nil), false},
+		{"权限错误（回滚）", NewStructuredDeployError(DeployErrorPermission, PhaseRollback, "test", nil), false},
+		{"部署失败且回滚失败", NewStructuredDeployError(DeployErrorUnknown, PhaseRollback, "test", nil), false},
+		{"网络错误", NewStructuredDeployError(DeployErrorNetwork, PhaseReload, "test", nil), false},
+		{"非结构化错误", errors.New("plain error"), false},
+		{"nil", nil, false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := NewStructuredDeployError(tt.errType, PhaseReload, "test", nil)
-			if err.Retryable() != tt.retryable {
-				t.Errorf("Retryable() = %v, 期望 %v", err.Retryable(), tt.retryable)
+			if got := IsPermanentDeployError(tt.err); got != tt.permanent {
+				t.Errorf("IsPermanentDeployError() = %v, 期望 %v", got, tt.permanent)
 			}
 		})
+	}
+}
+
+// TestIsPermanentDeployError_WrappedRootCause 判定必须穿透包裹层取根因。
+// 项 L：同一根因在"有备份"路径下被包了一层"部署失败（已回滚）"，
+// 分类结果不得因此改变。
+func TestIsPermanentDeployError_WrappedRootCause(t *testing.T) {
+	root := NewStructuredDeployError(DeployErrorConfig, PhaseWriteCert, "创建部署器失败", nil)
+	wrapped := fmt.Errorf("部署失败（已回滚）: %w", root)
+	if !IsPermanentDeployError(wrapped) {
+		t.Error("包裹后应仍判为永久性错误")
+	}
+
+	rootRetryable := NewStructuredDeployError(DeployErrorConfig, PhaseTest, "config test failed", nil)
+	if IsPermanentDeployError(fmt.Errorf("部署失败（已回滚）: %w", rootRetryable)) {
+		t.Error("包裹后不得把可重试错误判成永久")
 	}
 }
 

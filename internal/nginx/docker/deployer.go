@@ -13,13 +13,13 @@ import (
 
 // DeployerOptions 部署器选项
 type DeployerOptions struct {
-	CertPath         string // 容器内证书路径
-	KeyPath          string // 容器内私钥路径
-	HostCertPath     string // 宿主机证书路径（挂载卷模式）
-	HostKeyPath      string // 宿主机私钥路径
-	TestCommand      string // 容器内测试命令
-	ReloadCommand    string // 容器内重载命令
-	DeployMode       string // volume | copy | auto
+	CertPath      string // 容器内证书路径
+	KeyPath       string // 容器内私钥路径
+	HostCertPath  string // 宿主机证书路径（挂载卷模式）
+	HostKeyPath   string // 宿主机私钥路径
+	TestCommand   string // 容器内测试命令
+	ReloadCommand string // 容器内重载命令
+	DeployMode    string // volume | copy | auto
 }
 
 // Deployer Docker Nginx 部署器
@@ -363,4 +363,3 @@ func validateContainerPath(path string) error {
 	}
 	return nil
 }
-

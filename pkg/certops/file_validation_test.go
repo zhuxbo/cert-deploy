@@ -197,7 +197,7 @@ func TestCollectWebroots(t *testing.T) {
 		Bindings: []config.SiteBinding{
 			{Enabled: true, Paths: config.BindingPaths{Webroot: "/var/www/a"}},
 			{Enabled: true, Paths: config.BindingPaths{Webroot: "/var/www/b"}},
-			{Enabled: true, Paths: config.BindingPaths{Webroot: "/var/www/a"}}, // 重复
+			{Enabled: true, Paths: config.BindingPaths{Webroot: "/var/www/a"}},  // 重复
 			{Enabled: false, Paths: config.BindingPaths{Webroot: "/var/www/c"}}, // 禁用
 			{Enabled: true, Paths: config.BindingPaths{}},                       // 空 webroot
 		},

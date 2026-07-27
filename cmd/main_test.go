@@ -122,3 +122,91 @@ func TestCertHasSite(t *testing.T) {
 		t.Error("不应匹配 c.com")
 	}
 }
+
+func TestWebServerStatusSummary_DockerOnly(t *testing.T) {
+	cfg := &config.Config{
+		Certificates: []config.CertConfig{{
+			Enabled: true,
+			Bindings: []config.SiteBinding{{
+				ServerType: config.ServerTypeDockerNginx,
+				Enabled:    true,
+				Docker: &config.DockerInfo{
+					ContainerName: "1Panel-openresty-lqt4",
+				},
+			}},
+		}},
+	}
+
+	got := webServerStatusSummary("", cfg)
+	want := "docker-nginx（已配置，容器: 1Panel-openresty-lqt4）"
+	if got != want {
+		t.Fatalf("webServerStatusSummary() = %q, want %q", got, want)
+	}
+}
+
+func TestWebServerStatusSummary(t *testing.T) {
+	tests := []struct {
+		name  string
+		local string
+		cfg   *config.Config
+		want  string
+	}{
+		{
+			name:  "无检测结果且无配置",
+			local: "",
+			cfg:   nil,
+			want:  "未检测到",
+		},
+		{
+			name:  "宿主机检测结果保持原输出",
+			local: config.ServerTypeNginx,
+			cfg:   nil,
+			want:  config.ServerTypeNginx,
+		},
+		{
+			name:  "同一宿主机绑定不重复展示",
+			local: config.ServerTypeNginx,
+			cfg: &config.Config{Certificates: []config.CertConfig{{
+				Enabled: true,
+				Bindings: []config.SiteBinding{{
+					ServerType: config.ServerTypeNginx,
+					Enabled:    true,
+				}},
+			}}},
+			want: config.ServerTypeNginx,
+		},
+		{
+			name: "禁用绑定不作为当前配置展示",
+			cfg: &config.Config{Certificates: []config.CertConfig{{
+				Enabled: true,
+				Bindings: []config.SiteBinding{{
+					ServerType: config.ServerTypeDockerApache,
+					Enabled:    false,
+				}},
+			}}},
+			want: "未检测到",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := webServerStatusSummary(tt.local, tt.cfg); got != tt.want {
+				t.Fatalf("webServerStatusSummary() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDiagnosticCommandsHelp(t *testing.T) {
+	got := diagnosticCommandsHelp()
+	for _, command := range []string{
+		"sslctl status",
+		"systemctl status sslctl",
+		"journalctl -u sslctl -f",
+		"sc query sslctl",
+	} {
+		if !strings.Contains(got, command) {
+			t.Fatalf("diagnosticCommandsHelp() 未包含 %q：%q", command, got)
+		}
+	}
+}

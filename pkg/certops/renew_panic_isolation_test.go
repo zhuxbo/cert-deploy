@@ -2,6 +2,7 @@
 package certops
 
 import (
+	"context"
 	"fmt"
 	"net/http/httptest"
 	"os"
@@ -22,10 +23,10 @@ const panicServerType = "panic-server"
 // panicDeployer 部署即 panic 的测试部署器
 type panicDeployer struct{}
 
-func (p *panicDeployer) Deploy(_, _, _ string) error   { panic("deployer exploded") }
-func (p *panicDeployer) Reload() error                 { return nil }
-func (p *panicDeployer) Test() error                   { return nil }
-func (p *panicDeployer) Rollback(_, _, _ string) error { return nil }
+func (p *panicDeployer) Deploy(_ context.Context, _, _, _ string) error   { panic("deployer exploded") }
+func (p *panicDeployer) Reload(_ context.Context) error                   { return nil }
+func (p *panicDeployer) Test(_ context.Context) error                     { return nil }
+func (p *panicDeployer) Rollback(_ context.Context, _, _, _ string) error { return nil }
 
 func init() {
 	webserver.RegisterDeployer(webserver.ServerType(panicServerType), func(_, _, _, _, _ string) webserver.Deployer {

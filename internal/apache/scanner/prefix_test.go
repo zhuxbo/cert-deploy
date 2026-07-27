@@ -2,10 +2,88 @@ package scanner
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 
 	sslerrors "github.com/zhuxbo/sslctl/pkg/errors"
 )
+
+func TestServerRootFromConfigContent(t *testing.T) {
+	base := t.TempDir()
+	want := filepath.Join(base, "runtime")
+	content := "# ServerRoot /ignored\nServerRoot \"runtime\"\n"
+
+	got, ok := serverRootFromConfigContent(content, base)
+	if !ok || got != want {
+		t.Fatalf("serverRootFromConfigContent() = %q, %v，期望 %q, true", got, ok, want)
+	}
+}
+
+func TestApacheEffectiveServerRootOverridesDetectedRoot(t *testing.T) {
+	old := getPrefixOverride()
+	defer SetPrefixOverride(old)
+	SetPrefixOverride("")
+
+	s := New()
+	s.serverRoot = "/compiled/root"
+	s.setEffectiveServerRoot("/configured/root")
+
+	prefix, _, ok := s.getApachePrefix("")
+	if !ok || prefix != "/configured/root" {
+		t.Fatalf("getApachePrefix() = %q, %v，期望配置生效的 ServerRoot", prefix, ok)
+	}
+}
+
+func TestParseServerRootFromApacheCtlOutput(t *testing.T) {
+	output := "VirtualHost configuration:\nServerRoot: \"/runtime/apache\"\n"
+	if got := parseServerRootFromApacheCtlOutput(output); got != "/runtime/apache" {
+		t.Fatalf("parseServerRootFromApacheCtlOutput() = %q", got)
+	}
+}
+
+func TestApacheConfigServerRootResolvesRelativeSitePaths(t *testing.T) {
+	old := getPrefixOverride()
+	defer SetPrefixOverride(old)
+	SetPrefixOverride("")
+
+	dir := t.TempDir()
+	root := filepath.Join(dir, "apache-root")
+	configPath := filepath.Join(dir, "httpd.conf")
+	content := `ServerRoot "` + root + `"
+<VirtualHost *:443>
+    ServerName example.com
+    SSLEngine on
+    SSLCertificateFile ssl/cert.pem
+    SSLCertificateKeyFile ssl/key.pem
+    SSLCertificateChainFile ssl/chain.pem
+    DocumentRoot htdocs
+</VirtualHost>
+`
+	if err := os.WriteFile(configPath, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	s := NewWithConfig(configPath)
+	s.prepareServerRoot(configPath)
+	sites, err := s.scanAllConfigFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sites, err = s.resolveSitePaths(sites)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sites) != 1 {
+		t.Fatalf("站点数 = %d", len(sites))
+	}
+	if sites[0].CertificatePath != filepath.Join(root, "ssl/cert.pem") ||
+		sites[0].PrivateKeyPath != filepath.Join(root, "ssl/key.pem") ||
+		sites[0].ChainPath != filepath.Join(root, "ssl/chain.pem") ||
+		sites[0].Webroot != filepath.Join(root, "htdocs") {
+		t.Fatalf("相对路径解析错误: %+v", sites[0])
+	}
+}
 
 func TestApacheTokenizeCmdline(t *testing.T) {
 	tests := []struct {
@@ -89,7 +167,7 @@ func TestApachePrefixFromScannerServerRoot(t *testing.T) {
 	}
 }
 
-func TestApacheHasRelativeCertPath(t *testing.T) {
+func TestApacheHasRelativeSitePath(t *testing.T) {
 	tests := []struct {
 		name string
 		site *Site
@@ -99,12 +177,13 @@ func TestApacheHasRelativeCertPath(t *testing.T) {
 		{"相对证书", &Site{CertificatePath: "cert/a"}, true},
 		{"相对私钥", &Site{PrivateKeyPath: "cert/b"}, true},
 		{"相对 chain", &Site{ChainPath: "cert/c"}, true},
+		{"相对 Webroot", &Site{Webroot: "htdocs"}, true},
 		{"全空", &Site{}, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := hasRelativeCertPath(tt.site); got != tt.want {
-				t.Errorf("hasRelativeCertPath() = %v, want %v", got, tt.want)
+			if got := hasRelativeSitePath(tt.site); got != tt.want {
+				t.Errorf("hasRelativeSitePath() = %v, want %v", got, tt.want)
 			}
 		})
 	}

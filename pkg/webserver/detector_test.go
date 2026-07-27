@@ -187,7 +187,7 @@ func TestDetectDockerServer_InputValidation(t *testing.T) {
 		{"包含换行符", "my\ncontainer", TypeUnknown},
 		{"包含 tab", "my\tcontainer", TypeUnknown},
 		{"包含中文", "我的容器", TypeUnknown},
-		{"合法的短 ID", "abc123", TypeUnknown},                   // 格式合法但容器不存在
+		{"合法的短 ID", "abc123", TypeUnknown},                    // 格式合法但容器不存在
 		{"合法的完整 ID", "abc123def456789012345678", TypeUnknown}, // 格式合法但容器不存在
 		{"合法的容器名（含下划线）", "my_container", TypeUnknown},
 		{"合法的容器名（含短横线）", "my-container", TypeUnknown},
@@ -222,7 +222,10 @@ func TestDetectDockerServer_BoundaryLength(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			id := strings.Repeat("a", tt.length)
+			// 必须用非十六进制字符：Docker 按 ID 前缀匹配，用 "a" 造的短 ID
+			// 会命中宿主机上任何 ID 以 a 开头的真实容器，使本用例随环境变红。
+			// 容器名匹配要求完全相等、不做前缀，因此 "z" 串不会误命中。
+			id := strings.Repeat("z", tt.length)
 			got := DetectDockerServer(id)
 			// 所有用例都应返回 TypeUnknown（非法输入被拒绝，合法输入但容器不存在）
 			if got != TypeUnknown {
@@ -517,6 +520,11 @@ func TestDetectDockerCommands(t *testing.T) {
 		{"docker-nginx", TypeDockerNginx, "my-nginx", "docker exec my-nginx nginx -t", "docker exec my-nginx nginx -s reload"},
 		{"docker-apache", TypeDockerApache, "web_1", "docker exec web_1 apachectl -t", "docker exec web_1 apachectl graceful"},
 		{"空容器名返回空命令", TypeDockerNginx, "", "", ""},
+		// 非法容器名在构建时就返回空命令，而不是拼成命令后在执行期被 executor 白名单拒绝
+		// （那样错误指向"白名单"，掩盖了容器名非法这个真实原因）
+		{"含空格的容器名", TypeDockerNginx, "my nginx", "", ""},
+		{"以连字符开头的容器名", TypeDockerNginx, "-rm", "", ""},
+		{"含分号的容器名", TypeDockerNginx, "web;rm", "", ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

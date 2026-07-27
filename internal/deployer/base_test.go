@@ -1,6 +1,7 @@
 package deployer
 
 import (
+	"context"
 	"errors"
 	"runtime"
 	"strings"
@@ -14,14 +15,14 @@ import (
 func TestReloadService_WinSvcSentinel(t *testing.T) {
 	called := ""
 	orig := restartWindowsServiceFunc
-	restartWindowsServiceFunc = func(name string) error {
+	restartWindowsServiceFunc = func(_ context.Context, name string) error {
 		called = name
 		return nil
 	}
 	defer func() { restartWindowsServiceFunc = orig }()
 
 	b := &Base{ReloadCommand: webserver.WinSvcReloadPrefix + "nginx"}
-	if err := b.ReloadService(); err != nil {
+	if err := b.ReloadService(context.Background()); err != nil {
 		t.Fatalf("ReloadService 返回错误: %v", err)
 	}
 	if called != "nginx" {
@@ -33,11 +34,11 @@ func TestReloadService_WinSvcSentinel(t *testing.T) {
 func TestReloadService_WinSvcSentinelError(t *testing.T) {
 	wantErr := errors.New("scm boom")
 	orig := restartWindowsServiceFunc
-	restartWindowsServiceFunc = func(_ string) error { return wantErr }
+	restartWindowsServiceFunc = func(_ context.Context, _ string) error { return wantErr }
 	defer func() { restartWindowsServiceFunc = orig }()
 
 	b := &Base{ReloadCommand: webserver.WinSvcReloadPrefix + "Apache2.4"}
-	err := b.ReloadService()
+	err := b.ReloadService(context.Background())
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("err = %v, 期望 wrap %v", err, wantErr)
 	}
@@ -46,13 +47,13 @@ func TestReloadService_WinSvcSentinelError(t *testing.T) {
 // TestReloadService_WinSvcFallbackSuccess 验证 SCM 失败但 fallback 命令成功时返回 nil。
 func TestReloadService_WinSvcFallbackSuccess(t *testing.T) {
 	origSvc := restartWindowsServiceFunc
-	restartWindowsServiceFunc = func(_ string) error { return errors.New("scm failed") }
+	restartWindowsServiceFunc = func(_ context.Context, _ string) error { return errors.New("scm failed") }
 	defer func() { restartWindowsServiceFunc = origSvc }()
 
 	origFallback := reloadFallbackCommandFunc
 	var receivedCmd string
 	var receivedPrev error
-	reloadFallbackCommandFunc = func(cmd string, prev error) error {
+	reloadFallbackCommandFunc = func(_ context.Context, cmd string, prev error) error {
 		receivedCmd = cmd
 		receivedPrev = prev
 		return nil
@@ -60,7 +61,7 @@ func TestReloadService_WinSvcFallbackSuccess(t *testing.T) {
 	defer func() { reloadFallbackCommandFunc = origFallback }()
 
 	b := &Base{ReloadCommand: webserver.WinSvcReloadPrefix + "nginx" + webserver.WinSvcFallbackSep + `C:\nginx\nginx.exe -s reload`}
-	if err := b.ReloadService(); err != nil {
+	if err := b.ReloadService(context.Background()); err != nil {
 		t.Fatalf("ReloadService 返回错误: %v", err)
 	}
 	if receivedCmd != `C:\nginx\nginx.exe -s reload` {
@@ -76,18 +77,18 @@ func TestReloadService_WinSvcFallbackSuccess(t *testing.T) {
 func TestReloadService_WinSvcFallbackBothFail(t *testing.T) {
 	origSvc := restartWindowsServiceFunc
 	scmErr := errors.New("scm cannot find binary")
-	restartWindowsServiceFunc = func(_ string) error { return scmErr }
+	restartWindowsServiceFunc = func(_ context.Context, _ string) error { return scmErr }
 	defer func() { restartWindowsServiceFunc = origSvc }()
 
 	origFallback := reloadFallbackCommandFunc
 	fallbackErr := errors.New("nginx reload failed")
-	reloadFallbackCommandFunc = func(_ string, _ error) error {
+	reloadFallbackCommandFunc = func(_ context.Context, _ string, _ error) error {
 		return fallbackErr
 	}
 	defer func() { reloadFallbackCommandFunc = origFallback }()
 
 	b := &Base{ReloadCommand: webserver.WinSvcReloadPrefix + "nginx" + webserver.WinSvcFallbackSep + `nginx -s reload`}
-	err := b.ReloadService()
+	err := b.ReloadService(context.Background())
 	if err == nil {
 		t.Fatal("期望返回错误")
 	}
@@ -100,14 +101,14 @@ func TestReloadService_WinSvcFallbackBothFail(t *testing.T) {
 func TestReloadService_WinSvcOldFormatCompat(t *testing.T) {
 	called := ""
 	orig := restartWindowsServiceFunc
-	restartWindowsServiceFunc = func(name string) error {
+	restartWindowsServiceFunc = func(_ context.Context, name string) error {
 		called = name
 		return nil
 	}
 	defer func() { restartWindowsServiceFunc = orig }()
 
 	b := &Base{ReloadCommand: webserver.WinSvcReloadPrefix + "Apache2.4"}
-	if err := b.ReloadService(); err != nil {
+	if err := b.ReloadService(context.Background()); err != nil {
 		t.Fatalf("旧格式应可用: %v", err)
 	}
 	if called != "Apache2.4" {

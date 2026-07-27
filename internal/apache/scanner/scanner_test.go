@@ -2098,7 +2098,6 @@ func TestScanAll_WithInclude(t *testing.T) {
 	}
 }
 
-
 func TestParseApacheDArg(t *testing.T) {
 	cases := []struct {
 		name string

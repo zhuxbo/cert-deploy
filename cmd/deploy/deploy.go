@@ -96,7 +96,7 @@ func Run(args []string, version, buildTime string, debug bool) {
 	}
 
 	ctx := context.Background()
-	f := fetcher.New(30 * time.Second)
+	f := fetcher.New()
 	backupMgr := backup.NewManager(cfgManager.GetBackupDir(), 5)
 
 	if *all {
@@ -186,7 +186,7 @@ func fetchAndDeployCert(ctx context.Context, cfgManager *config.ConfigManager, c
 		fmt.Printf("  证书名称修正: %s -> %s\n", oldCertName, cert.CertName)
 	}
 
-	if certData.Status != "active" || certData.Cert == "" {
+	if certData.Status != config.OrderStatusActive || certData.Cert == "" {
 		return fmt.Errorf("证书未就绪: status=%s", certData.Status)
 	}
 
@@ -229,7 +229,7 @@ func fetchAndDeployCert(ctx context.Context, cfgManager *config.ConfigManager, c
 		return cfgManager.UpdateCert(cert)
 	}
 
-	successCount, deployErr := deployToBindings(cert.Bindings, certData, privateKey, backupMgr, log)
+	successCount, failedNames, deployErr := deployToBindings(ctx, cert, certData, privateKey, backupMgr, log)
 
 	// 仅在至少有一个绑定部署成功时才更新元数据
 	if successCount > 0 {
@@ -238,19 +238,73 @@ func fetchAndDeployCert(ctx context.Context, cfgManager *config.ConfigManager, c
 		cert.Metadata.CertSerial = fmt.Sprintf("%X", parsedCert.SerialNumber)
 		// 部署成功后补转正 pending 私钥（若本次使用的正是 pending 私钥）
 		certops.CommitPendingKeyIfMatches(cfgManager.GetWorkDir(), cert, privateKey, log)
+		// 人工修复后必须解除停机状态：此前 CAPPED 的证书手动部署成功后仍会永久静默，
+		// 因为 last_issue_state 与计数从未被清理。
+		cert.Metadata.LastIssueState = ""
+		cert.Metadata.CappedPhase = ""
+		cert.Metadata.IssueRetryCount = 0
+		cert.Metadata.DeployAttemptCount = 0
+		cert.Metadata.DeployStartedAt = time.Time{}
+		cert.Metadata.RetryAttemptCount = 0
+		// 无进展计时同样解除：手动部署成功本身就是最强的进展信号
+		cert.Metadata.NoProgressSince = time.Time{}
+	}
+	// 失败绑定原样记录（不是清空）：清空会让 daemon 不再接手仍失败的站点，
+	// 制造"手动部署部分成功 → 剩下的永远没人管"的新洞
+	cert.Metadata.FailedBindings = failedNames
+	if len(failedNames) > 0 {
+		if cert.Metadata.FailedBindingsAt.IsZero() {
+			cert.Metadata.FailedBindingsAt = time.Now()
+		}
+	} else {
+		cert.Metadata.FailedBindingsAt = time.Time{}
 	}
 
 	if err := cfgManager.UpdateCert(cert); err != nil {
 		return err
 	}
+
+	// 上报部署结果（deploy-spec §5.1 步骤 6）：此前手动 deploy 全链不发回调，
+	// 服务端会一直停留在最后一次 failure 上，直到下个续签窗口。
+	sendDeployResultCallback(ctx, cfgManager, cert, api, f, deployErr, log)
 	return deployErr
+}
+
+// sendDeployResultCallback 上报一次手动部署结果（非关键路径，失败仅记日志）。
+// CLI 的 ctx 无 deadline，显式限定预算，避免部署已成功却让命令再挂几分钟。
+func sendDeployResultCallback(ctx context.Context, cfgManager *config.ConfigManager, cert *config.CertConfig,
+	api config.APIConfig, f *fetcher.Fetcher, deployErr error, log *logger.Logger) {
+	req := &fetcher.CallbackRequest{
+		OrderID:    cert.OrderID,
+		Status:     "success",
+		DeployedAt: time.Now().Format(time.RFC3339),
+	}
+	if deployErr != nil {
+		req.Status = "failure"
+		req.Message = certops.CallbackMessage(deployErr)
+	}
+
+	cbCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), certops.CallbackFallbackBudget)
+	defer cancel()
+
+	renewBeforeDays, err := f.CallbackNew(cbCtx, api.URL, api.Token, req)
+	if err != nil {
+		if log != nil {
+			log.Warn("上报部署结果失败（不影响部署结果）: %v", err)
+		}
+		return
+	}
+	applyDeployRenewBeforeDays(cfgManager, log, renewBeforeDays)
 }
 
 // deployToBindings 部署全部启用绑定；只要有一个绑定失败就返回错误，
 // 便于脚本调用方通过退出码识别部分失败，同时不影响其他绑定继续部署。
-func deployToBindings(bindings []config.SiteBinding, certData *fetcher.CertData, privateKey string, backupMgr *backup.Manager, log *logger.Logger) (int, error) {
+// 返回成功数、仍失败的站点名（供 FailedBindings 记录）与聚合错误。
+func deployToBindings(ctx context.Context, cert *config.CertConfig, certData *fetcher.CertData, privateKey string, backupMgr *backup.Manager, log *logger.Logger) (int, []string, error) {
 	successCount := 0
 	failedSites := make([]string, 0)
+	failedNames := make([]string, 0)
+	bindings := cert.Bindings
 	for i := range bindings {
 		binding := &bindings[i]
 		if !binding.Enabled {
@@ -258,19 +312,21 @@ func deployToBindings(bindings []config.SiteBinding, certData *fetcher.CertData,
 		}
 
 		fmt.Printf("  部署到: %s\n", binding.ServerName)
-		if err := deployToBinding(binding, certData, privateKey, backupMgr, log); err != nil {
+		if err := deployToBinding(ctx, binding, certData, privateKey, backupMgr, log); err != nil {
 			fmt.Printf("    失败: %v\n", err)
 			failedSites = append(failedSites, fmt.Sprintf("%s: %v", binding.ServerName, err))
+			failedNames = append(failedNames, binding.ServerName)
 			continue
 		}
+		certops.ClearStaleBinding(cert, binding.ServerName)
 		fmt.Printf("    成功\n")
 		successCount++
 	}
 
 	if len(failedSites) > 0 {
-		return successCount, fmt.Errorf("%d 个站点部署失败: %s", len(failedSites), strings.Join(failedSites, "; "))
+		return successCount, failedNames, fmt.Errorf("%d 个站点部署失败: %s", len(failedSites), strings.Join(failedSites, "; "))
 	}
-	return successCount, nil
+	return successCount, failedNames, nil
 }
 
 func applyDeployRenewBeforeDays(cm *config.ConfigManager, log *logger.Logger, value int) {
@@ -286,7 +342,7 @@ func applyDeployRenewBeforeDays(cm *config.ConfigManager, log *logger.Logger, va
 }
 
 // deployToBinding 部署到绑定（带备份和回滚）
-func deployToBinding(binding *config.SiteBinding, certData *fetcher.CertData, privateKey string, backupMgr *backup.Manager, log *logger.Logger) error {
+func deployToBinding(ctx context.Context, binding *config.SiteBinding, certData *fetcher.CertData, privateKey string, backupMgr *backup.Manager, log *logger.Logger) error {
 	// Docker 站点：校验可安全部署（挂载卷模式 + 容器重载命令），否则如实报错而非静默成功
 	if config.IsDockerType(binding.ServerType) {
 		if err := config.ValidateDockerBinding(binding); err != nil {
@@ -326,13 +382,17 @@ func deployToBinding(binding *config.SiteBinding, certData *fetcher.CertData, pr
 		return fmt.Errorf("创建部署器失败: %w", err)
 	}
 
-	deployErr := deployer.Deploy(certData.Cert, certData.IntermediateCert, privateKey)
+	deployErr := deployer.Deploy(ctx, certData.Cert, certData.IntermediateCert, privateKey)
 
 	// 部署失败时回滚
 	if deployErr != nil && backupPath != "" {
 		log.Warn("部署失败，尝试回滚: %v", deployErr)
 		certPath, keyPath, chainPath := backupMgr.GetBackupPathsWithChain(backupPath)
-		rollbackErr := deployer.Rollback(certPath, keyPath, chainPath)
+		// 回滚脱离取消传播：部署失败常常正是 ctx 被取消所致，
+		// 沿用同一个 ctx 会让兜底回滚当场失败、服务停在坏状态
+		rbCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), certops.RollbackBudget)
+		rollbackErr := deployer.Rollback(rbCtx, certPath, keyPath, chainPath)
+		cancel()
 		if rollbackErr != nil {
 			log.Error("回滚失败: %v", rollbackErr)
 			return fmt.Errorf("部署失败且回滚失败: deploy=%v, rollback=%v", deployErr, rollbackErr)
@@ -445,7 +505,7 @@ func installSSLForSite(ctx context.Context, site *config.ScannedSite, binding *c
 		return fmt.Errorf("获取证书失败: %w", err)
 	}
 	applyDeployRenewBeforeDays(cfgManager, nil, renewBeforeDays)
-	if certData.Status != "active" || certData.Cert == "" {
+	if certData.Status != config.OrderStatusActive || certData.Cert == "" {
 		return fmt.Errorf("证书未就绪: status=%s", certData.Status)
 	}
 
@@ -666,7 +726,8 @@ func runLocal(args []string, debug bool) {
 	}
 
 	backupMgr := backup.NewManager(cfgManager.GetBackupDir(), 5)
-	if err := deployToBinding(binding, certDataStruct, keyPEM, backupMgr, log); err != nil {
+	// CLI 单次操作：无上游 deadline，由 executor 的单命令上限兜底
+	if err := deployToBinding(context.Background(), binding, certDataStruct, keyPEM, backupMgr, log); err != nil {
 		fmt.Fprintf(os.Stderr, "部署失败: %v\n", err)
 		os.Exit(1)
 	}

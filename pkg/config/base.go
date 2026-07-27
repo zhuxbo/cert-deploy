@@ -100,13 +100,96 @@ const (
 
 // 触顶阶段常量（metadata.capped_phase 取值）
 const (
-	CappedPhaseIssue  = "issue"  // 签发计数触顶
-	CappedPhaseDeploy = "deploy" // 部署计数触顶
-	CappedPhaseLegacy = "legacy" // 旧混合计数升级即触顶
+	CappedPhaseIssue   = "issue"   // 签发计数触顶
+	CappedPhaseDeploy  = "deploy"  // 部署计数触顶
+	CappedPhaseStalled = "stalled" // 无进展时限触顶（停更，deploy-spec §3.2）
+	CappedPhaseLegacy  = "legacy"  // 旧混合计数升级即触顶
 )
+
+// 服务端订单状态取值（CertData.status，deploy-spec §2.4）。
+// 服务端枚举共 12 个，客户端必须显式分类——用 default 兜底会把
+// unpaid / cancelling 这类可自愈的中间态误判为终态并停止推进。
+const (
+	OrderStatusUnpaid     = "unpaid"     // 未支付（服务端 update 会自动推进；孤儿单由服务端 60 分钟清理）
+	OrderStatusPending    = "pending"    // 已收到 CSR，待提交上游
+	OrderStatusProcessing = "processing" // 签发处理中
+	OrderStatusApproving  = "approving"  // processing 与 active 之间的短暂中间态
+	OrderStatusActive     = "active"     // 已签发
+	OrderStatusFailed     = "failed"     // CA 拒签，终态
+	OrderStatusCancelling = "cancelling" // 取消中（过渡态，将转 cancelled）
+	OrderStatusCancelled  = "cancelled"  // 已取消，终态
+	OrderStatusRevoked    = "revoked"    // 已吊销，终态
+	OrderStatusRenewed    = "renewed"    // 已被续费替代（服务端自动跟链，收到即数据异常）
+	OrderStatusReissued   = "reissued"   // 已被重签替代（同上）
+	OrderStatusExpired    = "expired"    // 已过期，终态
+)
+
+// OrderStatusClass 订单状态的客户端处置类别
+type OrderStatusClass int
+
+const (
+	// OrderClassActive 已签发，可部署
+	OrderClassActive OrderStatusClass = iota
+	// OrderClassWaiting 在途等待：只 GET 查询、不计数、不重复提交，计入无进展计时。
+	// 含 unpaid / cancelling——它们不是终态，服务端会自行推进或清理，
+	// 客户端**不主动 POST 推进**（update 会触发 pay 扣费，涉及资金的动作不由客户端自动发起）。
+	OrderClassWaiting
+	// OrderClassTerminal 真终态：持久化后停止自动动作，等待人工处理
+	OrderClassTerminal
+	// OrderClassChainAnomaly 链式状态：服务端 resolveRenewedOrder 会自动跟随续费/重签链，
+	// 客户端收到即说明链数据异常（断链或成环），按终态处置并显式告警
+	OrderClassChainAnomaly
+	// OrderClassUnknown 服务端新增的未知状态：保守当等待，由无进展时限兜底。
+	// 反向（当终态）会让一个新增的中间态把所有证书打进停机。
+	OrderClassUnknown
+)
+
+// ClassifyOrderStatus 归类服务端订单状态（deploy-spec §2.4/§3.4/§3.5）
+func ClassifyOrderStatus(status string) OrderStatusClass {
+	switch status {
+	case OrderStatusActive:
+		return OrderClassActive
+	case OrderStatusPending, OrderStatusProcessing, OrderStatusApproving,
+		OrderStatusUnpaid, OrderStatusCancelling:
+		return OrderClassWaiting
+	case OrderStatusFailed, OrderStatusCancelled, OrderStatusRevoked, OrderStatusExpired:
+		return OrderClassTerminal
+	case OrderStatusRenewed, OrderStatusReissued:
+		return OrderClassChainAnomaly
+	default:
+		return OrderClassUnknown
+	}
+}
 
 // AttemptCap 签发/部署尝试上限（deploy-spec §3.2/§11）：分别计数，各自 >= 10 触顶。
 const AttemptCap = 10
+
+// MaxNoProgressDays 无进展时限（deploy-spec §3.2/§11）：纯 GET 轮询的绝对边界。
+// 轮询不计入尝试计数，到期闸门在到期时间未知时失效，故需要独立时限。
+const MaxNoProgressDays = 14
+
+// MaxBlockReportCount 环境阻断上报上限（deploy-spec §2.8/§11）：超出转静默。
+//
+// 阻断按设计不递增部署尝试计数（修好即自动恢复，不必人工解除 CAPPED），
+// 于是若无此上限，整条阻断回调路径就没有任何边界——「原因未变化才不上报」这一道
+// 抑制并不足够：原因串含 PID / 路径 / 异常文本等可变内容时每轮都算"变化"，
+// 环境好坏抖动时每次复发也会重新触发。环境恢复时清零：恢复过就是新一轮故障，
+// 应当重新获得完整的上报额度。
+const MaxBlockReportCount = 10
+
+// CertUnchangedRounds 证书未更替的容忍轮数：连续该轮数返回同一张证书即升级为失败。
+//
+// 取 2 而非 1：单轮相同可能是上一轮部分失败后的正常补部署——失败站点次日重试时，
+// 用的必然还是同一张证书。
+const CertUnchangedRounds = 2
+
+// ClockSanityMaxDays 无进展计时的时钟合理上限（deploy-spec §11）。
+//
+// 不是「允许停滞的预算」而是时间差的可信度判据：每日检查下计时走到第 14 天即已停更，
+// 自然流逝到不了这个值——超过它只可能是 daemon 长期停摆刚恢复（期间服务端状态可能
+// 已变化，应重查而非停更），或时钟跳变（如设备重启后 NTP 同步前锚定了 1970/2000 年）。
+// 两者的保守方向都是重新锚定。该值与证书生命周期正交，证书周期缩短不影响其语义。
+const ClockSanityMaxDays = 60
 
 // ContainsIPDomain 判断域名列表是否包含 IP 地址（SAN 含 IP）。
 // 复用 net.ParseIP 精确判断，IPv4/IPv6 均识别。

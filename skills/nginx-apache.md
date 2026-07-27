@@ -38,41 +38,47 @@ server {
 
 四个解析函数（`parseConfigFile`、`parseHTTPConfigFile`、`parseAllConfigFile`、`scanWithNginxT`）共用统一的 `parseServerBlocks()` 引擎，通过 `parseOptions` 参数化差异（如 nginx -T 模式的文件跟踪）。正则表达式在包级别编译一次。
 
-### 相对路径 prefix 解析（nginx 与 Apache 统一机制）
+### 相对路径解析
 
-Web 服务器配置里的相对路径（nginx `ssl_certificate cert/xxx.pem`、Apache `SSLCertificateFile ssl/xxx.crt`）的解析基准由**进程启动时的 CWD / 命令行参数 / 编译时 prefix** 决定，跟配置文件自身所在目录无必然关系。面板类启动器常导致与直觉不符：
+Web 服务器配置里的相对路径必须按具体指令区分基准，不能统一按进程 CWD 或当前被包含文件目录拼接：
 
-- nginx：基准 = nginx `prefix`（`nginx -p <path>` / 编译时 `--prefix=<path>` / CWD）
-- Apache：基准 = `ServerRoot`（`httpd -d <path>` / 编译时 `HTTPD_ROOT` / CWD）
+- nginx 的 `ssl_certificate`、`ssl_certificate_key` 与 `include`：基准 = 实际主 `nginx.conf` 所在目录（configuration prefix）。默认布局的主配置为 `<prefix>/conf/nginx.conf`，因此 `ssl/cert.pem` 通常解析为 `<prefix>/conf/ssl/cert.pem`；若通过 `-c /custom/nginx.conf` 启动，则解析为 `/custom/ssl/cert.pem`。被 include 文件中的相对路径仍以主 `nginx.conf` 目录为准。
+- nginx 的 `root` 等普通路径：基准 = nginx `prefix`（`nginx -p <path>` / 编译时 `--prefix=<path>` / CWD）。
+- Apache 的证书路径、`DocumentRoot` 与 `Include`：基准 = 最终有效的 `ServerRoot`。`httpd -d <path>` 或编译时 `HTTPD_ROOT` 提供初始值，主配置中的 `ServerRoot` 指令可以覆盖；配置文件位于 `conf/` 并不意味着相对路径自动基于 `conf/`。
 
-扫描器必须探测出真实 prefix，才能把相对路径转成绝对路径写入配置，否则证书会被写到错位置导致**静默失败**（部署"成功"但 nginx/Apache 读的仍是旧证书）。
+扫描器必须探测实际主配置路径及所需 prefix，按指令分别转成绝对路径，否则证书会被写到错位置导致**静默失败**（部署"成功"但 nginx/Apache 读的仍是旧证书）。
 
-#### nginx 探测链（`internal/nginx/scanner/scanner.go::getNginxPrefix`）
+#### nginx 主配置与普通 prefix 探测
+
+证书、私钥和 include 使用 `DetectNginx()` 得到的实际主配置路径，优先读取 `nginx -t` 输出，再读取 `nginx -V --conf-path`，最后检查默认位置；`nginx -T` 扫描从同一次输出记录实际主配置路径。`NewWithConfig()` 的显式路径直接作为主配置。
+
+`root` 等普通路径的 prefix 由 `internal/nginx/scanner/scanner.go::getNginxPrefix` 按以下顺序探测：
 
 1. `SetPrefixOverride()` 显式 override（CLI `--nginx-prefix`，仅当前进程内存生效，不写配置）
 2. `nginx -V` 解析 `--prefix=`（Linux 常见发行版走这条）
 3. Windows 上 `Get-CimInstance Win32_Process` 读运行进程命令行的 `-p`
 4. Windows `logs/error.log` 启发式（`<nginx_dir>` vs `<nginx_dir>\conf`）
-5. 全失败 → 返回 `*sslerrors.PrefixUnknownError{ServerKind: Nginx}`
+5. 全失败 → 普通相对路径保持原值，不影响已经准确解析的证书和私钥路径
 
 #### Apache 探测链（`internal/apache/scanner/prefix.go::(*Scanner).getApachePrefix`）
 
 1. `SetPrefixOverride()` 显式 override（CLI `--apache-prefix`）
-2. `Scanner.serverRoot`（`DetectApache` 已从 `httpd -V` 读到的 `HTTPD_ROOT`）
-3. `getServerRootFromVersion()`—再跑一次 `httpd -V` 解析 `HTTPD_ROOT`，覆盖 `scanWithApacheCtl` 跳过 `DetectApache` 的场景
-4. `getServerRootFromProcessCmdline()`—运行进程命令行的 `-d` 参数（Linux 读 `/proc/<pid>/cmdline`，Windows 读 `Get-CimInstance`）
-5. Windows `logs/error.log`（以及 `error_log` 无扩展名变体）启发式
-6. 全失败 → 返回 `*sslerrors.PrefixUnknownError{ServerKind: Apache}`
+2. 主配置 `ServerRoot` 指令或 `apachectl -S` 输出的最终有效值
+3. `getServerRootFromProcessCmdline()`—运行进程命令行的 `-d` 参数（Linux 读 `/proc/<pid>/cmdline`，Windows 读 `Get-CimInstance`）
+4. `Scanner.serverRoot`（`DetectApache` 已从 `httpd -V` 读到的编译期 `HTTPD_ROOT`）
+5. `getServerRootFromVersion()`—再跑一次 `httpd -V` 解析 `HTTPD_ROOT`
+6. Windows `logs/error.log`（以及 `error_log` 无扩展名变体）启发式
+7. 全失败 → 返回 `*sslerrors.PrefixUnknownError{ServerKind: Apache}`
 
 #### 共用约束
 
-- 只有 `ssl_certificate`/`ssl_certificate_key`/`SSLCertificateFile`/`SSLCertificateKeyFile`/`SSLCertificateChainFile` 出现相对路径时才触发阻断；绝对路径站点继续正常处理
-- `PrefixUnknownError` 必须穿透 `nginxScannerAdapter.Scan`、`apacheScannerAdapter.Scan`、`certops.ScanSites` 三层（全部用 `errors.As` 检查），避免被 Docker 成功结果或另一个服务器类型的扫描掩盖
-- CLI 层（`cmd/setup/setup.go::scanSites`、`cmd/main.go::runScan`）捕获错误后调用 `err.RenderHint()` 打印给用户并退出非零码
-- 推荐用户把配置里相对路径改成绝对路径后重跑，根治歧义；`--nginx-prefix` / `--apache-prefix` 只是临时逃生口，不持久化到 config.json
-- 渲染文本根据 `ServerKind` 分支：指令名（`ssl_certificate` vs `SSLCertificateFile`）、验证命令（`nginx -t` vs `apachectl configtest`）、flag 名都不一样；格式由 `pkg/errors/scan.go::RenderHint` 控制，有测试锁定必含段落
-- Nginx `ScanAll` 遇 `PrefixUnknownError` 不回退到文件扫描（回退会丢失错误信息），直接向上抛；文件扫描路径末尾同样经过 `resolveSitePaths` 统一处理
+- nginx 证书相对路径由主配置目录确定，不依赖普通 prefix；Apache 证书相对路径在 `ServerRoot` 无法确定时触发阻断，绝对路径站点继续正常处理
+- Apache 的 `PrefixUnknownError` 必须穿透 scanner adapter 与 `certops.ScanSites`（用 `errors.As` 检查），避免被另一个服务器类型的扫描结果掩盖
+- CLI 层捕获 `PrefixUnknownError` 后调用 `err.RenderHint()` 打印修复指引并退出非零码
+- `--nginx-prefix` 只覆盖 nginx 普通路径的 prefix，不改变证书、私钥和 include 的 configuration prefix；`--apache-prefix` 临时覆盖 Apache ServerRoot，均不持久化到 config.json
+- Nginx 的 `nginx -T` 与文件扫描路径末尾都经过 `resolveSitePaths`，使用同一主配置目录语义
 - Apache `ScanAll` 两条路径（`apachectl -S` 和文件扫描）末尾都经过 `resolveSitePaths`
+- Apache Docker 扫描先按最终 `ServerRoot` 把证书、私钥、证书链和 `DocumentRoot` 转成容器内绝对路径，再匹配挂载并转换成宿主机路径
 
 ### 重载服务
 
@@ -213,18 +219,18 @@ chown root:root /opt/sslctl/certs/
 setup 流程为**未启用 SSL** 的站点安装 HTTPS 配置（需用户确认），备份原配置、配置测试失败自动回滚。
 
 - 支持 `server\n{` 多行格式；SSL 指令仅插入 server 块顶层，兼容 `root` 写在 `location` 内的 SPA / 反代配置。
-- **nginx**：仅向 `server_name` 匹配目标站点、且尚未配置 SSL 的 `:80` 块注入证书（已配 SSL 的块跳过防 duplicate listen）。"已配置 SSL"检测与注入共用同一匹配谓词（lower + 通配符），避免同文件多域名块被统一注入。
+- **nginx**：先按 nginx 自身的名字优先级选出服务目标站点的**唯一** server 块（`selectTargetBlock`：精确名优先于通配符名），再只向该块注入。匹配必须是单向的——"块的 `server_name` 覆盖目标域名"，反向不成立；双向匹配会把目标站点的证书一并写进 `*.example.com` 块，使通配符站点被换上只覆盖单域名的证书、其余子域名 HTTPS 证书不匹配。同优先级内已配 SSL 的块优先选中，使常见的"`:80` 跳转块 + `:443 ssl` 块"同名布局判定为"已有 HTTPS"而不产生 duplicate listen 443。"已配置 SSL"检测（`hasSSLConfig`）与注入基于同一选块结果，两趟解析共用 `scanServerBlocks` 的块编号，不各自重复判定。
 - **Apache**：生成 `:443` VirtualHost 时按地址 token 精确替换端口，仅端口恰为 80 才换，`*:8080` 等自定义端口不受污染。
 
 ### 安装器失败语义
 
 - SSL 配置安装失败的绑定标记 `Enabled=false` 后跳过部署并计入失败（单证书与批量模式一致），不误报"部署成功"。
-- nginx 安装器在非 80 端口 / 无可处理 HTTP server 块时返回明确错误而非静默跳过，与 Apache 一致；安装器"无可注入块"必须报错而非返回 `Modified=false`。
+- nginx 安装器在非 80 端口 / 无可处理 HTTP server 块时返回明确错误而非静默跳过，与 Apache 一致；安装器"无可注入块"必须报错而非返回 `Modified=false`。判定只看**选中的目标块**是否已配 SSL：同域族的其他块（如通配符块）已有 SSL 不得让目标站点短路成"无需安装"，否则 setup/deploy 会误以为无需安装继续部署并报成功，而目标站点 HTTPS 实际未生效。
 
 ## Docker 站点部署（setup/deploy）
 
 - 证书写入**宿主机侧挂载路径**（`HostCertPath`，非容器内路径）。
-- test/reload 使用容器化命令：`docker exec <容器> nginx -t` / `nginx -s reload`（apache 用 `apachectl`）；executor 放行 `docker exec <容器> <固定命令>`（容器名字符白名单 + 内层命令白名单）；base deployer 对 docker exec 命令跳过宿主机 SIGUSR1 / 进程重启回退。
+- test/reload 使用容器化命令：`docker exec <容器> nginx -t` / `nginx -s reload`（apache 用 `apachectl`）；executor 放行 `docker exec <容器> <固定命令>`（容器名字符白名单 + 内层命令白名单）；命令构建方（`webserver.DetectDockerCommands`）用 `executor.IsValidDockerContainerName` 前置校验容器名，非法即返回空命令，不拼出必然被执行期白名单拒绝的命令（那样错误指向白名单，掩盖真实原因）；base deployer 对 docker exec 命令跳过宿主机 SIGUSR1 / 进程重启回退。
 - 非挂载卷（copy 模式）或缺容器重载命令时 `config.ValidateDockerBinding` 返回明确错误、如实计为失败，不再静默写错位置报成功。旧版本 setup 创建的存量绑定升级后持续报失败属预期，需重跑 setup 补齐容器命令与卷校验（见根 `README.md`「存量 Docker 绑定升级说明」）。
 - Apache 容器内仅 `httpd`/`apache2ctl` 时 reload 明确报错，自动探测待后续支持。
 - **挂载路径精确匹配**：Docker 挂载路径按精确匹配，防止 `/etc/nginx` 匹配到 `/etc/nginx-backup`。

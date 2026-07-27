@@ -1,22 +1,22 @@
 package setup
 
 import (
+	"context"
 	"crypto/x509"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"time"
 
 	"github.com/zhuxbo/sslctl/pkg/certops"
 	"github.com/zhuxbo/sslctl/pkg/config"
+	sslerrors "github.com/zhuxbo/sslctl/pkg/errors"
 	"github.com/zhuxbo/sslctl/pkg/fetcher"
 	"github.com/zhuxbo/sslctl/pkg/matcher"
 	"github.com/zhuxbo/sslctl/pkg/util"
 	"github.com/zhuxbo/sslctl/pkg/validator"
-	"github.com/zhuxbo/sslctl/pkg/webserver"
 )
 
 // certDeployPlan 单个证书的部署计划
@@ -27,6 +27,10 @@ type certDeployPlan struct {
 	PrivateKey     string
 	Bindings       []config.SiteBinding
 	NeedSSLInstall []*matcher.ScannedSiteInfo
+
+	// 部署阶段填充，供保存阶段使用
+	SiteSuccess    int      // 本证书成功部署的站点数，保存门禁据此判定
+	RetryableSites []string // 可重试失败的站点，写入 FailedBindings 交给 daemon
 }
 
 // siteCandidate 站点的候选证书信息（用于冲突解决）
@@ -37,20 +41,28 @@ type siteCandidate struct {
 	orderID      int              // 订单 ID（越大越新）
 }
 
-// runBatch 批量部署
+// runBatch 批量部署（query 为逗号分隔的订单 ID，形态已在入口校验）
 func runBatch(p *setupParams, query string) {
-	// 1/8: 检测 Web 服务器
-	fmt.Println("步骤 1/8: 检测 Web 服务器...")
-	serverType := webserver.DetectWebServerType()
-	if serverType == "" {
-		fmt.Fprintln(os.Stderr, "未检测到 Nginx 或 Apache 服务")
+	// 1/7: 检测 Web 服务并扫描站点（宿主机 + Docker）
+	fmt.Println("步骤 1/7: 检测 Web 服务并扫描站点...")
+	scanResult := scanWebServersAndSites(p.log)
+	if len(scanResult.ServerTypes) == 0 {
+		fmt.Fprintln(os.Stderr, webServersNotFoundMessage())
 		os.Exit(1)
 	}
-	fmt.Printf("  检测到: %s\n", serverType)
+	fmt.Printf("  ✓ 检测到 Web 服务: %s\n", strings.Join(scanResult.ServerTypes, ", "))
+	if len(scanResult.Sites) == 0 {
+		fmt.Fprintln(os.Stderr, deployableSitesNotFoundMessage())
+		os.Exit(1)
+	}
+	sites := scanResult.Sites
+	environment, _ := summarizeScannedSites(sites)
+	fmt.Printf("  ✓ 发现 %d 个可部署站点\n", len(sites))
+	fmt.Printf("  环境: %s\n", environment)
 
-	// 2/8: 查询证书
-	fmt.Println("\n步骤 2/8: 查询证书...")
-	f := fetcher.New(30 * time.Second)
+	// 2/7: 查询证书
+	fmt.Println("\n步骤 2/7: 查询证书...")
+	f := fetcher.New()
 	certList, renewBeforeDays, err := f.QueryBatch(p.ctx, p.apiURL, p.token, query)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "查询证书失败: %v\n", err)
@@ -63,13 +75,18 @@ func runBatch(p *setupParams, query string) {
 		os.Exit(1)
 	}
 	fmt.Printf("  查询到 %d 个证书\n", len(certList))
+	// 不存在的 ID 被服务端静默跳过（deploy-spec §2.3），条数少于请求数时如实提示
+	if requested := len(strings.Split(query, ",")); len(certList) < requested {
+		fmt.Printf("  提示: 请求 %d 个订单，%d 个未命中（不存在或不在当前 Token 可见范围）\n",
+			requested, requested-len(certList))
+	}
 
 	// 过滤并验证证书
 	certValidator := validator.New("")
 	var plans []*certDeployPlan
 	for i := range certList {
 		cd := &certList[i]
-		if cd.Status != "active" || cd.Cert == "" {
+		if cd.Status != config.OrderStatusActive || cd.Cert == "" {
 			fmt.Printf("  ⚠ 订单 %d: 证书未就绪 (status=%s)，跳过\n", cd.OrderID, cd.Status)
 			continue
 		}
@@ -108,17 +125,8 @@ func runBatch(p *setupParams, query string) {
 	}
 	fmt.Printf("\n  共 %d 个证书可部署\n", len(plans))
 
-	// 3/8: 扫描站点
-	fmt.Println("\n步骤 3/8: 扫描站点...")
-	sites := scanSites(serverType, p.log)
-	if len(sites) == 0 {
-		fmt.Fprintln(os.Stderr, "未发现站点配置")
-		os.Exit(1)
-	}
-	fmt.Printf("  发现 %d 个站点\n", len(sites))
-
-	// 4/8: 匹配站点 + 冲突解决
-	fmt.Println("\n步骤 4/8: 匹配站点...")
+	// 3/7: 匹配站点 + 冲突解决
+	fmt.Println("\n步骤 3/7: 匹配证书与站点...")
 	resolveSiteConflicts(plans, sites, p.cfgManager)
 
 	// 统计有绑定的计划
@@ -136,8 +144,8 @@ func runBatch(p *setupParams, query string) {
 		os.Exit(1)
 	}
 
-	// 5/8: 确认部署计划
-	fmt.Println("\n步骤 5/8: 确认部署计划...")
+	// 4/7: 确认部署计划
+	fmt.Println("\n步骤 4/7: 确认部署计划...")
 	printDeployPlan(plans)
 	fmt.Printf("\n  共 %d 个证书，%d 个站点\n", activePlans, totalBindings)
 
@@ -148,8 +156,8 @@ func runBatch(p *setupParams, query string) {
 		}
 	}
 
-	// 6/8: 验证私钥 + 部署
-	fmt.Println("\n步骤 6/8: 部署证书...")
+	// 5/7: 验证私钥 + 部署
+	fmt.Println("\n步骤 5/7: 部署证书...")
 	var certSuccess, certFail int
 	var totalSiteSuccess, totalSiteFail int
 	var needKeyNames []string
@@ -182,9 +190,19 @@ func runBatch(p *setupParams, query string) {
 		}
 
 		// 部署到每个绑定
-		siteSuccess, siteFail := deployPlanBindings(p, plan)
+		siteSuccess, failedSites, retryableSites := deployPlanBindings(p, plan)
+		siteFail := len(failedSites) + len(retryableSites)
+		plan.RetryableSites = retryableSites
+		plan.SiteSuccess = siteSuccess
 		totalSiteSuccess += siteSuccess
 		totalSiteFail += siteFail
+
+		// 上报该证书的部署结果（deploy-spec §5.1 步骤 6）。必须留在部署循环内：
+		// 后面既有全失败 os.Exit(1)，保存循环又会跳过没有成功绑定的证书，
+		// 放到那里会正好丢掉最该上报的那批。
+		// 三条 continue（无绑定、缺私钥、私钥验证失败）都未发生部署，不上报——
+		// deploy-spec §5.3 把"需要私钥"单列为区别于"失败"的第三类。
+		sendBatchDeployCallback(p, f, plan.CertData.OrderID, siteSuccess, siteFail)
 
 		if siteSuccess > 0 {
 			certSuccess++
@@ -201,21 +219,16 @@ func runBatch(p *setupParams, query string) {
 		os.Exit(1)
 	}
 
-	// 7/8: 保存配置
-	fmt.Println("\n步骤 7/8: 保存配置...")
+	// 6/7: 保存配置
+	fmt.Println("\n步骤 6/7: 保存配置...")
 	for _, plan := range plans {
 		if len(plan.Bindings) == 0 {
 			continue
 		}
-		// 检查是否有成功的绑定
-		hasEnabled := false
-		for _, b := range plan.Bindings {
-			if b.Enabled {
-				hasEnabled = true
-				break
-			}
-		}
-		if !hasEnabled {
+		// 必须按"有没有成功部署"判定，不能看"有没有启用的绑定"。
+		// 二者此前等价，仅仅因为部署失败一律置 Enabled=false；P1-2 保留可重试绑定后
+		// 该等价被打破，全失败的证书会被写入配置，进而由 AddCert 摘除其它证书的同名绑定。
+		if plan.SiteSuccess == 0 {
 			continue
 		}
 
@@ -233,6 +246,11 @@ func runBatch(p *setupParams, query string) {
 		certConfig.Metadata.CertExpiresAt = plan.ParsedCert.NotAfter
 		certConfig.Metadata.CertSerial = fmt.Sprintf("%X", plan.ParsedCert.SerialNumber)
 		certConfig.Metadata.LastDeployAt = time.Now()
+		// 可重试失败的站点交给 daemon 自愈
+		if len(plan.RetryableSites) > 0 {
+			certConfig.Metadata.FailedBindings = plan.RetryableSites
+			certConfig.Metadata.FailedBindingsAt = time.Now()
+		}
 
 		// 逐证书派生续签模式：SAN 含 IP 的证书强制 local + file（deploy-spec §5.2），
 		// DNS 证书按命令行参数派生，混合批次下 DNS 证书不受 IP 证书影响。
@@ -291,9 +309,9 @@ func runBatch(p *setupParams, query string) {
 		notifyAutoReissue(p, f, certConfig.OrderID, certConfig.RenewMode)
 	}
 
-	// 8/8: 安装守护服务
+	// 7/7: 安装守护服务
 	if !p.noService {
-		fmt.Println("\n步骤 8/8: 安装守护服务...")
+		fmt.Println("\n步骤 7/7: 安装守护服务...")
 		if err := installService(); err != nil {
 			fmt.Fprintf(os.Stderr, "  安装服务失败: %v\n", err)
 			fmt.Println("  可稍后使用 'sslctl service repair' 修复")
@@ -301,7 +319,7 @@ func runBatch(p *setupParams, query string) {
 			fmt.Println("  ✓ 服务已安装并启动")
 		}
 	} else {
-		fmt.Println("\n步骤 8/8: 跳过服务安装 (--no-service)")
+		fmt.Println("\n步骤 7/7: 跳过服务安装 (--no-service)")
 	}
 
 	// 汇总
@@ -322,16 +340,9 @@ func runBatch(p *setupParams, query string) {
 	fmt.Printf("\n配置文件: %s\n", p.cfgManager.GetConfigPath())
 	fmt.Printf("证书目录: %s\n", p.cfgManager.GetCertsDir())
 
-	if !p.noService {
-		fmt.Println("\n守护服务命令:")
-		if runtime.GOOS == "windows" {
-			fmt.Println("  sc query sslctl              # 查看状态")
-			fmt.Println("  sslctl status                # 查看证书状态")
-		} else {
-			fmt.Println("  systemctl status sslctl    # 查看状态")
-			fmt.Println("  journalctl -u sslctl -f    # 查看日志")
-		}
-	}
+	fmt.Print(deploymentStatusHint())
+
+	p.reportNonCriticalSkips()
 
 	// 检查 Docker 非卷挂载站点
 	if totalSiteSuccess > 0 {
@@ -504,21 +515,58 @@ func installSSLForBatch(site *matcher.ScannedSiteInfo, plan *certDeployPlan, p *
 	}
 }
 
-// deployPlanBindings 部署证书计划中的所有绑定，返回成功和失败数
-func deployPlanBindings(p *setupParams, plan *certDeployPlan) (success, fail int) {
+// sendBatchDeployCallback 上报单张证书的 setup 部署结果（deploy-spec §5.1 步骤 6）。
+// 非关键路径，失败仅记日志。
+func sendBatchDeployCallback(p *setupParams, f *fetcher.Fetcher, orderID, successCount, failCount int) {
+	if p.nonCriticalTripped() {
+		return
+	}
+
+	req := &fetcher.CallbackRequest{
+		OrderID:    orderID,
+		Status:     "success",
+		DeployedAt: time.Now().Format(time.RFC3339),
+	}
+	if failCount > 0 {
+		req.Status = "failure"
+		req.Message = certops.CallbackMessage(
+			fmt.Errorf("%d 个站点部署失败，%d 个成功", failCount, successCount))
+	}
+
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(p.ctx), certops.CallbackFallbackBudget)
+	defer cancel()
+
+	renewBeforeDays, err := f.CallbackNew(ctx, p.apiURL, p.token, req)
+	p.recordNonCritical(err)
+	if err != nil {
+		p.log.Warn("上报证书 order_id=%d 的部署结果失败（不影响部署结果）: %v", orderID, err)
+		return
+	}
+	applyRenewBeforeDays(p.cfgManager, p.log, renewBeforeDays)
+}
+
+// deployPlanBindings 部署证书计划中的所有绑定。
+// 与 deploySingleBindings 同一分流规则：failedSites 的绑定已禁用，
+// retryableSites 的绑定保持启用并写入 FailedBindings 交给 daemon 重试，两者不重叠。
+func deployPlanBindings(p *setupParams, plan *certDeployPlan) (success int, failedSites, retryableSites []string) {
 	svc := certops.NewService(p.cfgManager, p.log)
 	for i := range plan.Bindings {
 		binding := &plan.Bindings[i]
 		if !binding.Enabled {
-			fail++
+			failedSites = append(failedSites, binding.ServerName)
 			continue
 		}
 		fmt.Printf("    部署到: %s\n", binding.ServerName)
 
 		if err := deployToSiteBinding(p.ctx, svc, binding, plan.CertData, plan.PrivateKey); err != nil {
-			fmt.Fprintf(os.Stderr, "      部署失败: %v\n", err)
-			fail++
-			binding.Enabled = false
+			if sslerrors.IsPermanentDeployError(err) {
+				fmt.Fprintf(os.Stderr, "      部署失败（需修正该站点配置后重新 setup）: %v\n", err)
+				binding.Enabled = false
+				failedSites = append(failedSites, binding.ServerName)
+				continue
+			}
+			fmt.Fprintf(os.Stderr, "      部署失败（保留绑定，将由守护进程重试）: %v\n", err)
+			retryableSites = append(retryableSites, binding.ServerName)
 			continue
 		}
 		fmt.Printf("      ✓ 部署成功\n")

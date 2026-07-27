@@ -157,8 +157,8 @@ func MatchDomain(certDomain, targetDomain string) bool {
 
 // SiteMatchResult 批量匹配站点的结果
 type SiteMatchResult struct {
-	Site      *ScannedSiteInfo     // 站点信息
-	Result    *config.MatchResult  // 匹配结果
+	Site   *ScannedSiteInfo    // 站点信息
+	Result *config.MatchResult // 匹配结果
 }
 
 // ScannedSiteInfo 扫描到的站点信息

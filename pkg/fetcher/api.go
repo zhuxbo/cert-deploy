@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 
@@ -51,6 +52,7 @@ type CertData struct {
 	OrderID          int            `json:"order_id"`
 	Status           string         `json:"status"`
 	Domains          string         `json:"domains"`
+	CSR              string         `json:"csr"`
 	Cert             string         `json:"certificate"`
 	IntermediateCert string         `json:"ca_certificate"`
 	PrivateKey       string         `json:"private_key"`
@@ -83,6 +85,81 @@ type APIResponse struct {
 	Code    int             `json:"code"`
 	Message string          `json:"msg"` // API 使用 msg 字段
 	Data    json.RawMessage `json:"data"`
+	// Errors 错误响应的附加信息（deploy-spec §2.2）；仅 code != 1 时有值
+	Errors APIErrors `json:"errors"`
+}
+
+// APIErrors 错误响应的 errors 字段（deploy-spec §2.2）。
+// HTTP 状态码恒为 200、业务成败只由 code 区分，因此 error_code 是客户端
+// 唯一可靠的失败分类依据——没有它就只能把「订单不存在」这类确定性失败
+// 当成网络错误无限重试。
+type APIErrors struct {
+	// ErrorCode 机器可读的失败标识，取值见 deploy-spec §2.2；缺失表示未分类
+	ErrorCode string `json:"error_code"`
+	// RetryAfter 睡满即可重试的保守秒数（仅 error_code=rate_limited 时有值，取值 61..120）
+	RetryAfter int `json:"retry_after"`
+}
+
+// 服务端下发的 error_code 取值（deploy-spec §2.2）。
+// 取值一旦发布不得改动，只允许新增；未列出的取值按未分类处理。
+const (
+	// 整批共通（凭据 / 限流类）：对每个条目都会同样失败
+	ErrorCodeRateLimited     = "rate_limited"     // 触发限流，带 retry_after
+	ErrorCodeTokenMissing    = "token_missing"    // 请求未携带 token
+	ErrorCodeTokenInvalid    = "token_invalid"    // token 不存在或已失效
+	ErrorCodeTokenDisabled   = "token_disabled"   // token 被禁用
+	ErrorCodeAccountDisabled = "account_disabled" // token 所属账号被禁用
+	ErrorCodeIPNotAllowed    = "ip_not_allowed"   // 来源 IP 不在白名单
+
+	// 单条目：只影响当前订单，不中断本批其余条目
+	ErrorCodeInvalidOrder    = "invalid_order"     // order 参数缺失、形态非法或超过 100 个
+	ErrorCodeOrderNotFound   = "order_not_found"   // 订单不存在或不可见
+	ErrorCodeCertNotFound    = "cert_not_found"    // 订单存在但无可用证书
+	ErrorCodeOrderInProgress = "order_in_progress" // 订单在途，不接受改 CSR/域名（唯一的过渡态）
+	// ErrorCodeValidationMethodUnsupported 产品不支持所请求的验证方式
+	ErrorCodeValidationMethodUnsupported = "validation_method_unsupported"
+	ErrorCodeAutoRenewDisabled           = "auto_renew_disabled"  // 订单未开启自动续费
+	ErrorCodeInsufficientBalance         = "insufficient_balance" // 余额不足以支付续费
+)
+
+// IsAuthBlockErrorCode 判断 error_code 是否属于「整批共通」组（deploy-spec §2.2）。
+//
+// 这类失败由认证与限流中间件下发，与具体订单无关：同一 (url, token) 的后续调用必然以
+// 同样方式失败。调用方应把该 token 本轮拉黑，而不是逐个条目重试——重试零收益，还会在
+// local 模式下每个条目各烧一次签发额度；限流场景更糟，spec §2.2 明确要求「等待期间不再
+// 发请求」，继续打会重新累积计数、把恢复时间往后推。
+//
+// 正面列举而非「非单条目即整批」：将来新增的取值语义未知，误判成整批共通会把一整轮
+// 无辜条目连带停掉。未列出的取值按未分类处理，沿用调用方既有的失败计数与重试策略。
+//
+// 单条目组（invalid_order / order_not_found / cert_not_found /
+// validation_method_unsupported / auto_renew_disabled / insufficient_balance）刻意不提供
+// 对称的判定函数：它们的「客户端应对」都是停止本轮该条目、等人工处理，而这正是「带
+// error_code 即业务错误」已经给出的行为，逐值分档只会引入无谓的分类漂移。唯一例外是
+// order_in_progress——它是过渡态而非永久失败，由 certops 单独识别并归一为等待。
+func IsAuthBlockErrorCode(code string) bool {
+	switch code {
+	case ErrorCodeRateLimited,
+		ErrorCodeTokenMissing,
+		ErrorCodeTokenInvalid,
+		ErrorCodeTokenDisabled,
+		ErrorCodeAccountDisabled,
+		ErrorCodeIPNotAllowed:
+		return true
+	}
+	return false
+}
+
+// apiError 依据 error_code 构造错误：带 error_code 一律是服务端明确拒绝
+// （确定性失败，调用方应停止本轮而非重试），无 error_code 沿用网络错误语义。
+//
+// 不按取值再分档：spec §2.2 表格中每一项的「客户端应对」都是停止本轮，
+// 逐值分支只会引入无谓的分类漂移。retry_after 由调用方按需读取。
+func (r *APIResponse) apiError(msg string) error {
+	if r.Errors.ErrorCode == "" {
+		return errors.NewNetworkError(msg, nil)
+	}
+	return errors.NewBusinessErrorWithCode(msg, r.Errors.ErrorCode, r.Errors.RetryAfter)
 }
 
 // ParseData 解析 Data 字段，支持单个对象或数组格式
@@ -112,48 +189,45 @@ func (r *APIResponse) ParseData() (*CertData, error) {
 	return &list[0], nil
 }
 
-// PaginatedResponse 批量查询分页响应结构
-type PaginatedResponse struct {
-	Total           int        `json:"total"`
-	CurrentPage     int        `json:"page"`
-	PageSize        int        `json:"page_size"`
+// QueryResponse 查询接口的 data 字段结构（deploy-spec §2.3，无分页）
+type QueryResponse struct {
 	RenewBeforeDays int        `json:"renew_before_days"`
 	Data            []CertData `json:"data"`
 }
 
-// ParsePaginatedData 解析批量查询的分页响应
-// 批量响应格式: {"total": N, "page": 1, "page_size": 100, "renew_before_days": 14, "data": [...]}
-// 兼容单对象格式: 包装成单元素切片返回
-// 返回: (certs, total, renewBeforeDays, error)
-func (r *APIResponse) ParsePaginatedData() ([]CertData, int, int, error) {
+// ParseQueryData 解析查询响应
+// 标准格式: {"renew_before_days": 14, "data": [...]}；服务端不分页，单次取完。
+// 兼容单对象与裸数组格式: 包装成切片返回
+// 返回: (certs, renewBeforeDays, error)
+func (r *APIResponse) ParseQueryData() ([]CertData, int, error) {
 	if len(r.Data) == 0 {
-		return nil, 0, 0, fmt.Errorf("empty data field")
+		return nil, 0, fmt.Errorf("empty data field")
 	}
-	// 尝试解析为分页响应
-	var paginated PaginatedResponse
-	if err := json.Unmarshal(r.Data, &paginated); err == nil && paginated.Data != nil {
-		if err := validateCertDataList(paginated.Data); err != nil {
-			return nil, 0, 0, err
+	// 尝试解析为标准查询响应
+	var listResp QueryResponse
+	if err := json.Unmarshal(r.Data, &listResp); err == nil && listResp.Data != nil {
+		if err := validateCertDataList(listResp.Data); err != nil {
+			return nil, 0, err
 		}
-		return paginated.Data, paginated.Total, paginated.RenewBeforeDays, nil
+		return listResp.Data, listResp.RenewBeforeDays, nil
 	}
 	// 兼容：尝试解析为单个对象
 	var single CertData
 	if err := json.Unmarshal(r.Data, &single); err == nil && single.OrderID != 0 {
 		if err := validateCertDataSizes(&single); err != nil {
-			return nil, 0, 0, err
+			return nil, 0, err
 		}
-		return []CertData{single}, 1, 0, nil
+		return []CertData{single}, 0, nil
 	}
 	// 兼容：尝试解析为数组
 	var list []CertData
 	if err := json.Unmarshal(r.Data, &list); err == nil {
 		if err := validateCertDataList(list); err != nil {
-			return nil, 0, 0, err
+			return nil, 0, err
 		}
-		return list, len(list), 0, nil
+		return list, 0, nil
 	}
-	return nil, 0, 0, fmt.Errorf("failed to parse paginated data")
+	return nil, 0, fmt.Errorf("failed to parse query data")
 }
 
 // UpdateRequest 更新/续费证书请求
@@ -182,20 +256,45 @@ type UpdateResponse struct {
 	RenewBeforeDays int `json:"renew_before_days"`
 }
 
-// CallbackResponse 回调响应
+// CallbackResponse 回调响应。
+// data 用 RawMessage 承接：服务端在不同分支下可能返回对象、null 或空数组，
+// 直接声明为结构体时非对象形状会让整条响应解析失败——回调其实已被受理，
+// 却被记成失败并丢掉 renew_before_days。形状不符时忽略 data，不影响成功判定。
 type CallbackResponse struct {
-	Code            int    `json:"code"`
-	Message         string `json:"msg"`
-	RenewBeforeDays int    `json:"renew_before_days"`
-	Data            struct {
-		RenewBeforeDays int `json:"renew_before_days"`
-	} `json:"data"`
+	Code            int             `json:"code"`
+	Message         string          `json:"msg"`
+	RenewBeforeDays int             `json:"renew_before_days"`
+	Data            json.RawMessage `json:"data"`
+	Errors          APIErrors       `json:"errors"`
 }
+
+// renewBeforeDaysFromData 从 data 对象中提取 renew_before_days，形状不符或缺失返回 0
+func renewBeforeDaysFromData(data json.RawMessage) int {
+	if len(data) == 0 {
+		return 0
+	}
+	var payload struct {
+		RenewBeforeDays int `json:"renew_before_days"`
+	}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return 0
+	}
+	return payload.RenewBeforeDays
+}
+
+// 单次请求超时（deploy-spec §11）：GET 30s、POST 60s。
+// 不再使用 http.Client.Timeout——它是覆盖整个请求的单一上限，
+// 无法按方法区分，且会把 POST 一并压到 GET 的时长上。
+const (
+	defaultGetTimeout  = 30 * time.Second
+	defaultPostTimeout = 60 * time.Second
+)
 
 // Fetcher 证书获取器
 type Fetcher struct {
 	client      *http.Client
-	postTimeout time.Duration // POST 请求超时（默认 60s），GET 使用 client.Timeout（默认 30s）
+	getTimeout  time.Duration
+	postTimeout time.Duration
 	retryConfig RetryConfig
 }
 
@@ -204,7 +303,11 @@ type Fetcher struct {
 // - 连接池复用与 HTTP/2
 // - 合理的连接/空闲超时
 // - DNS Rebinding 防护：在 TCP 连接时二次校验目标 IP
-func New(timeout time.Duration) *Fetcher {
+//
+// 超时统一在 doAttempt 内按方法套用（含响应体读取），client 本身不设 Timeout；
+// 可重试请求走 doWithRetry；结果不确定时不得重放的请求走 doOnce。
+// 两者都复用 doAttempt 的方法级超时、响应体读取与大小限制，不能直连 f.client.Do。
+func New() *Fetcher {
 	dialer := &net.Dialer{
 		Timeout:   10 * time.Second,
 		KeepAlive: 30 * time.Second,
@@ -221,8 +324,9 @@ func New(timeout time.Duration) *Fetcher {
 		ForceAttemptHTTP2:   true,
 	}
 	return &Fetcher{
-		client:      &http.Client{Timeout: timeout, Transport: transport},
-		postTimeout: 60 * time.Second,
+		client:      &http.Client{Transport: transport},
+		getTimeout:  defaultGetTimeout,
+		postTimeout: defaultPostTimeout,
 		retryConfig: DefaultRetryConfig,
 	}
 }
@@ -294,8 +398,8 @@ func validateIPForSSRF(ip net.IP) error {
 }
 
 // NewWithRetry 创建带自定义重试配置的 Fetcher
-func NewWithRetry(timeout time.Duration, retryConfig RetryConfig) *Fetcher {
-	f := New(timeout)
+func NewWithRetry(retryConfig RetryConfig) *Fetcher {
+	f := New()
 	f.retryConfig = retryConfig
 	return f
 }
@@ -327,47 +431,84 @@ func isRetryable(err error, statusCode int) bool {
 	return false
 }
 
-// doWithRetry 带重试的 HTTP 请求
-func (f *Fetcher) doWithRetry(ctx context.Context, newRequest func() (*http.Request, error)) (*http.Response, error) {
+// errorBodyLimit 非 200 响应体的读取上限。
+// 这类响应体只用于拼错误信息：批量查询的 5MB 上限 × 最多 4 次尝试会让 lastErr
+// 本身变成 MB 级字符串，一路流进日志与回调 message 的脱敏正则。
+const errorBodyLimit = 1024
+
+// attemptTimeout 返回单次尝试的超时（deploy-spec §11）
+func (f *Fetcher) attemptTimeout(method string) time.Duration {
+	if method == http.MethodPost {
+		return f.postTimeout
+	}
+	return f.getTimeout
+}
+
+// doAttempt 执行单次请求，并在同一超时作用域内读完响应体。
+// per-request 超时覆盖连接、首字节与响应体读取全过程，与父 ctx deadline 取更早者
+// （context.WithTimeout 语义）。返回时响应体已关闭，调用方不再持有 *http.Response。
+func (f *Fetcher) doAttempt(req *http.Request, maxBodySize int64) (int, []byte, error) {
+	ctx, cancel := context.WithTimeout(req.Context(), f.attemptTimeout(req.Method))
+	defer cancel()
+
+	resp, err := f.client.Do(req.WithContext(ctx))
+	if err != nil {
+		// Go http.Client.Do 规范保证 err != nil 时 resp == nil
+		return 0, nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	limit := maxBodySize
+	if resp.StatusCode != http.StatusOK {
+		limit = errorBodyLimit
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, limit))
+	if err != nil {
+		return resp.StatusCode, nil, err
+	}
+	return resp.StatusCode, body, nil
+}
+
+// doOnce 执行一次请求，不做传输层重试。
+// 用于携带非空 CSR 的 POST：请求一旦可能送达，超时、断连、5xx 或响应读取失败都必须
+// 交给上层 query-first 收敛，不能直接重放。
+func (f *Fetcher) doOnce(newRequest func() (*http.Request, error), maxBodySize int64) (int, []byte, error) {
+	req, err := newRequest()
+	if err != nil {
+		return 0, nil, err
+	}
+	return f.doAttempt(req, maxBodySize)
+}
+
+// doWithRetry 带重试的 HTTP 请求，返回状态码与已读取的响应体。
+// 响应体在 per-request 超时到期前读完（否则 deadline 会在调用方读 body 时才触发），
+// 且由本函数负责关闭——调用方不再持有 *http.Response。
+func (f *Fetcher) doWithRetry(ctx context.Context, newRequest func() (*http.Request, error), maxBodySize int64) (int, []byte, error) {
 	var lastErr error
 
 	for attempt := 0; attempt <= f.retryConfig.MaxRetries; attempt++ {
 		req, err := newRequest()
 		if err != nil {
-			return nil, err
+			return 0, nil, err
 		}
 
-		// POST 请求使用更长超时（spec: GET 30s, POST 60s）
-		if req.Method == http.MethodPost && f.postTimeout > 0 {
-			if _, hasDeadline := req.Context().Deadline(); !hasDeadline {
-				postCtx, cancel := context.WithTimeout(req.Context(), f.postTimeout)
-				req = req.WithContext(postCtx)
-				defer cancel()
-			}
+		statusCode, body, err := f.doAttempt(req, maxBodySize)
+
+		// 请求成功且不需要重试，返回状态码与响应体
+		if err == nil && !isRetryable(nil, statusCode) {
+			return statusCode, body, nil
 		}
 
-		resp, err := f.client.Do(req)
-
-		// 请求成功且不需要重试，返回响应（由调用者关闭 Body）
-		if err == nil && !isRetryable(nil, resp.StatusCode) {
-			return resp, nil
-		}
-
-		// 记录错误并确保关闭响应体
-		var statusCode int
 		if err != nil {
-			// 网络错误：Go http.Client.Do 规范保证 err != nil 时 resp == nil
+			// 网络错误或响应体读取中断：读取失败同样按可重试处理，
+			// 否则一次连接中断就会变成 JSON 解析失败并终止整条链路
 			lastErr = err
-		} else {
+			statusCode = 0
+		} else if len(body) > 0 {
 			// HTTP 错误但需要重试（5xx、429 等）
-			statusCode = resp.StatusCode
-			body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-			_ = resp.Body.Close() // 必须关闭，防止连接泄漏
-			if len(body) > 0 {
-				lastErr = fmt.Errorf("HTTP %d: %s", statusCode, string(body))
-			} else {
-				lastErr = fmt.Errorf("HTTP %d", statusCode)
-			}
+			lastErr = fmt.Errorf("HTTP %d: %s", statusCode, string(body))
+		} else {
+			lastErr = fmt.Errorf("HTTP %d", statusCode)
 		}
 
 		// 最后一次尝试不等待
@@ -398,36 +539,33 @@ func (f *Fetcher) doWithRetry(ctx context.Context, newRequest func() (*http.Requ
 
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return 0, nil, ctx.Err()
 		case <-time.After(sleepTime):
 		}
 	}
 
-	return nil, lastErr
+	return 0, nil, lastErr
 }
 
-// doAPICallBatch 批量查询的 API 调用流程，返回证书列表、总数和 renewBeforeDays
-func (f *Fetcher) doAPICallBatch(ctx context.Context, newRequest func() (*http.Request, error), errMsg string) ([]CertData, int, int, error) {
-	resp, err := f.doWithRetry(ctx, newRequest)
+// doAPICallQuery 查询接口的 API 调用流程，返回证书列表和 renewBeforeDays
+func (f *Fetcher) doAPICallQuery(ctx context.Context, newRequest func() (*http.Request, error), errMsg string) ([]CertData, int, error) {
+	statusCode, body, err := f.doWithRetry(ctx, newRequest, batchMaxResponseSize)
 	if err != nil {
-		return nil, 0, 0, errors.NewNetworkError(errMsg, err)
+		return nil, 0, errors.NewNetworkError(errMsg, err)
 	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return nil, 0, 0, errors.NewNetworkError(fmt.Sprintf("unexpected status code: %d", resp.StatusCode), nil)
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, batchMaxResponseSize))
-	if err != nil {
-		return nil, 0, 0, errors.NewNetworkError("failed to read response body", err)
+	if statusCode != http.StatusOK {
+		return nil, 0, errors.NewNetworkError(fmt.Sprintf("unexpected status code: %d", statusCode), nil)
 	}
 	var apiResp APIResponse
 	if err := json.Unmarshal(body, &apiResp); err != nil {
-		return nil, 0, 0, errors.NewNetworkError("failed to parse JSON response", err)
+		return nil, 0, errors.NewNetworkError("failed to parse JSON response", err)
 	}
 	if apiResp.Code != APICodeSuccess {
-		return nil, 0, 0, errors.NewNetworkError(fmt.Sprintf("API error: %s", apiResp.Message), nil)
+		// 带 error_code 时归为业务拒绝：订单不存在 / token 失效 / 形态非法都是
+		// 确定结果，此前一律当网络错误会让调用方每日重试到证书过期
+		return nil, 0, apiResp.apiError(fmt.Sprintf("API error: %s", apiResp.Message))
 	}
-	return apiResp.ParsePaginatedData()
+	return apiResp.ParseQueryData()
 }
 
 // mustValidURL 校验 URL 是否有效。
@@ -460,27 +598,26 @@ func (f *Fetcher) Callback(ctx context.Context, callbackURL, token string, callb
 		return httpReq, nil
 	}
 
-	resp, err := f.doWithRetry(ctx, newRequest)
+	const maxResponseSize = 64 * 1024 // 64KB 足够回调响应
+	statusCode, body, err := f.doWithRetry(ctx, newRequest, maxResponseSize)
 	if err != nil {
 		return 0, errors.NewNetworkError("failed to send callback", err)
 	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return 0, errors.NewNetworkError(fmt.Sprintf("callback returned unexpected status: %d", resp.StatusCode), nil)
-	}
-	const maxResponseSize = 64 * 1024 // 64KB 足够回调响应
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseSize))
-	if err != nil {
-		return 0, errors.NewNetworkError("failed to read callback response", err)
+	if statusCode != http.StatusOK {
+		return 0, errors.NewNetworkError(fmt.Sprintf("callback returned unexpected status: %d", statusCode), nil)
 	}
 	var callbackResp CallbackResponse
 	if err := json.Unmarshal(body, &callbackResp); err != nil {
 		return 0, errors.NewNetworkError("failed to parse callback response", err)
 	}
 	if callbackResp.Code != APICodeSuccess {
-		return 0, errors.NewNetworkError(fmt.Sprintf("callback failed: %s", callbackResp.Message), nil)
+		msg := fmt.Sprintf("callback failed: %s", callbackResp.Message)
+		if callbackResp.Errors.ErrorCode != "" {
+			return 0, errors.NewBusinessErrorWithCode(msg, callbackResp.Errors.ErrorCode, callbackResp.Errors.RetryAfter)
+		}
+		return 0, errors.NewNetworkError(msg, nil)
 	}
-	renewBeforeDays := callbackResp.Data.RenewBeforeDays
+	renewBeforeDays := renewBeforeDaysFromData(callbackResp.Data)
 	if renewBeforeDays == 0 {
 		// 兼容旧服务端把 renew_before_days 放在顶层的响应。
 		renewBeforeDays = callbackResp.RenewBeforeDays
@@ -502,45 +639,6 @@ func buildAPIURL(baseURL, path string) string {
 	}
 	// 否则使用默认的 /api/deploy 路径
 	return baseURL + "/api/deploy" + path
-}
-
-// Query 查询证书（新 API：GET {baseURL}/api/deploy?order=xxx）
-// API 返回分页格式，取第一条结果
-// 返回: (certData, renewBeforeDays, error)
-func (f *Fetcher) Query(ctx context.Context, baseURL, token, domain string) (*CertData, int, error) {
-	apiURL := buildAPIURL(baseURL, "")
-	if err := mustValidURL(apiURL); err != nil {
-		return nil, 0, errors.NewNetworkError("invalid API URL", err)
-	}
-
-	// 构建带 order 参数的 URL
-	u, err := url.Parse(apiURL)
-	if err != nil {
-		return nil, 0, errors.NewNetworkError("invalid API URL", err)
-	}
-	q := u.Query()
-	q.Set("order", domain)
-	u.RawQuery = q.Encode()
-	fullURL := u.String()
-
-	newRequest := func() (*http.Request, error) {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, fullURL, nil)
-		if err != nil {
-			return nil, err
-		}
-		req.Header.Set("Accept", "application/json")
-		req.Header.Set("Authorization", "Bearer "+token)
-		return req, nil
-	}
-
-	certs, _, renewBeforeDays, err := f.doAPICallBatch(ctx, newRequest, "failed to query certificate")
-	if err != nil {
-		return nil, 0, err
-	}
-	if len(certs) == 0 {
-		return nil, 0, errors.NewNetworkError("no certificate found", nil)
-	}
-	return &certs[0], renewBeforeDays, nil
 }
 
 // Update 更新/续费证书（新 API：POST {baseURL}/api/deploy）
@@ -573,17 +671,18 @@ func (f *Fetcher) Update(ctx context.Context, baseURL, token string, orderID int
 		return req, nil
 	}
 
-	resp, err := f.doWithRetry(ctx, newRequest)
+	var statusCode int
+	var body []byte
+	if strings.TrimSpace(csr) != "" {
+		statusCode, body, err = f.doOnce(newRequest, defaultMaxResponseSize)
+	} else {
+		statusCode, body, err = f.doWithRetry(ctx, newRequest, defaultMaxResponseSize)
+	}
 	if err != nil {
 		return nil, 0, errors.NewNetworkError("failed to update certificate", err)
 	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return nil, 0, errors.NewNetworkError(fmt.Sprintf("unexpected status code: %d", resp.StatusCode), nil)
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, defaultMaxResponseSize))
-	if err != nil {
-		return nil, 0, errors.NewNetworkError("failed to read response body", err)
+	if statusCode != http.StatusOK {
+		return nil, 0, errors.NewNetworkError(fmt.Sprintf("unexpected status code: %d", statusCode), nil)
 	}
 	var apiResp APIResponse
 	if err := json.Unmarshal(body, &apiResp); err != nil {
@@ -591,7 +690,12 @@ func (f *Fetcher) Update(ctx context.Context, baseURL, token string, orderID int
 	}
 	if apiResp.Code != APICodeSuccess {
 		// 服务端已成功响应但明确拒绝提交（校验失败、订单状态不允许等）：
-		// 属确定结果而非传输失败，调用方据此清理在途 pending 后停止（spec 2.6）
+		// 属确定结果而非传输失败，调用方据此清理在途 pending 后停止（spec 2.6）。
+		// 无 error_code 时同样保持业务拒绝语义——POST 的拒绝判定先于 error_code 存在，
+		// 不能因服务端未下发标识而退回可重试。
+		if apiResp.Errors.ErrorCode != "" {
+			return nil, 0, apiResp.apiError(fmt.Sprintf("API error: %s", apiResp.Message))
+		}
 		return nil, 0, errors.NewBusinessError(fmt.Sprintf("API error: %s", apiResp.Message), nil)
 	}
 	// update 响应 data 字段为单条，同层包含 renew_before_days
@@ -619,7 +723,7 @@ func (f *Fetcher) CallbackNew(ctx context.Context, baseURL, token string, callba
 
 // QueryOrder 按 OrderID 查询订单状态
 // GET {baseURL}/api/deploy?order=xxx
-// API 返回分页格式，取第一条结果
+// 取第一条结果
 // 返回: (certData, renewBeforeDays, error)
 func (f *Fetcher) QueryOrder(ctx context.Context, baseURL, token string, orderID int) (*CertData, int, error) {
 	apiURL := buildAPIURL(baseURL, "")
@@ -647,7 +751,7 @@ func (f *Fetcher) QueryOrder(ctx context.Context, baseURL, token string, orderID
 		return req, nil
 	}
 
-	certs, _, renewBeforeDays, err := f.doAPICallBatch(ctx, newRequest, "failed to query order")
+	certs, renewBeforeDays, err := f.doAPICallQuery(ctx, newRequest, "failed to query order")
 	if err != nil {
 		return nil, 0, err
 	}
@@ -692,24 +796,19 @@ func (f *Fetcher) ToggleAutoReissue(ctx context.Context, baseURL, token string, 
 		return req, nil
 	}
 
-	resp, err := f.doWithRetry(ctx, newRequest)
+	statusCode, body, err := f.doWithRetry(ctx, newRequest, defaultMaxResponseSize)
 	if err != nil {
 		return 0, errors.NewNetworkError("failed to toggle auto reissue", err)
 	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return 0, errors.NewNetworkError(fmt.Sprintf("unexpected status code: %d", resp.StatusCode), nil)
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, defaultMaxResponseSize))
-	if err != nil {
-		return 0, errors.NewNetworkError("failed to read response body", err)
+	if statusCode != http.StatusOK {
+		return 0, errors.NewNetworkError(fmt.Sprintf("unexpected status code: %d", statusCode), nil)
 	}
 	var apiResp APIResponse
 	if err := json.Unmarshal(body, &apiResp); err != nil {
 		return 0, errors.NewNetworkError("failed to parse JSON response", err)
 	}
 	if apiResp.Code != APICodeSuccess {
-		return 0, errors.NewNetworkError(fmt.Sprintf("API error: %s", apiResp.Message), nil)
+		return 0, apiResp.apiError(fmt.Sprintf("API error: %s", apiResp.Message))
 	}
 	var data struct {
 		RenewBeforeDays int `json:"renew_before_days"`
@@ -722,18 +821,29 @@ func (f *Fetcher) ToggleAutoReissue(ctx context.Context, baseURL, token string, 
 	return data.RenewBeforeDays, nil
 }
 
-// QueryBatch 批量查询证书
-// query 非空时: GET {baseURL}/api/deploy?order={query}
-// query 为空时: GET {baseURL}/api/deploy（返回最新 100 条 active 证书）
-// 自动处理分页，返回全部结果
-// 返回: (certs, renewBeforeDays, error)，renewBeforeDays 取最后一页的值
+// MaxBatchQueryItems 单次批量查询的订单 ID 项数上限（deploy-spec §2.3）
+const MaxBatchQueryItems = 100
+
+// batchQueryPattern 批量查询形态（deploy-spec §2.3）：仅订单 ID，单个或逗号分隔多个。
+// 与服务端校验一致；本地先拒绝可以少发一次注定失败的请求。
+var batchQueryPattern = regexp.MustCompile(`^\d+(,\d+)*$`)
+
+// QueryBatch 批量查询证书（单次请求，无分页）
+// GET {baseURL}/api/deploy?order={id1,id2,...}
+// query 必填且只接受订单 ID（单个或英文逗号分隔，上限 MaxBatchQueryItems）。
+// 不存在的 ID 被服务端静默跳过，全部未命中返回空切片，由调用方决定语义。
+// 返回: (certs, renewBeforeDays, error)
+//
+// 协议无分页（不发也不认 page / page_size / total），单次取完即止：
+// 翻页循环的终止只依赖服务端自报的计数与非空页，一旦失真即无限翻页且累积内存无界。
 func (f *Fetcher) QueryBatch(ctx context.Context, baseURL, token, query string) ([]CertData, int, error) {
-	// 规范 2.3：批量查询上限 100
-	if query != "" {
-		if parts := strings.Split(query, ","); len(parts) > 100 {
-			return nil, 0, errors.NewNetworkError(
-				fmt.Sprintf("批量查询超过上限: %d（最大 100）", len(parts)), nil)
-		}
+	if !batchQueryPattern.MatchString(query) {
+		return nil, 0, errors.NewBusinessError(
+			fmt.Sprintf("批量查询只接受订单 ID（纯数字，英文逗号分隔）: %q", query), nil)
+	}
+	if parts := strings.Split(query, ","); len(parts) > MaxBatchQueryItems {
+		return nil, 0, errors.NewBusinessError(
+			fmt.Sprintf("批量查询超过上限: %d（最大 %d）", len(parts), MaxBatchQueryItems), nil)
 	}
 
 	apiURL := buildAPIURL(baseURL, "")
@@ -746,45 +856,20 @@ func (f *Fetcher) QueryBatch(ctx context.Context, baseURL, token, query string) 
 		return nil, 0, errors.NewNetworkError("invalid API URL", err)
 	}
 
-	const pageSize = 100
-	var allCerts []CertData
-	var lastRenewBeforeDays int
+	q := u.Query()
+	q.Set("order", query)
+	u.RawQuery = q.Encode()
+	fullURL := u.String()
 
-	for page := 1; ; page++ {
-		q := u.Query()
-		if query != "" {
-			q.Set("order", query)
-		}
-		q.Set("page_size", fmt.Sprintf("%d", pageSize))
-		q.Set("page", fmt.Sprintf("%d", page))
-		u.RawQuery = q.Encode()
-		fullURL := u.String()
-
-		newRequest := func() (*http.Request, error) {
-			req, err := http.NewRequestWithContext(ctx, http.MethodGet, fullURL, nil)
-			if err != nil {
-				return nil, err
-			}
-			req.Header.Set("Accept", "application/json")
-			req.Header.Set("Authorization", "Bearer "+token)
-			return req, nil
-		}
-
-		certs, total, renewBeforeDays, err := f.doAPICallBatch(ctx, newRequest, "failed to batch query")
+	newRequest := func() (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, fullURL, nil)
 		if err != nil {
-			return nil, 0, err
+			return nil, err
 		}
-
-		allCerts = append(allCerts, certs...)
-		if renewBeforeDays > 0 {
-			lastRenewBeforeDays = renewBeforeDays
-		}
-
-		// 已获取全部或无更多页
-		if len(allCerts) >= total || len(certs) == 0 {
-			break
-		}
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("Authorization", "Bearer "+token)
+		return req, nil
 	}
 
-	return allCerts, lastRenewBeforeDays, nil
+	return f.doAPICallQuery(ctx, newRequest, "failed to batch query")
 }

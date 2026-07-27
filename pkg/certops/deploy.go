@@ -30,7 +30,7 @@ func (s *Service) DeployOne(ctx context.Context, certName string) (*DeployResult
 	}
 
 	// 从 API 获取证书
-	certData, renewBeforeDays, err := s.fetcher.QueryOrder(ctx, api.URL, api.Token, cert.OrderID)
+	certData, renewBeforeDays, err := s.queryOrder(ctx, api, cert.OrderID)
 	if err != nil {
 		return nil, fmt.Errorf("获取证书失败: %w", err)
 	}
@@ -39,7 +39,7 @@ func (s *Service) DeployOne(ctx context.Context, certName string) (*DeployResult
 	// 订单续费后 API 返回新订单号，同步更新
 	s.syncOrderID(cert, certData)
 
-	if certData.Status != "active" || certData.Cert == "" {
+	if certData.Status != config.OrderStatusActive || certData.Cert == "" {
 		return nil, fmt.Errorf("证书未就绪 (status=%s)", certData.Status)
 	}
 
@@ -207,12 +207,12 @@ func (s *Service) deployToBinding(ctx context.Context, binding *config.SiteBindi
 	if err != nil {
 		return errors.NewStructuredDeployError(errors.DeployErrorConfig, errors.PhaseWriteCert, "创建部署器失败", err)
 	}
-	deployErr := deployer.Deploy(certData.Cert, certData.IntermediateCert, privateKey)
+	deployErr := deployer.Deploy(ctx, certData.Cert, certData.IntermediateCert, privateKey)
 
 	// 3. 部署失败时回滚
 	if deployErr != nil && backupPath != "" {
 		s.log.Warn("部署失败，尝试回滚: %v", deployErr)
-		if rollbackErr := s.rollbackFromBackup(binding, backupPath); rollbackErr != nil {
+		if rollbackErr := s.rollbackFromBackup(ctx, binding, backupPath); rollbackErr != nil {
 			s.log.Error("回滚失败: %v", rollbackErr)
 			// 构造手动恢复指引
 			recoveryCmd := fmt.Sprintf("cp %s %s && cp %s %s",
@@ -228,15 +228,29 @@ func (s *Service) deployToBinding(ctx context.Context, binding *config.SiteBindi
 				fmt.Sprintf("部署失败且回滚失败（服务可能不可用）: deploy=%v, rollback=%v\n手动恢复: %s", deployErr, rollbackErr, recoveryCmd), nil)
 		}
 		s.log.Info("已回滚到备份: %s", backupPath)
-		return errors.NewStructuredDeployError(errors.DeployErrorReload, errors.PhaseReload, "部署失败（已回滚）", deployErr)
+		// 包裹而非重造错误码：同一根因（如 nginx -t 失败 = Config@test_config）
+		// 此前"有备份"被重包成 Reload@reload、"首次部署无备份"原样返回，
+		// 相同问题得到相反的错误分类。%w 保留根因，与 cmd/deploy 的写法一致。
+		return fmt.Errorf("部署失败（已回滚）: %w", deployErr)
 	}
 
 	return deployErr
 }
 
+// RollbackBudget 回滚的独立预算。
+// 回滚要恢复旧证书并重新 test + reload，就地放弃比慢一点糟得多。
+const RollbackBudget = 90 * time.Second
+
 // rollbackFromBackup 从备份回滚证书
 // 直接调用 Deployer.Rollback()，包含完整回滚逻辑（文件恢复 + 测试 + 重载）
-func (s *Service) rollbackFromBackup(binding *config.SiteBinding, backupPath string) error {
+//
+// 回滚必须脱离父 ctx 的取消传播：部署失败往往正是因为 ctx 被取消（关停/检查超时），
+// 沿用同一个 ctx 会让兜底回滚当场失败，直接落进"部署失败且回滚失败（服务可能不可用）"
+// ——比不贯通 ctx 更糟。改为 WithoutCancel + 独立预算，仍然有界。
+func (s *Service) rollbackFromBackup(ctx context.Context, binding *config.SiteBinding, backupPath string) error {
+	rbCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), RollbackBudget)
+	defer cancel()
+
 	certPath, keyPath, chainPath := s.backupMgr.GetBackupPathsWithChain(backupPath)
 
 	// 使用 webserver 抽象层创建部署器
@@ -253,7 +267,7 @@ func (s *Service) rollbackFromBackup(binding *config.SiteBinding, backupPath str
 	}
 
 	// 直接调用 Deployer.Rollback，包含完整回滚逻辑
-	if err := deployer.Rollback(certPath, keyPath, chainPath); err != nil {
+	if err := deployer.Rollback(rbCtx, certPath, keyPath, chainPath); err != nil {
 		return errors.NewStructuredDeployError(errors.DeployErrorPermission, errors.PhaseRollback, "回滚失败", err)
 	}
 	return nil

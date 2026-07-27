@@ -4,8 +4,11 @@ package csr
 import (
 	"crypto/ecdsa"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -120,7 +123,7 @@ func TestGenerateKeyAndCSR_ECDSA(t *testing.T) {
 		{"P256 prime256v1", "prime256v1", true},
 		{"P384 secp384r1", "secp384r1", true},
 		{"P521 secp521r1", "secp521r1", true},
-		{"默认曲线", "", true},       // 默认 P256
+		{"默认曲线", "", true}, // 默认 P256
 		{"未知曲线回退 P256", "unknown", true},
 	}
 
@@ -281,6 +284,96 @@ func TestGenerateKeyAndCSR_HashUniqueness(t *testing.T) {
 	if hash1 == hash2 {
 		t.Error("hash should be unique for each CSR generation")
 	}
+}
+
+func TestGenerateKeyAndCSR_HashUsesDER(t *testing.T) {
+	_, csrPEM, got, err := GenerateKeyAndCSR(
+		KeyOptions{Type: "rsa", Size: 2048},
+		CSROptions{CommonName: "example.com"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block, _ := pem.Decode([]byte(csrPEM))
+	if block == nil {
+		t.Fatal("failed to decode generated CSR")
+	}
+	want := fmt.Sprintf("%x", sha256.Sum256(block.Bytes))
+	if got != want {
+		t.Fatalf("CSR hash = %s, want DER SHA256 %s", got, want)
+	}
+}
+
+func TestValidateOwnership(t *testing.T) {
+	keyPEM, csrPEM, csrHash, err := GenerateKeyAndCSR(
+		KeyOptions{Type: "rsa", Size: 2048},
+		CSROptions{CommonName: "example.com"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherKeyPEM, _, _, err := GenerateKeyAndCSR(
+		KeyOptions{Type: "rsa", Size: 2048},
+		CSROptions{CommonName: "example.com"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("valid", func(t *testing.T) {
+		if err := ValidateOwnership(csrPEM, keyPEM, csrHash, "example.com"); err != nil {
+			t.Fatalf("ValidateOwnership() error = %v", err)
+		}
+	})
+
+	t.Run("legacy PEM hash", func(t *testing.T) {
+		legacyHash := fmt.Sprintf("%x", sha256.Sum256([]byte(csrPEM)))
+		serviceCSR := strings.ReplaceAll(csrPEM, "\n", "\r\n")
+		if err := ValidateOwnership(serviceCSR, keyPEM, legacyHash, "example.com"); err != nil {
+			t.Fatalf("legacy PEM hash should remain recoverable during upgrade: %v", err)
+		}
+	})
+
+	tests := []struct {
+		name       string
+		keyPEM     string
+		hash       string
+		commonName string
+	}{
+		{name: "hash mismatch", keyPEM: keyPEM, hash: strings.Repeat("0", 64), commonName: "example.com"},
+		{name: "private key mismatch", keyPEM: otherKeyPEM, hash: csrHash, commonName: "example.com"},
+		{name: "common name mismatch", keyPEM: keyPEM, hash: csrHash, commonName: "other.example.com"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateOwnership(csrPEM, tt.keyPEM, tt.hash, tt.commonName)
+			if !errors.Is(err, ErrOwnershipMismatch) {
+				t.Fatalf("ValidateOwnership() error = %v, want ErrOwnershipMismatch", err)
+			}
+		})
+	}
+
+	t.Run("invalid signature", func(t *testing.T) {
+		block, _ := pem.Decode([]byte(csrPEM))
+		if block == nil {
+			t.Fatal("failed to decode CSR")
+		}
+		tampered := append([]byte(nil), block.Bytes...)
+		tampered[len(tampered)-1] ^= 0xff
+		tamperedPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: tampered})
+		tamperedHash := fmt.Sprintf("%x", sha256.Sum256(tampered))
+		err := ValidateOwnership(string(tamperedPEM), keyPEM, tamperedHash, "example.com")
+		if !errors.Is(err, ErrInvalidCSR) {
+			t.Fatalf("ValidateOwnership() error = %v, want ErrInvalidCSR", err)
+		}
+	})
+
+	t.Run("unreadable private key is not mismatch proof", func(t *testing.T) {
+		err := ValidateOwnership(csrPEM, "not-a-private-key", csrHash, "example.com")
+		if err == nil || errors.Is(err, ErrOwnershipMismatch) {
+			t.Fatalf("ValidateOwnership() error = %v, want unverifiable non-mismatch error", err)
+		}
+	})
 }
 
 // TestGenerateKeyAndCSR_KeyTypes 验证返回的密钥类型

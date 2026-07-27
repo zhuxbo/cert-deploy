@@ -118,22 +118,38 @@ func isOpenBrace(line string) bool {
 	return regexp.MustCompile(`^\s*\{\s*$`).MatchString(line)
 }
 
-// hasSSLConfig 检查目标 server 块是否已配置 SSL
-// 只检查匹配 serverName 的 server 块，而不是整个文件
-func (i *NginxInstaller) hasSSLConfig(content string) bool {
-	lines := strings.Split(content, "\n")
+// serverBlockSummary 一个 server 块的解析摘要，按块在文件中出现的顺序编号
+type serverBlockSummary struct {
+	index       int      // 块序号（从 0 开始）
+	serverNames []string // 块内声明的全部 server_name
+	hasListen80 bool     // 是否含非 ssl 的 :80 监听
+	hasSSL      bool     // 块内是否已有 ssl_certificate
+}
 
+// scanServerBlocks 单趟解析文件中所有 server 块的摘要。
+// 与 addSSLConfig 的注入趟共用同一套块识别规则（注释行不参与解析、支持 "server\n{" 格式），
+// 保证两趟对块的编号一致——注入趟按块序号定位目标，不再各自重复判定。
+func scanServerBlocks(content string) []serverBlockSummary {
 	serverNameRe := regexp.MustCompile(`^\s*server_name\s+([^;]+);`)
 	sslCertRe := regexp.MustCompile(`^\s*ssl_certificate\s+`)
+	listenRe := regexp.MustCompile(`^\s*listen\s+([^;]+);`)
+	listen80Re := regexp.MustCompile(`(?:^|[:\s])80(?:\s|;|$)`)
 
+	var blocks []serverBlockSummary
+	var current serverBlockSummary
 	inServerBlock := false
 	pendingServer := false
 	braceCount := 0
-	currentServerNames := []string{}
-	hasSSLInBlock := false
+	nextIndex := 0
 
-	for _, line := range lines {
-		// 跳过注释
+	startBlock := func() {
+		inServerBlock = true
+		braceCount = 1
+		current = serverBlockSummary{index: nextIndex}
+		nextIndex++
+	}
+
+	for _, line := range strings.Split(content, "\n") {
 		trimmed := strings.TrimSpace(line)
 		if strings.HasPrefix(trimmed, "#") {
 			continue
@@ -146,21 +162,14 @@ func (i *NginxInstaller) hasSSLConfig(content string) bool {
 			}
 			pendingServer = false
 			if isOpenBrace(line) {
-				inServerBlock = true
-				braceCount = 1
-				currentServerNames = nil
-				hasSSLInBlock = false
+				startBlock()
 				continue
 			}
 		}
 
-		// 检测 server 块开始
 		started, pending := isServerBlockStart(line)
 		if started {
-			inServerBlock = true
-			braceCount = 1
-			currentServerNames = nil
-			hasSSLInBlock = false
+			startBlock()
 			continue
 		}
 		if pending {
@@ -172,32 +181,109 @@ func (i *NginxInstaller) hasSSLConfig(content string) bool {
 			continue
 		}
 
-		// 统计大括号
 		braceCount += strings.Count(line, "{") - strings.Count(line, "}")
 
-		// 解析 server_name
-		if matches := serverNameRe.FindStringSubmatch(line); len(matches) > 1 {
-			names := strings.Fields(matches[1])
-			currentServerNames = append(currentServerNames, names...)
-		}
-
-		// 检测 SSL 配置
-		if sslCertRe.MatchString(line) {
-			hasSSLInBlock = true
-		}
-
-		// server 块结束
-		if braceCount <= 0 {
-			// 检查这个 server 块是否匹配目标站点且已有 SSL
-			// （与 addSSLConfig 共用 blockMatchesServerName 谓词：lower + 通配符，
-			// 避免"精确匹配漏检通配符块已有 SSL → addSSLConfig 二次注入 duplicate listen"）
-			if hasSSLInBlock && i.blockMatchesServerName(currentServerNames) {
-				return true
+		if matches := listenRe.FindStringSubmatch(line); len(matches) > 1 {
+			listenValue := strings.TrimSpace(matches[1])
+			if listen80Re.MatchString(listenValue) && !strings.Contains(listenValue, "ssl") {
+				current.hasListen80 = true
 			}
+		}
+		if matches := serverNameRe.FindStringSubmatch(line); len(matches) > 1 {
+			current.serverNames = append(current.serverNames, strings.Fields(matches[1])...)
+		}
+		if sslCertRe.MatchString(line) {
+			current.hasSSL = true
+		}
+
+		if braceCount <= 0 {
+			blocks = append(blocks, current)
 			inServerBlock = false
 		}
 	}
 
+	return blocks
+}
+
+// selectTargetBlock 按 nginx 自身的名字优先级选出服务目标站点的 server 块序号。
+//
+// nginx 用精确名优先于通配符名来决定由哪个 server 块响应某个域名，安装器必须遵循同一优先级，
+// 否则会出现"目标是 www.example.com，却把它的证书也注入到 *.example.com 块"——通配符站点
+// 被换上只覆盖单域名的证书，其余子域名 HTTPS 证书不匹配。
+//
+// 同优先级内多个匹配块时：已配 SSL 的块优先返回，使调用方判定为"该站点已有 HTTPS，无需安装"。
+// 常见的 "listen 80 跳转块 + listen 443 ssl 块" 同名布局据此不会被二次注入 duplicate listen 443。
+// 其次返回第一个含 :80 的块作为注入目标；都不满足时返回第一个匹配块，由调用方报明确错误。
+//
+// 无匹配返回 -1。
+func (i *NginxInstaller) selectTargetBlock(blocks []serverBlockSummary) int {
+	if i.serverName == "" {
+		return -1
+	}
+	target := strings.ToLower(i.serverName)
+
+	pick := func(exact bool) int {
+		candidate := -1
+		for idx := range blocks {
+			if !blockMatchesTarget(blocks[idx].serverNames, target, exact) {
+				continue
+			}
+			if blocks[idx].hasSSL {
+				return blocks[idx].index
+			}
+			if candidate < 0 || (!blocks[candidate].hasListen80 && blocks[idx].hasListen80) {
+				candidate = idx
+			}
+		}
+		if candidate < 0 {
+			return -1
+		}
+		return blocks[candidate].index
+	}
+
+	if idx := pick(true); idx >= 0 {
+		return idx
+	}
+	return pick(false)
+}
+
+// blockMatchesTarget 判断块的 server_name 列表是否命中目标站点。
+// exact 为 true 时只认大小写无关的精确相等；否则按"块名覆盖目标域名"的单向通配符匹配
+// （*.example.com 块服务 www.example.com，反之不成立）。
+// 无 server_name 或 `_` 的块（default_server 等）不命中：扫描器已过滤空/`_` server_name，
+// 安装器的 serverName 必为真实域名。
+func blockMatchesTarget(names []string, target string, exact bool) bool {
+	for _, name := range names {
+		if name == "_" {
+			continue
+		}
+		n := strings.ToLower(name)
+		if exact {
+			if n == target {
+				return true
+			}
+			continue
+		}
+		if matcher.MatchDomain(n, target) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasSSLConfig 检查服务目标站点的 server 块是否已配置 SSL
+// 只检查 selectTargetBlock 选中的块，而不是整个文件
+func (i *NginxInstaller) hasSSLConfig(content string) bool {
+	blocks := scanServerBlocks(content)
+	target := i.selectTargetBlock(blocks)
+	if target < 0 {
+		return false
+	}
+	for idx := range blocks {
+		if blocks[idx].index == target {
+			return blocks[idx].hasSSL
+		}
+	}
 	return false
 }
 
@@ -214,10 +300,17 @@ func (i *NginxInstaller) backup(content string) (string, error) {
 	return backupPath, nil
 }
 
-// addSSLConfig 添加 SSL 配置到 server 块
+// addSSLConfig 添加 SSL 配置到目标 server 块。
+// 先按 nginx 的名字优先级选出服务目标站点的唯一块（selectTargetBlock），再只向该块注入，
+// 避免同文件内其他同域族的块（如通配符块）被一并写入本站点的证书。
 func (i *NginxInstaller) addSSLConfig(content string) (string, error) {
 	lines := strings.Split(content, "\n")
 	var result []string
+
+	targetBlock := i.selectTargetBlock(scanServerBlocks(content))
+	if targetBlock < 0 {
+		return content, nil
+	}
 
 	// 状态跟踪
 	inServerBlock := false
@@ -229,7 +322,8 @@ func (i *NginxInstaller) addSSLConfig(content string) (string, error) {
 	listenLineIndex := -1
 	ipv6ListenLineIndex := -1
 	rootLineIndex := -1
-	currentServerNames := []string{}
+	blockIndex := -1
+	nextBlockIndex := 0
 
 	// 正则表达式
 	listenRe := regexp.MustCompile(`^\s*listen\s+([^;]+);`)
@@ -237,7 +331,6 @@ func (i *NginxInstaller) addSSLConfig(content string) (string, error) {
 	listen80Re := regexp.MustCompile(`(?:^|[:\s])80(?:\s|;|$)`)
 	ipv6ListenRe := regexp.MustCompile(`\[::\]`)
 	rootRe := regexp.MustCompile(`^\s*root\s+`)
-	serverNameRe := regexp.MustCompile(`^\s*server_name\s+([^;]+);`)
 	sslCertRe := regexp.MustCompile(`^\s*ssl_certificate\s+`)
 
 	for _, line := range lines {
@@ -264,7 +357,8 @@ func (i *NginxInstaller) addSSLConfig(content string) (string, error) {
 				listenLineIndex = -1
 				ipv6ListenLineIndex = -1
 				rootLineIndex = -1
-				currentServerNames = nil
+				blockIndex = nextBlockIndex
+				nextBlockIndex++
 				result = append(result, line)
 				continue
 			}
@@ -281,7 +375,8 @@ func (i *NginxInstaller) addSSLConfig(content string) (string, error) {
 			listenLineIndex = -1
 			ipv6ListenLineIndex = -1
 			rootLineIndex = -1
-			currentServerNames = nil
+			blockIndex = nextBlockIndex
+			nextBlockIndex++
 			result = append(result, line)
 			continue
 		}
@@ -308,11 +403,6 @@ func (i *NginxInstaller) addSSLConfig(content string) (string, error) {
 				}
 			}
 
-			// 解析 server_name（可能一行多名、跨多行累积）
-			if matches := serverNameRe.FindStringSubmatch(line); len(matches) > 1 {
-				currentServerNames = append(currentServerNames, strings.Fields(matches[1])...)
-			}
-
 			// 检测块内已有 SSL 配置（已配 SSL 的块不再注入，防 duplicate listen）
 			if sslCertRe.MatchString(line) {
 				hasSSLInBlock = true
@@ -327,10 +417,9 @@ func (i *NginxInstaller) addSSLConfig(content string) (string, error) {
 
 			// server 块结束
 			if braceCount <= 0 {
-				// 仅向 server_name 匹配目标站点、且尚未配置 SSL 的块注入：
-				// 已有 ssl_certificate 的块（如通配符块已配 SSL 且含 listen 80）再注入
-				// 会产生 duplicate listen 443，导致配置测试失败回滚
-				if hasListen80 && listenLineIndex >= 0 && !hasSSLInBlock && i.blockMatchesServerName(currentServerNames) {
+				// 仅向 selectTargetBlock 选中、且尚未配置 SSL 的目标块注入：
+				// 已有 ssl_certificate 的块再注入会产生 duplicate listen 443，导致配置测试失败回滚
+				if blockIndex == targetBlock && hasListen80 && listenLineIndex >= 0 && !hasSSLInBlock {
 					// 先插入 SSL 配置（在 root 后或 listen 后），再插入 listen 443（在 listen 80 后）
 					// 注意：先插入靠后的，再插入靠前的，避免索引偏移
 					sslConfigInsertIndex := rootLineIndex
@@ -354,26 +443,6 @@ func (i *NginxInstaller) addSSLConfig(content string) (string, error) {
 	}
 
 	return strings.Join(result, "\n"), nil
-}
-
-// blockMatchesServerName 判断 server 块的 server_name 列表是否命中目标站点。
-// 兼容通配符（*.example.com）两侧匹配；无 server_name 的块（default_server 等）不命中，
-// 因为扫描器已过滤空/`_` server_name，安装器的 serverName 必为真实域名。
-func (i *NginxInstaller) blockMatchesServerName(names []string) bool {
-	if i.serverName == "" {
-		return false
-	}
-	target := strings.ToLower(i.serverName)
-	for _, name := range names {
-		if name == "_" {
-			continue
-		}
-		n := strings.ToLower(name)
-		if matcher.MatchDomain(n, target) || matcher.MatchDomain(target, n) {
-			return true
-		}
-	}
-	return false
 }
 
 // insertListenDirectives 在 listen 80 后插入 listen 443 ssl

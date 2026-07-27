@@ -46,38 +46,45 @@ func IsDockerExecCommand(cmdStr string) bool {
 	return ok && dockerContainerNameRe.MatchString(container) && allowedDockerInnerCommands[inner]
 }
 
+// IsValidDockerContainerName 校验容器名是否符合 docker 命名规则。
+// 供命令构建方前置校验，使非法容器名在构建时就被发现，
+// 而不是拼成命令后在执行期被白名单拒绝（错误指向白名单，掩盖真实原因）。
+func IsValidDockerContainerName(name string) bool {
+	return dockerContainerNameRe.MatchString(name)
+}
+
 // AllowedCommands 允许的命令白名单（支持多发行版和 Windows）
 var AllowedCommands = map[string]bool{
 	// ========== Nginx 扫描命令 ==========
-	"nginx -V":                true, // 获取版本信息
-	"nginx -T":                true, // 获取合并配置
+	"nginx -V": true, // 获取版本信息
+	"nginx -T": true, // 获取合并配置
 
 	// ========== Nginx 部署命令 ==========
 	// Linux - 通用
-	"nginx -t":                true,
-	"nginx -s reload":         true,
+	"nginx -t":        true,
+	"nginx -s reload": true,
 	// Linux - systemd (Ubuntu/Debian/CentOS 7+/RHEL 7+/Fedora)
 	"systemctl reload nginx":  true,
 	"systemctl restart nginx": true,
 	// Linux - SysVinit (CentOS 6/旧系统)
-	"service nginx reload":   true,
-	"service nginx restart":  true,
+	"service nginx reload":  true,
+	"service nginx restart": true,
 	// Linux - OpenRC (Alpine/Gentoo)
 	"rc-service nginx reload":  true,
 	"rc-service nginx restart": true,
 	// Linux - 直接信号
 	"/usr/sbin/nginx -s reload": true,
 	// Windows - Nginx
-	"net stop nginx":             true,
-	"net start nginx":            true,
+	"net stop nginx":                 true,
+	"net start nginx":                true,
 	"C:\\nginx\\nginx.exe -t":        true,
 	"C:\\nginx\\nginx.exe -s reload": true,
 
 	// ========== Apache 命令 ==========
 	// Linux - apachectl (通用)
-	"apachectl -t":        true,
-	"apachectl graceful":  true,
-	"apachectl restart":   true,
+	"apachectl -t":       true,
+	"apachectl graceful": true,
+	"apachectl restart":  true,
 	// Linux - apache2ctl (Debian/Ubuntu)
 	"apache2ctl -t":       true,
 	"apache2ctl graceful": true,
@@ -110,15 +117,15 @@ var AllowedCommands = map[string]bool{
 	"C:\\Apache24\\bin\\httpd.exe -k restart": true,
 	"net stop Apache2.4":                      true,
 	"net start Apache2.4":                     true,
-	"taskkill /F /T /IM httpd.exe":  true,
-	"taskkill /F /T /IM nginx.exe": true,
+	"taskkill /F /T /IM httpd.exe":            true,
+	"taskkill /F /T /IM nginx.exe":            true,
 
 	// ========== 系统扫描命令（只读） ==========
 	"ps -C nginx -o pid=":   true, // 查找 nginx 进程
 	"ps -C httpd -o pid=":   true, // 查找 Apache 进程 (CentOS/RHEL)
 	"ps -C apache2 -o pid=": true, // 查找 Apache 进程 (Debian/Ubuntu)
-	"ss -tlnp":            true, // 查看监听端口
-	"netstat -tlnp":       true, // 查看监听端口（备用）
+	"ss -tlnp":              true, // 查看监听端口
+	"netstat -tlnp":         true, // 查看监听端口（备用）
 
 	// ========== sslctl 服务管理命令 ==========
 	// Linux - systemd
@@ -131,35 +138,35 @@ var AllowedCommands = map[string]bool{
 	"systemctl is-enabled sslctl": true,
 	"systemctl is-active sslctl":  true,
 	// Linux - SysVinit
-	"service sslctl start":   true,
-	"service sslctl stop":    true,
-	"service sslctl restart": true,
-	"service sslctl status":  true,
-	"chkconfig sslctl on":    true,
-	"chkconfig sslctl off":   true,
+	"service sslctl start":         true,
+	"service sslctl stop":          true,
+	"service sslctl restart":       true,
+	"service sslctl status":        true,
+	"chkconfig sslctl on":          true,
+	"chkconfig sslctl off":         true,
 	"update-rc.d sslctl defaults":  true,
 	"update-rc.d sslctl enable":    true,
 	"update-rc.d sslctl disable":   true,
 	"update-rc.d -f sslctl remove": true,
 	// Linux - OpenRC
-	"rc-service sslctl start":   true,
-	"rc-service sslctl stop":    true,
-	"rc-service sslctl restart": true,
-	"rc-service sslctl status":  true,
+	"rc-service sslctl start":      true,
+	"rc-service sslctl stop":       true,
+	"rc-service sslctl restart":    true,
+	"rc-service sslctl status":     true,
 	"rc-update add sslctl default": true,
 	"rc-update del sslctl default": true,
 }
 
 // AllowedScanExecutables 扫描器允许的可执行文件（用于动态路径）
 var AllowedScanExecutables = map[string]bool{
-	"nginx":            true,
-	"nginx.exe":        true,
-	"/usr/sbin/nginx":  true,
-	"httpd":            true,
-	"httpd.exe":        true,
-	"apachectl":        true,
-	"apache2ctl":       true,
-	"/usr/sbin/httpd":  true,
+	"nginx":               true,
+	"nginx.exe":           true,
+	"/usr/sbin/nginx":     true,
+	"httpd":               true,
+	"httpd.exe":           true,
+	"apachectl":           true,
+	"apache2ctl":          true,
+	"/usr/sbin/httpd":     true,
 	"/usr/sbin/apachectl": true,
 }
 
@@ -200,6 +207,15 @@ func Run(cmdStr string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), DefaultTimeout)
 	defer cancel()
 	return RunContext(ctx, cmdStr)
+}
+
+// RunWithin 在父 ctx 之下执行命令，同时保留默认单命令上限。
+// 直接把上游 ctx 交给 RunContext 会在上游无 deadline 时丢掉 30s 保护；
+// 直接用 Run 又让上游取消无法中断命令。取二者更早者。
+func RunWithin(ctx context.Context, cmdStr string) error {
+	c, cancel := context.WithTimeout(ctx, DefaultTimeout)
+	defer cancel()
+	return RunContext(c, cmdStr)
 }
 
 // RunContext 执行命令（带 context 超时控制）

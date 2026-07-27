@@ -2,6 +2,7 @@
 package deployer
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -31,7 +32,7 @@ func NewNginxDeployer(cfg baseDeployer.Config) *NginxDeployer {
 }
 
 // Deploy 部署证书（cert=服务器证书, intermediate=中间证书, key=私钥）
-func (d *NginxDeployer) Deploy(cert, intermediate, key string) error {
+func (d *NginxDeployer) Deploy(ctx context.Context, cert, intermediate, key string) error {
 	fullchain := cert
 	if intermediate != "" {
 		fullchain = cert + "\n" + intermediate
@@ -73,21 +74,21 @@ func (d *NginxDeployer) Deploy(cert, intermediate, key string) error {
 		fmt.Fprintf(os.Stderr, "[WARN] SELinux context restore failed for %s: %v\n", d.keyPath, err)
 	}
 
-	return d.TestAndReload()
+	return d.TestAndReload(ctx)
 }
 
 // Reload 重载 Nginx 服务
-func (d *NginxDeployer) Reload() error {
-	return d.ReloadService()
+func (d *NginxDeployer) Reload(ctx context.Context) error {
+	return d.ReloadService(ctx)
 }
 
 // Test 测试 Nginx 配置
-func (d *NginxDeployer) Test() error {
-	return d.TestConfig()
+func (d *NginxDeployer) Test(ctx context.Context) error {
+	return d.TestConfig(ctx)
 }
 
 // Rollback 回滚到备份的证书
-func (d *NginxDeployer) Rollback(backupCertPath, backupKeyPath string) error {
+func (d *NginxDeployer) Rollback(ctx context.Context, backupCertPath, backupKeyPath string) error {
 	if err := baseDeployer.RestoreFile(backupCertPath, d.certPath); err != nil {
 		return errors.NewStructuredDeployError(
 			errors.DeployErrorPermission, errors.PhaseRollback,
@@ -102,5 +103,5 @@ func (d *NginxDeployer) Rollback(backupCertPath, backupKeyPath string) error {
 		)
 	}
 
-	return d.TestAndReloadForRollback()
+	return d.TestAndReloadForRollback(ctx)
 }

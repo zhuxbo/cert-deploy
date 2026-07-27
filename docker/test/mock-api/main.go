@@ -20,6 +20,8 @@ import (
 	"math/big"
 	"net/http"
 	"os"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -41,6 +43,7 @@ type CertData struct {
 	OrderID          int            `json:"order_id"`
 	Status           string         `json:"status"`
 	Domains          string         `json:"domains,omitempty"`
+	CSR              string         `json:"csr,omitempty"`
 	Cert             string         `json:"certificate"`
 	IntermediateCert string         `json:"ca_certificate"`
 	PrivateKey       string         `json:"private_key"`
@@ -66,9 +69,20 @@ type APIResponse struct {
 	Code    int         `json:"code"`
 	Message string      `json:"msg"`
 	Data    interface{} `json:"data"`
+	// Errors 失败分类（deploy-spec §2.2）。真实服务端的业务失败一律 HTTP 200 + code=0，
+	// 分类只由 errors.error_code 提供——mock 必须照同样形态返回，否则 e2e 验证的是
+	// 一条生产环境不存在的路径（客户端对 HTTP 4xx 与对 code=0+error_code 的处置完全不同）。
+	Errors *APIErrors `json:"errors,omitempty"`
 }
 
-// PaginatedData 分页数据（与 fetcher.PaginatedResponse 字段名匹配）
+// APIErrors errors 字段的第一种形态：参与分类的 {error_code, retry_after?}
+type APIErrors struct {
+	ErrorCode  string `json:"error_code"`
+	RetryAfter int    `json:"retry_after,omitempty"`
+}
+
+// PaginatedData 查询响应数据（fetcher.QueryResponse 消费 data/renew_before_days，
+// 其余分页字段作为多余字段被忽略，保留以模拟旧服务端形态）
 type PaginatedData struct {
 	Total           int         `json:"total"`
 	CurrentPage     int         `json:"page"`
@@ -174,22 +188,74 @@ var (
 	releaseIndex      ReleaseIndex
 )
 
-// 场景配置
+// 场景配置。
+//
+// httpStatus 只用于协议外的服务端崩溃（未捕获异常 → HTTP 500）；所有业务失败必须
+// httpStatus=200 + code=0 + apiErrorCode，与 deploy-spec §2.2 一致。
 var scenarios = map[string]struct {
-	status    string
-	expiresIn time.Duration
-	errorCode int
-	errorMsg  string
+	status       string
+	expiresIn    time.Duration
+	httpStatus   int
+	apiErrorCode string
+	retryAfter   int
+	errorMsg     string
 }{
-	"active":       {status: "active", expiresIn: 90 * 24 * time.Hour},
-	"processing":   {status: "processing", expiresIn: 0},
-	"expired":      {status: "expired", expiresIn: -30 * 24 * time.Hour},
-	"error":        {errorCode: 500, errorMsg: "Internal server error"},
-	"unauthorized": {errorCode: 401, errorMsg: "Unauthorized"},
-	"not_found":    {errorCode: 404, errorMsg: "Order not found"},
+	"active":     {status: "active", expiresIn: 90 * 24 * time.Hour},
+	"processing": {status: "processing", expiresIn: 0},
+	"expired":    {status: "expired", expiresIn: -30 * 24 * time.Hour},
+	// 服务端未捕获异常：协议之外，客户端应按传输故障处理（可重试）
+	"error": {httpStatus: 500, errorMsg: "Internal server error"},
+	// 以下为业务失败：HTTP 200 + code=0 + error_code
+	"unauthorized": {apiErrorCode: "token_invalid", errorMsg: "Invalid deploy token"},
+	"not_found":    {apiErrorCode: "order_not_found", errorMsg: "Order not found"},
+	"rate_limited": {apiErrorCode: "rate_limited", retryAfter: 100, errorMsg: "Deploy token rate limit exceeded"},
 	"batch":        {status: "active", expiresIn: 90 * 24 * time.Hour},
 	"renew-flow":   {status: "processing", expiresIn: 0},
 	"releases":     {status: "active", expiresIn: 90 * 24 * time.Hour},
+}
+
+// scenarioNames 返回排序后的场景名，供日志与错误提示使用（避免多处硬编码后漂移）
+func scenarioNames() string {
+	names := make([]string, 0, len(scenarios))
+	for name := range scenarios {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return strings.Join(names, ", ")
+}
+
+// order 查询参数的形态与条数上限（deploy-spec §2.3）：仅订单 ID，单个或英文逗号分隔多个
+var orderQueryPattern = regexp.MustCompile(`^\d+(,\d+)*$`)
+
+const maxBatchQueryItems = 100
+
+// writeAPIError 按 deploy-spec §2.2 输出业务失败：HTTP 200 + code=0 + errors.error_code
+func writeAPIError(w http.ResponseWriter, msg, errorCode string, retryAfter int) {
+	w.Header().Set("Content-Type", "application/json")
+	resp := APIResponse{Code: 0, Message: msg}
+	if errorCode != "" {
+		resp.Errors = &APIErrors{ErrorCode: errorCode, RetryAfter: retryAfter}
+	}
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// scenarioFailure 若当前场景配置了失败则写出响应并返回 true
+func scenarioFailure(w http.ResponseWriter) bool {
+	cfg, ok := scenarios[getScenario()]
+	if !ok {
+		return false
+	}
+	switch {
+	case cfg.httpStatus > 0:
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(cfg.httpStatus)
+		_ = json.NewEncoder(w).Encode(APIResponse{Code: 0, Message: cfg.errorMsg})
+		return true
+	case cfg.apiErrorCode != "":
+		writeAPIError(w, cfg.errorMsg, cfg.apiErrorCode, cfg.retryAfter)
+		return true
+	}
+	return false
 }
 
 // ==============================================================================
@@ -246,7 +312,7 @@ func main() {
 	log.Printf("Mock API server starting on %s", addr)
 	log.Printf("Cert: %s, Key: %s, Chain: %s", certFile, keyFile, chainFile)
 	log.Printf("Default scenario: %s", currentScenario)
-	log.Printf("Available scenarios: active, processing, expired, error, unauthorized, not_found, batch, renew-flow, releases")
+	log.Printf("Available scenarios: %s", scenarioNames())
 	server := &http.Server{
 		Addr:              addr,
 		Handler:           handler,
@@ -481,10 +547,7 @@ func handleDeploy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 检查场景
-	scenario := getScenario()
-	if cfg, ok := scenarios[scenario]; ok && cfg.errorCode > 0 {
-		w.WriteHeader(cfg.errorCode)
-		_ = json.NewEncoder(w).Encode(APIResponse{Code: 0, Message: cfg.errorMsg})
+	if scenarioFailure(w) {
 		return
 	}
 
@@ -500,41 +563,55 @@ func handleDeploy(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleGetOrders(w http.ResponseWriter, r *http.Request) {
-	ordersMutex.RLock()
-	defer ordersMutex.RUnlock()
+	ordersMutex.Lock()
+	defer ordersMutex.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
 	scenario := getScenario()
 
-	// 检查是否请求特定订单
+	// order 必填且只接受订单 ID（deploy-spec §2.3）：缺参、空串、含域名、超过上限
+	// 一律 invalid_order。真实服务端不再提供「无 order 返回列表」与按域名匹配的行为。
 	orderIDStr := r.URL.Query().Get("order")
-	if orderIDStr != "" {
-		orderID, err := strconv.Atoi(orderIDStr)
-		if err != nil {
-			// 非纯整数: 批量查询（逗号分隔的 ID/域名混合）
-			matchedOrders := filterOrdersByQuery(orderIDStr, scenario)
-			_ = json.NewEncoder(w).Encode(APIResponse{
-				Code:    1,
-				Message: "success",
-				Data: PaginatedData{
-					Total: len(matchedOrders), CurrentPage: 1, PageSize: 100,
-					RenewBeforeDays: 14,
-					Data:            matchedOrders,
-				},
-			})
-			return
-		}
+	if !orderQueryPattern.MatchString(orderIDStr) {
+		writeAPIError(w, "order 参数形态非法（仅接受订单 ID）", "invalid_order", 0)
+		return
+	}
+	if strings.Count(orderIDStr, ",")+1 > maxBatchQueryItems {
+		writeAPIError(w, fmt.Sprintf("单次最多查询 %d 条", maxBatchQueryItems), "invalid_order", 0)
+		return
+	}
+
+	if strings.Contains(orderIDStr, ",") {
+		// 批量查询：全部未命中返回空数组而非报错（spec §2.3）
+		matchedOrders := filterOrdersByQuery(orderIDStr, scenario)
+		_ = json.NewEncoder(w).Encode(APIResponse{
+			Code:    1,
+			Message: "success",
+			Data: PaginatedData{
+				Total: len(matchedOrders), CurrentPage: 1, PageSize: 100,
+				RenewBeforeDays: 14,
+				Data:            matchedOrders,
+			},
+		})
+		return
+	}
+
+	{
+		orderID, _ := strconv.Atoi(orderIDStr)
 
 		order, exists := orders[orderID]
 		if !exists {
-			w.WriteHeader(http.StatusNotFound)
-			_ = json.NewEncoder(w).Encode(APIResponse{Code: 0, Message: "Order not found"})
+			// 单 ID 查询未命中：业务失败，HTTP 200 + code=0 + error_code（spec §2.3）
+			writeAPIError(w, "Order not found", "order_not_found", 0)
 			return
 		}
 
 		// local CSR 已提交：POST 仅返回 processing；后续 GET 返回按该 CSR 公钥签发的证书。
 		if order.CertData.Cert != "" {
 			certData := order.CertData
+			// Mock CA 已完成签发，本次查询把当前动作推进为 active。
+			// 状态更新与 CSR POST 共用 ordersMutex，模拟服务端同订单串行化边界。
+			order.Status = certData.Status
 			_ = json.NewEncoder(w).Encode(APIResponse{
 				Code:    1,
 				Message: "success",
@@ -601,47 +678,7 @@ func handleGetOrders(w http.ResponseWriter, r *http.Request) {
 				},
 			})
 		}
-		return
 	}
-
-	// 无 order 参数：返回订单列表
-	// batch 场景下返回所有 active 订单（附带证书数据）
-	if scenario == "batch" {
-		var activeOrders []interface{}
-		for _, order := range orders {
-			if order.Status == "active" {
-				certData := getCertDataWithOrder(order.CommonName, order.OrderID)
-				certData.Domains = order.Domains
-				activeOrders = append(activeOrders, certData)
-			}
-		}
-		_ = json.NewEncoder(w).Encode(APIResponse{
-			Code:    1,
-			Message: "success",
-			Data: PaginatedData{
-				Total: len(activeOrders), CurrentPage: 1, PageSize: 100,
-				RenewBeforeDays: 14,
-				Data:            activeOrders,
-			},
-		})
-		return
-	}
-
-	// 默认：返回所有订单
-	var orderList []interface{}
-	for _, order := range orders {
-		orderList = append(orderList, *order)
-	}
-
-	_ = json.NewEncoder(w).Encode(APIResponse{
-		Code:    1,
-		Message: "success",
-		Data: PaginatedData{
-			Total: len(orderList), CurrentPage: 1, PageSize: 100,
-			RenewBeforeDays: 14,
-			Data:            orderList,
-		},
-	})
 }
 
 func handleRenewRequest(w http.ResponseWriter, r *http.Request) {
@@ -661,8 +698,22 @@ func handleRenewRequest(w http.ResponseWriter, r *http.Request) {
 
 	order, exists := orders[req.OrderID]
 	if !exists {
-		w.WriteHeader(http.StatusNotFound)
-		_ = json.NewEncoder(w).Encode(APIResponse{Code: 0, Message: "Order not found"})
+		// 业务失败（spec §2.6 单条目组）：HTTP 200 + code=0 + error_code
+		writeAPIError(w, "Order not found", "order_not_found", 0)
+		return
+	}
+	hasMutation := strings.TrimSpace(req.CSR) != "" ||
+		strings.TrimSpace(req.Domains) != "" ||
+		strings.TrimSpace(req.ValidationMethod) != ""
+	if hasMutation && order.Status != "active" {
+		errorCode := ""
+		switch order.Status {
+		case "unpaid", "pending", "processing", "approving", "cancelling":
+			errorCode = "order_in_progress"
+		}
+		writeAPIError(w,
+			fmt.Sprintf("Order status %s does not allow CSR, domains, or validation method updates", order.Status),
+			errorCode, 0)
 		return
 	}
 
@@ -673,6 +724,7 @@ func handleRenewRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	order.Status = "processing"
+	issued.CSR = req.CSR
 	order.CertData = issued
 	order.ExpiresAt = issued.ExpiresAt
 
@@ -680,6 +732,7 @@ func handleRenewRequest(w http.ResponseWriter, r *http.Request) {
 		OrderID:  order.OrderID,
 		Status:   "processing",
 		Domains:  order.Domains,
+		CSR:      req.CSR,
 		IssuedAt: "",
 	}
 	if req.ValidationMethod == "file" {
@@ -697,6 +750,7 @@ func handleRenewRequest(w http.ResponseWriter, r *http.Request) {
 			"order_id":          processing.OrderID,
 			"status":            processing.Status,
 			"domains":           processing.Domains,
+			"csr":               processing.CSR,
 			"file":              processing.File,
 			"renew_before_days": 14,
 		},
@@ -710,10 +764,7 @@ func handleCert(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 检查场景
-	scenario := getScenario()
-	if cfg, ok := scenarios[scenario]; ok && cfg.errorCode > 0 {
-		w.WriteHeader(cfg.errorCode)
-		_ = json.NewEncoder(w).Encode(APIResponse{Code: 0, Message: cfg.errorMsg})
+	if scenarioFailure(w) {
 		return
 	}
 
@@ -888,7 +939,7 @@ func handleSetScenario(w http.ResponseWriter, r *http.Request) {
 	scenario := parts[3]
 	if _, ok := scenarios[scenario]; !ok {
 		w.WriteHeader(http.StatusBadRequest)
-		_, _ = w.Write([]byte(fmt.Sprintf("Unknown scenario: %s. Available: active, processing, expired, error, unauthorized, not_found, batch, renew-flow, releases", scenario)))
+		_, _ = w.Write([]byte(fmt.Sprintf("Unknown scenario: %s. Available: %s", scenario, scenarioNames())))
 		return
 	}
 
@@ -1037,8 +1088,8 @@ func getRenewFlowResponse(order *OrderData) interface{} {
 func checkAuth(w http.ResponseWriter, r *http.Request) bool {
 	auth := r.Header.Get("Authorization")
 	if !strings.HasPrefix(auth, "Bearer ") {
-		w.WriteHeader(http.StatusUnauthorized)
-		_ = json.NewEncoder(w).Encode(APIResponse{Code: 0, Message: "Unauthorized"})
+		// 认证中间件的失败同样是 HTTP 200 + code=0 + error_code（spec §2.2 整批共通组）
+		writeAPIError(w, "Deploy token is missing", "token_missing", 0)
 		return false
 	}
 	return true
@@ -1120,30 +1171,16 @@ func filterOrdersByQuery(query, scenario string) []interface{} {
 	var result []interface{}
 	seen := make(map[int]bool)
 
+	// 只按订单 ID 匹配：spec §2.3 已废止按域名查询，形态校验在调用前完成。
+	// 未命中的 ID 直接略过——批量查询全部未命中返回空数组而非报错。
 	for _, part := range parts {
-		part = strings.TrimSpace(part)
-		if part == "" {
+		id, err := strconv.Atoi(strings.TrimSpace(part))
+		if err != nil {
 			continue
 		}
-
-		// 尝试按 ID 匹配
-		if id, err := strconv.Atoi(part); err == nil {
-			if order, exists := orders[id]; exists && !seen[order.OrderID] {
-				seen[order.OrderID] = true
-				result = append(result, orderToResponse(order, scenario))
-			}
-			continue
-		}
-
-		// 按域名关键字匹配
-		for _, order := range orders {
-			if seen[order.OrderID] {
-				continue
-			}
-			if strings.Contains(order.Domains, part) || strings.Contains(order.CommonName, part) {
-				seen[order.OrderID] = true
-				result = append(result, orderToResponse(order, scenario))
-			}
+		if order, exists := orders[id]; exists && !seen[order.OrderID] {
+			seen[order.OrderID] = true
+			result = append(result, orderToResponse(order, scenario))
 		}
 	}
 

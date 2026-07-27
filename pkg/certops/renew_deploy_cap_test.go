@@ -220,7 +220,9 @@ func TestPrepareLocalRenew_ResponseLossKeepsPending(t *testing.T) {
 			_, _ = w.Write([]byte("network hiccup, not json"))
 			return
 		}
-		_, _ = w.Write([]byte(`{"code":1,"msg":"ok","data":{"order_id":950,"status":"processing"}}`))
+		// 首次 GET 是提交门禁，服务端必须明确 active 才允许 POST。
+		// POST 响应不确定后，下轮 GET 仍缺少 CSR，客户端应保留本地意图并停止。
+		_, _ = w.Write([]byte(`{"code":1,"msg":"ok","data":{"order_id":950,"status":"active"}}`))
 	}))
 	defer server.Close()
 

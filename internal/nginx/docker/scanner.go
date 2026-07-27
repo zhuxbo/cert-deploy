@@ -4,6 +4,7 @@ package docker
 import (
 	"context"
 	"fmt"
+	"path"
 	"regexp"
 	"strings"
 
@@ -43,6 +44,7 @@ type Scanner struct {
 	client       *Client
 	scannedFiles map[string]bool // 已扫描的文件（避免循环）
 	mounts       []MountInfo     // 容器挂载信息
+	configRoot   string          // 容器内主 nginx.conf 所在目录
 }
 
 // NewScanner 创建 Docker 扫描器
@@ -60,6 +62,7 @@ func (s *Scanner) Scan(ctx context.Context) ([]*SSLSite, error) {
 	if err != nil {
 		return nil, fmt.Errorf("detect nginx config failed: %w", err)
 	}
+	s.configRoot = path.Dir(configPath)
 
 	// 2. 获取容器挂载信息
 	info, err := s.client.GetContainerInfo(ctx)
@@ -159,7 +162,10 @@ func (s *Scanner) readContainerFile(ctx context.Context, filePath string) (strin
 
 // findIncludes 查找配置文件中的 include 指令
 func (s *Scanner) findIncludes(ctx context.Context, content, configPath string) []string {
-	configDir := getDir(configPath)
+	configRoot := s.configRoot
+	if configRoot == "" {
+		configRoot = getDir(configPath)
+	}
 	var includes []string
 
 	includeRe := regexp.MustCompile(`(?m)^\s*include\s+([^;]+);`)
@@ -173,9 +179,9 @@ func (s *Scanner) findIncludes(ctx context.Context, content, configPath string) 
 		pattern := strings.TrimSpace(match[1])
 		pattern = strings.Trim(pattern, `"'`)
 
-		// 处理相对路径
+		// Nginx 的 include 相对路径基于主 nginx.conf 所在目录。
 		if !strings.HasPrefix(pattern, "/") {
-			pattern = configDir + "/" + pattern
+			pattern = path.Join(configRoot, pattern)
 		}
 
 		// 处理 glob 模式
@@ -281,6 +287,7 @@ func (s *Scanner) parseConfig(content, configPath string, info *ContainerInfo) [
 			if currentSite != nil && currentSite.ServerName != "" && currentSite.ServerName != "_" {
 				// 计算宿主机路径（有证书配置时）
 				if currentSite.CertificatePath != "" && currentSite.PrivateKeyPath != "" {
+					s.resolveConfigPaths(currentSite, configPath)
 					s.resolveHostPaths(currentSite)
 				}
 				sites = append(sites, currentSite)
@@ -353,12 +360,27 @@ func (s *Scanner) parseConfig(content, configPath string, info *ContainerInfo) [
 	// 处理最后一个 server 块
 	if currentSite != nil && currentSite.ServerName != "" && currentSite.ServerName != "_" {
 		if currentSite.CertificatePath != "" && currentSite.PrivateKeyPath != "" {
+			s.resolveConfigPaths(currentSite, configPath)
 			s.resolveHostPaths(currentSite)
 		}
 		sites = append(sites, currentSite)
 	}
 
 	return sites
+}
+
+// resolveConfigPaths 将配置相关的相对路径按主 nginx.conf 所在目录转为容器内绝对路径。
+func (s *Scanner) resolveConfigPaths(site *SSLSite, configPath string) {
+	configRoot := s.configRoot
+	if configRoot == "" {
+		configRoot = path.Dir(configPath)
+	}
+	if site.CertificatePath != "" && !strings.HasPrefix(site.CertificatePath, "/") {
+		site.CertificatePath = path.Join(configRoot, site.CertificatePath)
+	}
+	if site.PrivateKeyPath != "" && !strings.HasPrefix(site.PrivateKeyPath, "/") {
+		site.PrivateKeyPath = path.Join(configRoot, site.PrivateKeyPath)
+	}
 }
 
 // resolveHostPaths 解析宿主机路径

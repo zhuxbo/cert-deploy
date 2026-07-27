@@ -1079,3 +1079,108 @@ func TestLoadTestdataFile(t *testing.T) {
 		})
 	}
 }
+
+// TestAddSSLConfig_ExactBlockPreferredOverWildcard 回归：同文件内精确块与通配符块并存时，
+// 只向精确匹配的块注入。双向匹配会把本站点证书一并写进 *.example.com 块，
+// 使通配符站点被换上只覆盖单域名的证书，其余子域名 HTTPS 证书不匹配。
+func TestAddSSLConfig_ExactBlockPreferredOverWildcard(t *testing.T) {
+	content := `server {
+    listen 80;
+    server_name www.example.com;
+    root /var/www/www;
+}
+
+server {
+    listen 80;
+    server_name *.example.com;
+    root /var/www/wild;
+}`
+
+	installer := NewNginxInstaller("", "/etc/ssl/cert.crt", "/etc/ssl/key.key", "www.example.com", "")
+
+	result, err := installer.addSSLConfig(content)
+	if err != nil {
+		t.Fatalf("addSSLConfig() error = %v", err)
+	}
+	if n := strings.Count(result, "ssl_certificate /etc/ssl/cert.crt;"); n != 1 {
+		t.Errorf("证书应只注入精确匹配块一次，实际 %d\n%s", n, result)
+	}
+	if n := strings.Count(result, "listen 443 ssl;"); n != 1 {
+		t.Errorf("listen 443 应只注入一次，实际 %d\n%s", n, result)
+	}
+	// 通配符块必须原样保留
+	wildIdx := strings.Index(result, "server_name *.example.com;")
+	if wildIdx < 0 {
+		t.Fatalf("通配符块丢失\n%s", result)
+	}
+	if strings.Contains(result[wildIdx:], "ssl_certificate") {
+		t.Errorf("通配符块不应被注入目标站点证书\n%s", result)
+	}
+}
+
+// TestAddSSLConfig_HTTPRedirectPlusSSLBlock 回归：同名的 "listen 80 跳转块 + listen 443 ssl 块"
+// 常见布局下不得向 80 块二次注入，否则产生 duplicate listen 443 导致配置测试失败回滚。
+func TestAddSSLConfig_HTTPRedirectPlusSSLBlock(t *testing.T) {
+	content := `server {
+    listen 80;
+    server_name www.example.com;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    server_name www.example.com;
+    ssl_certificate /etc/ssl/existing.crt;
+    ssl_certificate_key /etc/ssl/existing.key;
+    root /var/www/www;
+}`
+
+	installer := NewNginxInstaller("", "/etc/ssl/new.crt", "/etc/ssl/new.key", "www.example.com", "")
+
+	result, err := installer.addSSLConfig(content)
+	if err != nil {
+		t.Fatalf("addSSLConfig() error = %v", err)
+	}
+	if result != content {
+		t.Errorf("同名块已配 SSL 时不应再注入\n%s", result)
+	}
+	if !installer.hasSSLConfig(content) {
+		t.Error("hasSSLConfig 应识别同名 443 块已配 SSL")
+	}
+}
+
+// TestInstall_TargetOnNonStandardPort_WildcardSSLNotShortCircuit 回归：目标站点自身在非 80 端口
+// 且未配 SSL、而同域族通配符块已配 SSL 时，Install 必须报明确错误。
+// 若因通配符块已有 SSL 而返回 Modified=false，setup/deploy 会误以为"无需安装"继续部署并报成功，
+// 但目标站点 HTTPS 实际未生效。
+func TestInstall_TargetOnNonStandardPort_WildcardSSLNotShortCircuit(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "test.conf")
+
+	content := `server {
+    listen 8080;
+    server_name www.example.com;
+    root /var/www/www;
+}
+
+server {
+    listen 443 ssl;
+    server_name *.example.com;
+    ssl_certificate /etc/ssl/wild.crt;
+    ssl_certificate_key /etc/ssl/wild.key;
+}`
+	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
+		t.Fatalf("创建配置文件失败: %v", err)
+	}
+
+	installer := NewNginxInstaller(configPath, "/etc/ssl/new.crt", "/etc/ssl/new.key", "www.example.com", "")
+
+	result, err := installer.Install()
+	if err == nil {
+		t.Fatalf("目标块非 80 且无 SSL 时应报错，实际 result=%+v, err=nil", result)
+	}
+	written, _ := os.ReadFile(configPath)
+	if string(written) != content {
+		t.Error("报错路径不应改动配置文件")
+	}
+}

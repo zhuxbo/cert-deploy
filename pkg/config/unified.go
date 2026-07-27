@@ -3,6 +3,7 @@ package config
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -16,6 +17,15 @@ import (
 
 // tokenFormatRegex Token 格式正则：允许字母、数字、连字符、下划线、点
 var tokenFormatRegex = regexp.MustCompile(`^[A-Za-z0-9\-_\.]+$`)
+
+var (
+	// ErrCertNotFound 证书条目不存在（可能被并发删除）
+	ErrCertNotFound = errors.New("certificate not found")
+	// ErrCertCondNotMet UpdateCertIf 的前置条件在文件锁内复检时不再成立，未写盘
+	ErrCertCondNotMet = errors.New("certificate condition not met")
+	// ErrCertNameConflict 目标证书名已存在，拒绝改名以免制造同名条目
+	ErrCertNameConflict = errors.New("certificate name already exists")
+)
 
 // ConfigManager 统一配置管理器
 type ConfigManager struct {
@@ -138,7 +148,7 @@ func (cm *ConfigManager) Load() (*Config, error) {
 // 维护注意事项：
 //   - 如果向 CertConfig 或 SiteBinding 添加新的引用类型字段（map、slice、指针），
 //     必须在此函数中添加对应的深拷贝逻辑，否则会破坏并发安全保证！
-//   - 当前已处理的引用类型：Certificates(slice)、Bindings(slice)、Domains(slice)、Docker(*DockerInfo)、FailedBindings(slice)、ValidationFiles(slice)
+//   - 当前已处理的引用类型：Certificates(slice)、Bindings(slice)、Domains(slice)、Docker(*DockerInfo)、FailedBindings(slice)、StaleBindings(slice)、ValidationFiles(slice)
 func (cm *ConfigManager) copyConfig(src *Config) *Config {
 	if src == nil {
 		return nil
@@ -170,6 +180,11 @@ func (cm *ConfigManager) copyConfig(src *Config) *Config {
 			if cert.Metadata.FailedBindings != nil {
 				dst.Certificates[i].Metadata.FailedBindings = make([]string, len(cert.Metadata.FailedBindings))
 				copy(dst.Certificates[i].Metadata.FailedBindings, cert.Metadata.FailedBindings)
+			}
+			// 深拷贝 StaleBindings 切片
+			if cert.Metadata.StaleBindings != nil {
+				dst.Certificates[i].Metadata.StaleBindings = make([]string, len(cert.Metadata.StaleBindings))
+				copy(dst.Certificates[i].Metadata.StaleBindings, cert.Metadata.StaleBindings)
 			}
 			// 深拷贝 ValidationFiles 切片
 			if cert.Metadata.ValidationFiles != nil {
@@ -506,24 +521,85 @@ func (cm *ConfigManager) UpdateCert(cert *CertConfig) error {
 				return nil
 			}
 		}
-		return fmt.Errorf("certificate not found: %s", cert.CertName)
+		return fmt.Errorf("%w: %s", ErrCertNotFound, cert.CertName)
 	})
 }
 
-// RenameCert 按旧名查找证书并替换为新配置（支持 cert_name 变更）
-func (cm *ConfigManager) RenameCert(oldName string, cert *CertConfig) error {
+// UpdateCertIf 在配置文件锁内做"检查 + 写入"：cond 在**盘上最新状态**上复检，
+// 不成立时返回 ErrCertCondNotMet 且不写盘；证书不存在返回 ErrCertNotFound。
+//
+// 用于"读取时成立、落盘时可能已失效"的守卫场景（如零绑定阻断标记）：
+// 若先用 GetCert 复读再 UpdateCert，守卫看到的是 mtime 门控的缓存快照，
+// 而写入走的是文件锁内强制重读的另一份快照，两者可能不一致（见 mutateLocked 注释）。
+//
+// 注意：mutate 作用于配置副本，调用方内存中的 CertConfig 不会被同步更新，
+// 需要自行回填（日志去重等依赖内存态的逻辑要注意这一点）。
+func (cm *ConfigManager) UpdateCertIf(name string, cond func(*CertConfig) bool, mutate func(*CertConfig)) error {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
 	return cm.mutateLocked(func(cfg *Config) error {
 		for i := range cfg.Certificates {
+			if cfg.Certificates[i].CertName != name {
+				continue
+			}
+			if cond != nil && !cond(&cfg.Certificates[i]) {
+				return ErrCertCondNotMet
+			}
+			mutate(&cfg.Certificates[i])
+			return nil
+		}
+		return fmt.Errorf("%w: %s", ErrCertNotFound, name)
+	})
+}
+
+// RenameCert 按旧名查找证书并替换为新配置（支持 cert_name 变更）。
+// 目标名已存在时返回 ErrCertNameConflict 且不写盘：同名条目并存会让 UpdateCert
+// （按名匹配首条）把健康条目整体覆盖成另一条的内容。
+func (cm *ConfigManager) RenameCert(oldName string, cert *CertConfig) error {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	return cm.mutateLocked(func(cfg *Config) error {
+		idx := -1
+		for i := range cfg.Certificates {
 			if cfg.Certificates[i].CertName == oldName {
-				cfg.Certificates[i] = *cert
-				return nil
+				idx = i
+				break
 			}
 		}
-		return fmt.Errorf("certificate not found: %s", oldName)
+		if idx < 0 {
+			return fmt.Errorf("%w: %s", ErrCertNotFound, oldName)
+		}
+		if cert.CertName != oldName {
+			for i := range cfg.Certificates {
+				if i != idx && cfg.Certificates[i].CertName == cert.CertName {
+					return fmt.Errorf("%w: %s", ErrCertNameConflict, cert.CertName)
+				}
+			}
+		}
+		cfg.Certificates[idx] = *cert
+		return nil
 	})
+}
+
+// FindDuplicateCertNames 返回配置中重复出现的 cert_name（用于运行期告警）。
+// 同名条目只能由历史上未做重名检测的改名产生，本工具不自动合并或删除，交人工处理。
+func (cm *ConfigManager) FindDuplicateCertNames() ([]string, error) {
+	cfg, err := cm.Load()
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]int, len(cfg.Certificates))
+	var dups []string
+	for i := range cfg.Certificates {
+		name := cfg.Certificates[i].CertName
+		seen[name]++
+		if seen[name] == 2 {
+			dups = append(dups, name)
+		}
+	}
+	return dups, nil
 }
 
 // DeleteCert 删除证书配置

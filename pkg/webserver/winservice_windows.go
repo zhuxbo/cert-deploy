@@ -3,6 +3,7 @@
 package webserver
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -140,7 +141,7 @@ func listRunningProcessPaths(processName string) []string {
 //
 // 等待 Stopped 最多 30 秒，避免 wrapper（如 nginxservice.exe）回收 nginx master 较慢
 // 时直接 Start 失败。若服务原本已停止则跳过停止步骤，直接尝试启动。
-func RestartWindowsService(name string) error {
+func RestartWindowsService(ctx context.Context, name string) error {
 	m, err := mgr.Connect()
 	if err != nil {
 		return fmt.Errorf("connect SCM: %w", err)
@@ -178,7 +179,12 @@ func RestartWindowsService(name string) error {
 			if st.State == svc.Stopped {
 				break
 			}
-			time.Sleep(500 * time.Millisecond)
+			// 关停信号必须能中断这段最长 30s 的轮询，否则 daemon 的强杀窗口被它撑满
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("stop service %q aborted: %w", name, ctx.Err())
+			case <-time.After(500 * time.Millisecond):
+			}
 		}
 		if st.State != svc.Stopped {
 			return fmt.Errorf("service %q did not stop within 30s (state=%d)", name, st.State)

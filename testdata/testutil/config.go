@@ -11,10 +11,10 @@ import (
 
 // TestConfig 测试用配置结构（简化版，避免循环导入）
 type TestConfig struct {
-	API          TestAPIConfig       `json:"api"`
-	Schedule     TestScheduleConfig  `json:"schedule"`
-	Certificates []TestCertConfig    `json:"certificates"`
-	Metadata     TestConfigMetadata  `json:"metadata,omitempty"`
+	API          TestAPIConfig      `json:"api"`
+	Schedule     TestScheduleConfig `json:"schedule"`
+	Certificates []TestCertConfig   `json:"certificates"`
+	Metadata     TestConfigMetadata `json:"metadata,omitempty"`
 }
 
 // TestAPIConfig 测试用 API 配置
@@ -31,10 +31,10 @@ type TestScheduleConfig struct {
 
 // TestCertConfig 测试用证书配置
 type TestCertConfig struct {
-	CertName string           `json:"cert_name"`
-	OrderID  int              `json:"order_id"`
-	Enabled  bool             `json:"enabled"`
-	Domains  []string         `json:"domains"`
+	CertName string            `json:"cert_name"`
+	OrderID  int               `json:"order_id"`
+	Enabled  bool              `json:"enabled"`
+	Domains  []string          `json:"domains"`
 	Bindings []TestSiteBinding `json:"bindings"`
 }
 

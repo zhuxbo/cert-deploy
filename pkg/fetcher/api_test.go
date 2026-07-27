@@ -36,7 +36,7 @@ func mockCertData() map[string]interface{} {
 	}
 }
 
-func mockPaginatedData(certData ...map[string]interface{}) map[string]interface{} {
+func mockQueryData(certData ...map[string]interface{}) map[string]interface{} {
 	return map[string]interface{}{
 		"total":     len(certData),
 		"page":      1,
@@ -47,7 +47,7 @@ func mockPaginatedData(certData ...map[string]interface{}) map[string]interface{
 
 // TestNew 测试创建 Fetcher
 func TestNew(t *testing.T) {
-	f := New(30 * time.Second)
+	f := New()
 	if f == nil {
 		t.Fatal("New() returned nil")
 	}
@@ -64,7 +64,7 @@ func TestNewWithRetry(t *testing.T) {
 		MaxWait:     10 * time.Second,
 		Multiplier:  2.0,
 	}
-	f := NewWithRetry(30*time.Second, retryConfig)
+	f := NewWithRetry(retryConfig)
 
 	if f.retryConfig.MaxRetries != 5 {
 		t.Errorf("MaxRetries = %d, want 5", f.retryConfig.MaxRetries)
@@ -93,7 +93,7 @@ func TestInfo(t *testing.T) {
 	}))
 	defer server.Close()
 
-	f := New(30 * time.Second)
+	f := New()
 	ctx := context.Background()
 
 	// 使用 localhost HTTP 应该被允许
@@ -122,7 +122,7 @@ func TestQueryOrder_APIError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	f := New(30 * time.Second)
+	f := New()
 	ctx := context.Background()
 
 	_, _, err := f.QueryOrder(ctx, server.URL, "bad-token", 1)
@@ -142,42 +142,12 @@ func TestQueryOrder_HTTPError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	f := New(30 * time.Second)
+	f := New()
 	ctx := context.Background()
 
 	_, _, err := f.QueryOrder(ctx, server.URL, "token", 1)
 	if err == nil {
 		t.Error("QueryOrder() should return error for HTTP 404")
-	}
-}
-
-// TestQuery 测试按域名查询
-func TestQuery(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// 验证 order 参数
-		order := r.URL.Query().Get("order")
-		if order != "test.example.com" {
-			t.Errorf("order query param = %s, want test.example.com", order)
-		}
-
-		resp := mockResponse{
-			Code: 1,
-			Data: mockPaginatedData(mockCertData()),
-		}
-		_ = json.NewEncoder(w).Encode(resp)
-	}))
-	defer server.Close()
-
-	f := New(30 * time.Second)
-	ctx := context.Background()
-
-	data, _, err := f.Query(ctx, server.URL, "token", "test.example.com")
-	if err != nil {
-		t.Fatalf("Query() error = %v", err)
-	}
-
-	if data.OrderID != 12345 {
-		t.Errorf("OrderID = %d, want 12345", data.OrderID)
 	}
 }
 
@@ -192,13 +162,13 @@ func TestQueryOrder(t *testing.T) {
 
 		resp := mockResponse{
 			Code: 1,
-			Data: mockPaginatedData(mockCertData()),
+			Data: mockQueryData(mockCertData()),
 		}
 		_ = json.NewEncoder(w).Encode(resp)
 	}))
 	defer server.Close()
 
-	f := New(30 * time.Second)
+	f := New()
 	ctx := context.Background()
 
 	data, _, err := f.QueryOrder(ctx, server.URL, "token", 12345)
@@ -238,7 +208,7 @@ func TestUpdate(t *testing.T) {
 	}))
 	defer server.Close()
 
-	f := New(30 * time.Second)
+	f := New()
 	ctx := context.Background()
 
 	data, _, err := f.Update(ctx, server.URL, "token", 12345, "new-csr", "", "")
@@ -248,6 +218,188 @@ func TestUpdate(t *testing.T) {
 
 	if data.OrderID != 12345 {
 		t.Errorf("OrderID = %d, want 12345", data.OrderID)
+	}
+}
+
+type failingReadCloser struct{}
+
+func (failingReadCloser) Read([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }
+func (failingReadCloser) Close() error             { return nil }
+
+// TestUpdateWithCSR_DoesNotRetryAfterPossibleDelivery 防止结果不确定的 CSR POST 被传输层重放。
+// 网络错误、5xx 和响应体读取失败都可能发生在服务端已受理之后，必须统一交给上层 query-first。
+func TestUpdateWithCSR_DoesNotRetryAfterPossibleDelivery(t *testing.T) {
+	tests := []struct {
+		name      string
+		transport roundTripperFunc
+	}{
+		{
+			name: "network error",
+			transport: func(*http.Request) (*http.Response, error) {
+				return nil, io.ErrUnexpectedEOF
+			},
+		},
+		{
+			name: "HTTP 500",
+			transport: func(*http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusInternalServerError,
+					Body:       io.NopCloser(strings.NewReader("temporary failure")),
+					Header:     make(http.Header),
+				}, nil
+			},
+		},
+		{
+			name: "response read failure",
+			transport: func(*http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       failingReadCloser{},
+					Header:     make(http.Header),
+				}, nil
+			},
+		},
+		{
+			name: "invalid JSON response",
+			transport: func(*http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader("not-json")),
+					Header:     make(http.Header),
+				}, nil
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			attempts := 0
+			f := NewWithRetry(RetryConfig{
+				MaxRetries:  3,
+				InitialWait: time.Millisecond,
+				MaxWait:     time.Millisecond,
+				Multiplier:  1,
+			})
+			f.client.Transport = roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				attempts++
+				return tt.transport.RoundTrip(req)
+			})
+
+			_, _, err := f.Update(
+				context.Background(),
+				"http://127.0.0.1",
+				"token",
+				12345,
+				"-----BEGIN CERTIFICATE REQUEST-----\nCSR\n-----END CERTIFICATE REQUEST-----",
+				"example.com",
+				"file",
+			)
+			if err == nil {
+				t.Fatal("Update() error = nil, want failure")
+			}
+			if attempts != 1 {
+				t.Fatalf("CSR POST attempts = %d, want 1", attempts)
+			}
+		})
+	}
+}
+
+// TestUpdateWithoutCSRStillRetries 验证 order_id-only 的兼容/self-heal 请求仍适用通用重试。
+func TestUpdateWithoutCSRStillRetries(t *testing.T) {
+	attempts := 0
+	f := NewWithRetry(RetryConfig{
+		MaxRetries:  1,
+		InitialWait: time.Millisecond,
+		MaxWait:     time.Millisecond,
+		Multiplier:  1,
+	})
+	f.client.Transport = roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		attempts++
+		status := http.StatusInternalServerError
+		body := "temporary failure"
+		if attempts == 2 {
+			status = http.StatusOK
+			body = `{"code":1,"msg":"ok","data":{"order_id":12345,"status":"active"}}`
+		}
+		return &http.Response{
+			StatusCode: status,
+			Body:       io.NopCloser(strings.NewReader(body)),
+			Header:     make(http.Header),
+		}, nil
+	})
+
+	if _, _, err := f.Update(context.Background(), "http://127.0.0.1", "token", 12345, " \t", "", ""); err != nil {
+		t.Fatalf("order_id-only Update() error = %v", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("order_id-only POST attempts = %d, want 2", attempts)
+	}
+}
+
+func TestCallbackStillRetriesTransportFailures(t *testing.T) {
+	failures := []struct {
+		name string
+		fail func() (*http.Response, error)
+	}{
+		{
+			name: "HTTP 500",
+			fail: func() (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusInternalServerError,
+					Body:       io.NopCloser(strings.NewReader("temporary failure")),
+					Header:     make(http.Header),
+				}, nil
+			},
+		},
+		{
+			name: "network error",
+			fail: func() (*http.Response, error) {
+				return nil, io.ErrUnexpectedEOF
+			},
+		},
+		{
+			name: "response read failure",
+			fail: func() (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       failingReadCloser{},
+					Header:     make(http.Header),
+				}, nil
+			},
+		},
+	}
+
+	for _, tt := range failures {
+		t.Run(tt.name, func(t *testing.T) {
+			attempts := 0
+			f := NewWithRetry(RetryConfig{
+				MaxRetries:  1,
+				InitialWait: time.Millisecond,
+				MaxWait:     time.Millisecond,
+				Multiplier:  1,
+			})
+			f.client.Transport = roundTripperFunc(func(*http.Request) (*http.Response, error) {
+				attempts++
+				if attempts == 1 {
+					return tt.fail()
+				}
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader(`{"code":1,"msg":"ok","data":{}}`)),
+					Header:     make(http.Header),
+				}, nil
+			})
+
+			if _, err := f.Callback(context.Background(), "http://127.0.0.1/callback", "token", &CallbackRequest{
+				OrderID: 12345,
+				Status:  "success",
+			}); err != nil {
+				t.Fatalf("Callback() error = %v", err)
+			}
+			if attempts != 2 {
+				t.Fatalf("Callback attempts = %d, want 2", attempts)
+			}
+		})
 	}
 }
 
@@ -278,7 +430,7 @@ func TestCallback(t *testing.T) {
 	}))
 	defer server.Close()
 
-	f := New(30 * time.Second)
+	f := New()
 	ctx := context.Background()
 
 	req := &CallbackRequest{
@@ -300,7 +452,7 @@ func TestCallbackReadsRenewBeforeDaysFromData(t *testing.T) {
 	}))
 	defer server.Close()
 
-	f := New(30 * time.Second)
+	f := New()
 	got, err := f.Callback(context.Background(), server.URL, "token", &CallbackRequest{
 		OrderID: 12345,
 		Status:  "success",
@@ -324,7 +476,7 @@ func TestCallback_Error(t *testing.T) {
 	}))
 	defer server.Close()
 
-	f := New(30 * time.Second)
+	f := New()
 	ctx := context.Background()
 
 	req := &CallbackRequest{OrderID: 12345, Status: "success"}
@@ -477,7 +629,7 @@ func TestRetry(t *testing.T) {
 		MaxWait:     50 * time.Millisecond,
 		Multiplier:  1.0,
 	}
-	f := NewWithRetry(30*time.Second, retryConfig)
+	f := NewWithRetry(retryConfig)
 	ctx := context.Background()
 
 	_, _, err := f.QueryOrder(ctx, server.URL, "token", 1)
@@ -505,7 +657,7 @@ func TestRetry_ExhaustedRetries(t *testing.T) {
 		MaxWait:     50 * time.Millisecond,
 		Multiplier:  1.0,
 	}
-	f := NewWithRetry(30*time.Second, retryConfig)
+	f := NewWithRetry(retryConfig)
 	ctx := context.Background()
 
 	_, _, err := f.QueryOrder(ctx, server.URL, "token", 1)
@@ -528,7 +680,7 @@ func TestContextCancellation(t *testing.T) {
 	}))
 	defer server.Close()
 
-	f := New(30 * time.Second)
+	f := New()
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 
@@ -584,7 +736,7 @@ func TestResponseSizeLimit(t *testing.T) {
 	}))
 	defer server.Close()
 
-	f := New(30 * time.Second)
+	f := New()
 	ctx := context.Background()
 
 	// 正常响应应该成功
@@ -607,7 +759,7 @@ func TestQueryOrder_Retry(t *testing.T) {
 		// 第三次成功
 		resp := mockResponse{
 			Code: 1,
-			Data: mockPaginatedData(mockCertData()),
+			Data: mockQueryData(mockCertData()),
 		}
 		_ = json.NewEncoder(w).Encode(resp)
 	}))
@@ -620,7 +772,7 @@ func TestQueryOrder_Retry(t *testing.T) {
 		MaxWait:     50 * time.Millisecond,
 		Multiplier:  1.0,
 	}
-	f := NewWithRetry(30*time.Second, retryConfig)
+	f := NewWithRetry(retryConfig)
 	ctx := context.Background()
 
 	data, _, err := f.QueryOrder(ctx, server.URL, "token", 12345)
@@ -685,7 +837,7 @@ func TestQueryOrder_RetryBoundary(t *testing.T) {
 					w.WriteHeader(http.StatusInternalServerError)
 					return
 				}
-				resp := mockResponse{Code: 1, Data: mockPaginatedData(mockCertData())}
+				resp := mockResponse{Code: 1, Data: mockQueryData(mockCertData())}
 				_ = json.NewEncoder(w).Encode(resp)
 			}))
 			defer server.Close()
@@ -696,7 +848,7 @@ func TestQueryOrder_RetryBoundary(t *testing.T) {
 				MaxWait:     20 * time.Millisecond,
 				Multiplier:  1.0,
 			}
-			f := NewWithRetry(30*time.Second, retryConfig)
+			f := NewWithRetry(retryConfig)
 			ctx := context.Background()
 
 			_, _, err := f.QueryOrder(ctx, server.URL, "token", 12345)
@@ -713,7 +865,88 @@ func TestQueryOrder_RetryBoundary(t *testing.T) {
 	}
 }
 
-// TestFetcher_Timeout 测试请求超时
+// roundTripperFunc 便于在不发起真实连接的情况下观察 doAttempt 套用的 deadline
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) { return fn(req) }
+
+// TestFetcher_DefaultTimeouts 默认单次请求超时须与 deploy-spec §11 一致，
+// 且不得依赖 client.Timeout（它无法按方法区分，会把 POST 一并压到 GET 的时长）
+func TestFetcher_DefaultTimeouts(t *testing.T) {
+	f := New()
+	if f.getTimeout != 30*time.Second {
+		t.Errorf("getTimeout = %v, 期望 30s", f.getTimeout)
+	}
+	if f.postTimeout != 60*time.Second {
+		t.Errorf("postTimeout = %v, 期望 60s", f.postTimeout)
+	}
+	if f.client.Timeout != 0 {
+		t.Errorf("client.Timeout = %v, 期望 0（超时改由 doAttempt 按方法套用）", f.client.Timeout)
+	}
+}
+
+// TestFetcher_PerRequestDeadline 单次尝试按方法套用超时；父 ctx 更早时以父为准
+func TestFetcher_PerRequestDeadline(t *testing.T) {
+	const okBody = `{"code":1,"msg":"ok","data":{}}`
+
+	newProbe := func(observed *time.Duration) *Fetcher {
+		f := NewWithRetry(RetryConfig{MaxRetries: 0})
+		f.client.Transport = roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			dl, ok := req.Context().Deadline()
+			if !ok {
+				return nil, fmt.Errorf("请求 ctx 没有 deadline")
+			}
+			*observed = time.Until(dl)
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(okBody)),
+				Header:     make(http.Header),
+			}, nil
+		})
+		return f
+	}
+
+	tests := []struct {
+		name       string
+		parent     time.Duration // 0 表示父 ctx 无 deadline
+		post       bool
+		wantBudget time.Duration
+	}{
+		{"GET 无父 deadline 用 30s", 0, false, 30 * time.Second},
+		{"POST 无父 deadline 用 60s", 0, true, 60 * time.Second},
+		{"GET 父 deadline 更早时以父为准", 5 * time.Second, false, 5 * time.Second},
+		{"POST 父 deadline 更早时以父为准", 5 * time.Second, true, 5 * time.Second},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var observed time.Duration
+			f := newProbe(&observed)
+
+			ctx := context.Background()
+			if tt.parent > 0 {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, tt.parent)
+				defer cancel()
+			}
+
+			if tt.post {
+				_, _ = f.Callback(ctx, "http://127.0.0.1:9", "token", &CallbackRequest{OrderID: 1, Status: "success"})
+			} else {
+				_, _, _ = f.QueryOrder(ctx, "http://127.0.0.1:9", "token", 1)
+			}
+
+			if observed == 0 {
+				t.Fatal("transport 未被调用，无法观察 deadline")
+			}
+			if diff := observed - tt.wantBudget; diff > 2*time.Second || diff < -2*time.Second {
+				t.Errorf("单次请求预算 = %v, 期望约 %v", observed.Round(time.Second), tt.wantBudget)
+			}
+		})
+	}
+}
+
+// TestFetcher_Timeout 单次请求超时到期时请求失败（GET 用 getTimeout）
 func TestFetcher_Timeout(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// 模拟慢响应
@@ -723,13 +956,80 @@ func TestFetcher_Timeout(t *testing.T) {
 	}))
 	defer server.Close()
 
-	// 设置很短的超时
-	f := New(100 * time.Millisecond)
-	ctx := context.Background()
+	f := NewWithRetry(RetryConfig{MaxRetries: 0})
+	f.getTimeout = 100 * time.Millisecond
 
-	_, _, err := f.QueryOrder(ctx, server.URL, "token", 1)
+	_, _, err := f.QueryOrder(context.Background(), server.URL, "token", 1)
 	if err == nil {
-		t.Error("QueryOrder() 应因超时而失败")
+		t.Error("QueryOrder() 应因单次请求超时而失败")
+	}
+}
+
+// TestFetcher_PostUsesPostTimeout POST 不受 GET 超时约束（项 K：此前 60s 是死代码，
+// client.Timeout=30s 覆盖整个请求，POST 实际只有 30s）
+func TestFetcher_PostUsesPostTimeout(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(300 * time.Millisecond)
+		_, _ = io.WriteString(w, `{"code":1,"msg":"ok"}`)
+	}))
+	defer server.Close()
+
+	f := NewWithRetry(RetryConfig{MaxRetries: 0})
+	f.getTimeout = 50 * time.Millisecond
+	f.postTimeout = 10 * time.Second
+
+	if _, err := f.Callback(context.Background(), server.URL, "token",
+		&CallbackRequest{OrderID: 1, Status: "success"}); err != nil {
+		t.Errorf("POST 应使用 postTimeout 而非 getTimeout，实际失败: %v", err)
+	}
+}
+
+// TestFetcher_SlowBodyReadWithinBudget 分块慢速返回的响应体必须在单次预算内完整读出。
+// 项 M 回归：此前 per-request ctx 的 cancel 在 doWithRetry 返回时触发，
+// 而调用方在返回之后才读 body，大响应会间歇性 context canceled。
+func TestFetcher_SlowBodyReadWithinBudget(t *testing.T) {
+	// 4 × 8KB 合计 32KB，低于回调响应 64KB 上限，只为让读取跨越多个网络往返
+	padding := strings.Repeat("A", 8*1024)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		flusher, _ := w.(http.Flusher)
+		_, _ = io.WriteString(w, `{"code":1,"msg":"`)
+		for i := 0; i < 4; i++ {
+			_, _ = io.WriteString(w, padding)
+			if flusher != nil {
+				flusher.Flush()
+			}
+			time.Sleep(30 * time.Millisecond)
+		}
+		_, _ = io.WriteString(w, `","data":{}}`)
+	}))
+	defer server.Close()
+
+	f := NewWithRetry(RetryConfig{MaxRetries: 0})
+	if _, err := f.Callback(context.Background(), server.URL, "token",
+		&CallbackRequest{OrderID: 1, Status: "success"}); err != nil {
+		t.Errorf("分块响应体应在单次预算内完整读出，实际失败: %v", err)
+	}
+}
+
+// TestFetcher_ErrorBodyTruncated 可重试失败的响应体只取 1KB，
+// 避免批量查询的 5MB 上限 × 4 次尝试把错误信息本身变成 MB 级字符串
+func TestFetcher_ErrorBodyTruncated(t *testing.T) {
+	huge := strings.Repeat("E", 256*1024)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, huge)
+	}))
+	defer server.Close()
+
+	f := NewWithRetry(RetryConfig{MaxRetries: 0})
+	_, _, err := f.QueryOrder(context.Background(), server.URL, "token", 1)
+	if err == nil {
+		t.Fatal("5xx 应返回错误")
+	}
+	if len(err.Error()) > 4096 {
+		t.Errorf("错误信息长度 = %d，响应体未被截断到 1KB", len(err.Error()))
 	}
 }
 
@@ -742,7 +1042,7 @@ func TestFetcher_TimeoutWithContext(t *testing.T) {
 	}))
 	defer server.Close()
 
-	f := New(30 * time.Second)
+	f := New()
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 
@@ -774,7 +1074,7 @@ func TestFetcher_LargeResponse(t *testing.T) {
 	}))
 	defer server.Close()
 
-	f := New(30 * time.Second)
+	f := New()
 	ctx := context.Background()
 
 	data, _, err := f.QueryOrder(ctx, server.URL, "token", 1)
@@ -807,7 +1107,7 @@ func TestRetry_429TooManyRequests(t *testing.T) {
 		MaxWait:     50 * time.Millisecond,
 		Multiplier:  1.0,
 	}
-	f := NewWithRetry(30*time.Second, retryConfig)
+	f := NewWithRetry(retryConfig)
 	ctx := context.Background()
 
 	_, _, err := f.QueryOrder(ctx, server.URL, "token", 1)
@@ -847,7 +1147,7 @@ func TestRetry_NonRetryableErrors(t *testing.T) {
 				MaxWait:     50 * time.Millisecond,
 				Multiplier:  1.0,
 			}
-			f := NewWithRetry(30*time.Second, retryConfig)
+			f := NewWithRetry(retryConfig)
 			ctx := context.Background()
 
 			_, _, err := f.QueryOrder(ctx, server.URL, "token", 1)
@@ -886,6 +1186,7 @@ func TestCertData_Fields(t *testing.T) {
 			"order_id":       99999,
 			"status":         "active",
 			"domains":        "test.example.com,www.test.example.com",
+			"csr":            "-----BEGIN CERTIFICATE REQUEST-----\ncsr\n-----END CERTIFICATE REQUEST-----",
 			"certificate":    "-----BEGIN CERTIFICATE-----\ncert\n-----END CERTIFICATE-----",
 			"ca_certificate": "-----BEGIN CERTIFICATE-----\nca\n-----END CERTIFICATE-----",
 			"private_key":    "-----BEGIN RSA PRIVATE KEY-----\nkey\n-----END RSA PRIVATE KEY-----",
@@ -897,7 +1198,7 @@ func TestCertData_Fields(t *testing.T) {
 	}))
 	defer server.Close()
 
-	f := New(30 * time.Second)
+	f := New()
 	ctx := context.Background()
 
 	data, _, err := f.QueryOrder(ctx, server.URL, "token", 1)
@@ -913,6 +1214,9 @@ func TestCertData_Fields(t *testing.T) {
 	}
 	if data.Domains != "test.example.com,www.test.example.com" {
 		t.Errorf("Domains = %s", data.Domains)
+	}
+	if data.CSR != "-----BEGIN CERTIFICATE REQUEST-----\ncsr\n-----END CERTIFICATE REQUEST-----" {
+		t.Errorf("CSR = %q", data.CSR)
 	}
 	if data.IssuedAt != "2024-06-01" {
 		t.Errorf("IssuedAt = %s", data.IssuedAt)
@@ -935,7 +1239,7 @@ func TestCallbackNew(t *testing.T) {
 	}))
 	defer server.Close()
 
-	f := New(30 * time.Second)
+	f := New()
 	ctx := context.Background()
 
 	req := &CallbackRequest{
@@ -969,7 +1273,7 @@ func TestUpdate_WithDomains(t *testing.T) {
 	}))
 	defer server.Close()
 
-	f := New(30 * time.Second)
+	f := New()
 	ctx := context.Background()
 
 	_, _, err := f.Update(ctx, server.URL, "token", 12345, "csr", "example.com,www.example.com", "http")
@@ -978,38 +1282,38 @@ func TestUpdate_WithDomains(t *testing.T) {
 	}
 }
 
-// TestAPIResponse_ParsePaginatedData 测试分页响应解析
-func TestAPIResponse_ParsePaginatedData(t *testing.T) {
+// TestAPIResponse_ParseQueryData 测试查询响应解析
+func TestAPIResponse_ParseQueryData(t *testing.T) {
 	tests := []struct {
 		name      string
 		data      string
 		wantCount int
-		wantTotal int
 		wantErr   bool
 	}{
 		{
-			name:      "分页响应",
-			data:      `{"total":2,"page":1,"page_size":100,"data":[{"order_id":1,"status":"active"},{"order_id":2,"status":"active"}]}`,
+			name:      "标准查询响应",
+			data:      `{"renew_before_days":14,"data":[{"order_id":1,"status":"active"},{"order_id":2,"status":"active"}]}`,
 			wantCount: 2,
-			wantTotal: 2,
 		},
 		{
-			name:      "分页响应空数据",
-			data:      `{"total":0,"page":1,"page_size":100,"data":[]}`,
+			name:      "查询响应空数据",
+			data:      `{"renew_before_days":14,"data":[]}`,
 			wantCount: 0,
-			wantTotal: 0,
+		},
+		{
+			name:      "带旧分页字段的响应（多余字段被忽略）",
+			data:      `{"total":2,"page":1,"page_size":100,"data":[{"order_id":1,"status":"active"},{"order_id":2,"status":"active"}]}`,
+			wantCount: 2,
 		},
 		{
 			name:      "兼容单对象",
 			data:      `{"order_id":123,"status":"issued"}`,
 			wantCount: 1,
-			wantTotal: 1,
 		},
 		{
 			name:      "兼容数组",
 			data:      `[{"order_id":1,"status":"active"},{"order_id":2,"status":"active"}]`,
 			wantCount: 2,
-			wantTotal: 2,
 		},
 		{
 			name:    "空数据",
@@ -1030,9 +1334,9 @@ func TestAPIResponse_ParsePaginatedData(t *testing.T) {
 				Data: json.RawMessage(tt.data),
 			}
 
-			certs, total, _, err := resp.ParsePaginatedData()
+			certs, _, err := resp.ParseQueryData()
 			if (err != nil) != tt.wantErr {
-				t.Errorf("ParsePaginatedData() error = %v, wantErr %v", err, tt.wantErr)
+				t.Errorf("ParseQueryData() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
 			if err != nil {
@@ -1041,9 +1345,6 @@ func TestAPIResponse_ParsePaginatedData(t *testing.T) {
 			if len(certs) != tt.wantCount {
 				t.Errorf("certs count = %d, want %d", len(certs), tt.wantCount)
 			}
-			if total != tt.wantTotal {
-				t.Errorf("total = %d, want %d", total, tt.wantTotal)
-			}
 		})
 	}
 }
@@ -1051,115 +1352,106 @@ func TestAPIResponse_ParsePaginatedData(t *testing.T) {
 // TestQueryBatch 测试批量查询
 func TestQueryBatch(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		queryParam := r.URL.Query().Get("order")
-		pageSize := r.URL.Query().Get("page_size")
-
-		if pageSize != "100" {
-			t.Errorf("pageSize = %s, want 100", pageSize)
+		if got := r.URL.Query().Get("order"); got != "123,456" {
+			t.Errorf("order query param = %s, want 123,456", got)
 		}
 
-		var data []map[string]interface{}
-		if queryParam == "" {
-			// 无参数：返回全部
-			data = []map[string]interface{}{mockCertData()}
-		} else if queryParam == "123,example.com" {
-			// 混合查询
-			cert1 := mockCertData()
-			cert1["order_id"] = 123
-			cert2 := mockCertData()
-			cert2["order_id"] = 456
-			data = []map[string]interface{}{cert1, cert2}
-		}
-
+		cert1 := mockCertData()
+		cert1["order_id"] = 123
+		cert2 := mockCertData()
+		cert2["order_id"] = 456
 		resp := mockResponse{
 			Code: 1,
 			Data: map[string]interface{}{
-				"total":     len(data),
-				"page":      1,
-				"page_size": 100,
-				"data":      data,
+				"renew_before_days": 14,
+				"data":              []map[string]interface{}{cert1, cert2},
 			},
 		}
 		_ = json.NewEncoder(w).Encode(resp)
 	}))
 	defer server.Close()
 
-	f := New(30 * time.Second)
-	ctx := context.Background()
-
-	// 测试无参数查询
-	certs, _, err := f.QueryBatch(ctx, server.URL, "token", "")
+	certs, _, err := queryBatchHelper(t, server.URL, "123,456")
 	if err != nil {
-		t.Fatalf("QueryBatch('') error = %v", err)
-	}
-	if len(certs) != 1 {
-		t.Errorf("QueryBatch('') got %d certs, want 1", len(certs))
-	}
-
-	// 测试混合查询
-	certs, _, err = f.QueryBatch(ctx, server.URL, "token", "123,example.com")
-	if err != nil {
-		t.Fatalf("QueryBatch('123,example.com') error = %v", err)
+		t.Fatalf("QueryBatch('123,456') error = %v", err)
 	}
 	if len(certs) != 2 {
-		t.Errorf("QueryBatch('123,example.com') got %d certs, want 2", len(certs))
+		t.Errorf("QueryBatch('123,456') got %d certs, want 2", len(certs))
 	}
 }
 
-// TestQueryBatch_Pagination 测试批量查询自动翻页
-func TestQueryBatch_Pagination(t *testing.T) {
+// queryBatchHelper 测试辅助：以默认 Fetcher 执行批量查询
+func queryBatchHelper(t *testing.T, baseURL, query string) ([]CertData, int, error) {
+	t.Helper()
+	return New().QueryBatch(context.Background(), baseURL, "token", query)
+}
+
+// TestQueryBatch_RejectsInvalidQuery 形态非法的 query 本地拒绝，不发请求（deploy-spec §2.3）
+func TestQueryBatch_RejectsInvalidQuery(t *testing.T) {
+	called := false
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		called = true
+	}))
+	defer server.Close()
+
+	for _, query := range []string{"", "example.com", "123,example.com", "12 34", "123,"} {
+		if _, _, err := queryBatchHelper(t, server.URL, query); err == nil {
+			t.Errorf("QueryBatch(%q) error = nil, want invalid-query rejection", query)
+		}
+	}
+	if called {
+		t.Error("server was called, want local rejection before any request")
+	}
+}
+
+// TestQueryBatch_SingleRequestNoPagination 锁死「单次请求、绝不翻页」这个边界不变式。
+//
+// 服务端（或异常实现）返回带旧分页字段且 total 谎报极大——旧的按 total 翻页实现
+// 在这个输入下会无限请求下去（终止只依赖 total 与非空页，两者同时失真即失效），
+// 且累积切片同步无限增长。本用例断言客户端只发一次请求、不带任何分页参数，
+// 防止分页循环被重新引入。
+func TestQueryBatch_SingleRequestNoPagination(t *testing.T) {
 	callCount := 0
+	var gotPage, gotPageSize string
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		callCount++
-		page := r.URL.Query().Get("page")
+		gotPage = r.URL.Query().Get("page")
+		gotPageSize = r.URL.Query().Get("page_size")
 
-		var data []map[string]interface{}
-		total := 3
-		pageNum := 1
-		if page == "2" {
-			pageNum = 2
-		}
-
-		switch page {
-		case "1":
-			cert1 := mockCertData()
-			cert1["order_id"] = 1
-			cert2 := mockCertData()
-			cert2["order_id"] = 2
-			data = []map[string]interface{}{cert1, cert2}
-		case "2":
-			cert3 := mockCertData()
-			cert3["order_id"] = 3
-			data = []map[string]interface{}{cert3}
-		default:
-			data = []map[string]interface{}{}
-		}
+		cert1 := mockCertData()
+		cert1["order_id"] = 1
+		cert2 := mockCertData()
+		cert2["order_id"] = 2
 
 		resp := mockResponse{
 			Code: 1,
 			Data: map[string]interface{}{
-				"total":     total,
-				"page":      pageNum,
-				"page_size": 2,
-				"data":      data,
+				"total":     999999, // 谎报总数：旧实现据此继续翻页
+				"page":      1,
+				"page_size": MaxBatchQueryItems,
+				"data":      []map[string]interface{}{cert1, cert2},
 			},
 		}
 		_ = json.NewEncoder(w).Encode(resp)
 	}))
 	defer server.Close()
 
-	f := New(30 * time.Second)
-	ctx := context.Background()
-
-	certs, _, err := f.QueryBatch(ctx, server.URL, "token", "")
+	certs, _, err := queryBatchHelper(t, server.URL, "1,2")
 	if err != nil {
 		t.Fatalf("QueryBatch() error = %v", err)
 	}
-	if len(certs) != 3 {
-		t.Errorf("got %d certs, want 3", len(certs))
+	if callCount != 1 {
+		t.Errorf("API called %d times, want exactly 1 (must not paginate)", callCount)
 	}
-	if callCount != 2 {
-		t.Errorf("API called %d times, want 2 (pagination)", callCount)
+	if len(certs) != 2 {
+		t.Errorf("got %d certs, want 2 (single response as-is)", len(certs))
+	}
+	if gotPage != "" {
+		t.Errorf("page param = %q, want absent (no pagination in protocol)", gotPage)
+	}
+	if gotPageSize != "" {
+		t.Errorf("page_size param = %q, want absent (no pagination in protocol)", gotPageSize)
 	}
 }
 
@@ -1171,10 +1463,10 @@ func TestQueryBatch_APIError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	f := NewWithRetry(30*time.Second, RetryConfig{MaxRetries: 0})
+	f := NewWithRetry(RetryConfig{MaxRetries: 0})
 	ctx := context.Background()
 
-	_, _, err := f.QueryBatch(ctx, server.URL, "bad-token", "")
+	_, _, err := f.QueryBatch(ctx, server.URL, "bad-token", "12345")
 	if err == nil {
 		t.Fatal("QueryBatch() should return error for API error")
 	}
@@ -1185,7 +1477,7 @@ func TestQueryBatch_APIError(t *testing.T) {
 
 // TestQueryBatch_ExceedsLimit 批量查询超过 100 项上限
 func TestQueryBatch_ExceedsLimit(t *testing.T) {
-	f := NewWithRetry(30*time.Second, RetryConfig{MaxRetries: 0})
+	f := NewWithRetry(RetryConfig{MaxRetries: 0})
 	ctx := context.Background()
 
 	// 构造 101 项查询
@@ -1215,8 +1507,8 @@ func TestQueryBatch_ExceedsLimit(t *testing.T) {
 	}
 }
 
-// TestParsePaginatedData_RenewBeforeDays 验证分页响应中 renew_before_days 字段解析
-func TestParsePaginatedData_RenewBeforeDays(t *testing.T) {
+// TestParseQueryData_RenewBeforeDays 验证查询响应中 renew_before_days 字段解析
+func TestParseQueryData_RenewBeforeDays(t *testing.T) {
 	tests := []struct {
 		name                string
 		dataJSON            string
@@ -1224,17 +1516,17 @@ func TestParsePaginatedData_RenewBeforeDays(t *testing.T) {
 	}{
 		{
 			name:                "包含 renew_before_days",
-			dataJSON:            `{"total":1,"page":1,"page_size":100,"renew_before_days":14,"data":[{"order_id":123,"status":"active"}]}`,
+			dataJSON:            `{"renew_before_days":14,"data":[{"order_id":123,"status":"active"}]}`,
 			wantRenewBeforeDays: 14,
 		},
 		{
 			name:                "renew_before_days 为 0",
-			dataJSON:            `{"total":1,"page":1,"page_size":100,"renew_before_days":0,"data":[{"order_id":123,"status":"active"}]}`,
+			dataJSON:            `{"renew_before_days":0,"data":[{"order_id":123,"status":"active"}]}`,
 			wantRenewBeforeDays: 0,
 		},
 		{
 			name:                "不含 renew_before_days 字段",
-			dataJSON:            `{"total":1,"page":1,"page_size":100,"data":[{"order_id":123,"status":"active"}]}`,
+			dataJSON:            `{"data":[{"order_id":123,"status":"active"}]}`,
 			wantRenewBeforeDays: 0,
 		},
 	}
@@ -1245,9 +1537,9 @@ func TestParsePaginatedData_RenewBeforeDays(t *testing.T) {
 				Code: 1,
 				Data: json.RawMessage(tt.dataJSON),
 			}
-			_, _, renewBeforeDays, err := resp.ParsePaginatedData()
+			_, renewBeforeDays, err := resp.ParseQueryData()
 			if err != nil {
-				t.Fatalf("ParsePaginatedData() error = %v", err)
+				t.Fatalf("ParseQueryData() error = %v", err)
 			}
 			if renewBeforeDays != tt.wantRenewBeforeDays {
 				t.Errorf("renewBeforeDays = %d, want %d", renewBeforeDays, tt.wantRenewBeforeDays)
@@ -1256,7 +1548,7 @@ func TestParsePaginatedData_RenewBeforeDays(t *testing.T) {
 	}
 }
 
-func TestParsePaginatedDataRejectsOversizedCertificateMaterial(t *testing.T) {
+func TestParseQueryDataRejectsOversizedCertificateMaterial(t *testing.T) {
 	tests := []struct {
 		name string
 		data CertData
@@ -1273,12 +1565,12 @@ func TestParsePaginatedDataRejectsOversizedCertificateMaterial(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			raw, err := json.Marshal(PaginatedResponse{Total: 1, Data: []CertData{tt.data}})
+			raw, err := json.Marshal(QueryResponse{Data: []CertData{tt.data}})
 			if err != nil {
 				t.Fatal(err)
 			}
 			resp := APIResponse{Code: 1, Data: raw}
-			if _, _, _, err := resp.ParsePaginatedData(); err == nil {
+			if _, _, err := resp.ParseQueryData(); err == nil {
 				t.Fatal("oversized certificate material must be rejected")
 			}
 		})
@@ -1302,41 +1594,12 @@ func TestQueryOrder_RenewBeforeDays(t *testing.T) {
 	}))
 	defer server.Close()
 
-	f := New(30 * time.Second)
+	f := New()
 	ctx := context.Background()
 
 	_, renewBeforeDays, err := f.QueryOrder(ctx, server.URL, "token", 12345)
 	if err != nil {
 		t.Fatalf("QueryOrder() error = %v", err)
-	}
-	if renewBeforeDays != 14 {
-		t.Errorf("renewBeforeDays = %d, want 14", renewBeforeDays)
-	}
-}
-
-// TestQuery_RenewBeforeDays 验证 Query 能正确传递 renew_before_days
-func TestQuery_RenewBeforeDays(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		resp := mockResponse{
-			Code: 1,
-			Data: map[string]interface{}{
-				"total":             1,
-				"page":              1,
-				"page_size":         100,
-				"renew_before_days": 14,
-				"data":              []interface{}{mockCertData()},
-			},
-		}
-		_ = json.NewEncoder(w).Encode(resp)
-	}))
-	defer server.Close()
-
-	f := New(30 * time.Second)
-	ctx := context.Background()
-
-	_, renewBeforeDays, err := f.Query(ctx, server.URL, "token", "example.com")
-	if err != nil {
-		t.Fatalf("Query() error = %v", err)
 	}
 	if renewBeforeDays != 14 {
 		t.Errorf("renewBeforeDays = %d, want 14", renewBeforeDays)
@@ -1349,9 +1612,6 @@ func TestQueryBatch_RenewBeforeDays(t *testing.T) {
 		resp := mockResponse{
 			Code: 1,
 			Data: map[string]interface{}{
-				"total":             1,
-				"page":              1,
-				"page_size":         100,
 				"renew_before_days": 14,
 				"data":              []interface{}{mockCertData()},
 			},
@@ -1360,10 +1620,7 @@ func TestQueryBatch_RenewBeforeDays(t *testing.T) {
 	}))
 	defer server.Close()
 
-	f := New(30 * time.Second)
-	ctx := context.Background()
-
-	_, renewBeforeDays, err := f.QueryBatch(ctx, server.URL, "token", "")
+	_, renewBeforeDays, err := queryBatchHelper(t, server.URL, "12345")
 	if err != nil {
 		t.Fatalf("QueryBatch() error = %v", err)
 	}
@@ -1422,7 +1679,7 @@ func TestToggleAutoReissue(t *testing.T) {
 			}))
 			defer server.Close()
 
-			f := New(30 * time.Second)
+			f := New()
 			ctx := context.Background()
 
 			renewBeforeDays, err := f.ToggleAutoReissue(ctx, server.URL, "test-token", tt.orderID, tt.autoReissue)
@@ -1444,7 +1701,7 @@ func TestToggleAutoReissue_APIError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	f := NewWithRetry(30*time.Second, RetryConfig{MaxRetries: 0})
+	f := NewWithRetry(RetryConfig{MaxRetries: 0})
 	ctx := context.Background()
 
 	_, err := f.ToggleAutoReissue(ctx, server.URL, "token", 12345, true)
@@ -1463,11 +1720,49 @@ func TestToggleAutoReissue_HTTPError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	f := NewWithRetry(30*time.Second, RetryConfig{MaxRetries: 0})
+	f := NewWithRetry(RetryConfig{MaxRetries: 0})
 	ctx := context.Background()
 
 	_, err := f.ToggleAutoReissue(ctx, server.URL, "bad-token", 12345, true)
 	if err == nil {
 		t.Fatal("ToggleAutoReissue() should return error for HTTP 401")
+	}
+}
+
+// TestCallbackToleratesNonObjectData 回归：服务端在不同分支下 data 可能是空数组、null 或字符串。
+// 这些形状不得让整条响应解析失败——回调已被服务端受理，若报错会被记成部署失败回调丢失。
+func TestCallbackToleratesNonObjectData(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want int
+	}{
+		{"空数组 data", `{"code":1,"msg":"ok","data":[]}`, 0},
+		{"null data", `{"code":1,"msg":"ok","data":null}`, 0},
+		{"字符串 data", `{"code":1,"msg":"ok","data":""}`, 0},
+		{"无 data 键顶层字段", `{"code":1,"msg":"ok","renew_before_days":14}`, 14},
+		{"空数组 data 回退顶层", `{"code":1,"msg":"ok","data":[],"renew_before_days":21}`, 21},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, tt.body)
+			}))
+			defer server.Close()
+
+			f := New()
+			got, err := f.Callback(context.Background(), server.URL, "token", &CallbackRequest{
+				OrderID: 12345,
+				Status:  "success",
+			})
+			if err != nil {
+				t.Fatalf("data 形状不符不应导致回调失败: %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("renew_before_days = %d, want %d", got, tt.want)
+			}
+		})
 	}
 }

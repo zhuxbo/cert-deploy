@@ -17,7 +17,10 @@ export SSLCTL_CONFIG_DIR="/opt/sslctl"
 # ==============================================================================
 
 # 切换 Mock API 场景
-# $1 = scenario name (active/processing/expired/error/unauthorized/not_found/batch/renew-flow/releases)
+# $1 = scenario name（权威列表见 mock-api 的 scenarios 表，启动日志也会打印）
+#      业务失败场景：unauthorized(token_invalid) / not_found(order_not_found) / rate_limited
+#      协议外故障：error(HTTP 500)
+#      正常场景：active / processing / expired / batch / renew-flow / releases
 mock_set_scenario() {
   curl -sf --max-time 5 -X POST "$MOCK_REMOTE_URL/admin/scenario/$1" >/dev/null 2>&1
 }

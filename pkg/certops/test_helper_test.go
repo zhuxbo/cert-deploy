@@ -2,6 +2,7 @@
 package certops
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 
@@ -39,10 +40,10 @@ type mockScanner struct {
 	serverType webserver.ServerType
 }
 
-func (m *mockScanner) Scan() ([]webserver.Site, error)      { return nil, nil }
-func (m *mockScanner) ScanLocal() ([]webserver.Site, error) { return nil, nil }
+func (m *mockScanner) Scan() ([]webserver.Site, error)       { return nil, nil }
+func (m *mockScanner) ScanLocal() ([]webserver.Site, error)  { return nil, nil }
 func (m *mockScanner) ScanDocker() ([]webserver.Site, error) { return nil, nil }
-func (m *mockScanner) ServerType() webserver.ServerType     { return m.serverType }
+func (m *mockScanner) ServerType() webserver.ServerType      { return m.serverType }
 
 // mockDeployer 测试用 mock 部署器
 // 为了集成测试能够验证文件写入，实际执行文件操作
@@ -52,7 +53,12 @@ type mockDeployer struct {
 	chainPath string
 }
 
-func (m *mockDeployer) Deploy(cert, chain, key string) error {
+func (m *mockDeployer) Deploy(ctx context.Context, cert, chain, key string) error {
+	// ctx 必须如实生效：mock 若忽略它，"取消能否中断部署 / 回滚是否脱离取消"
+	// 这类用例就永远是绿的，测不出任何东西
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	// 实际写入文件以便测试验证
 	if m.certPath != "" {
 		// 组合证书和中间证书
@@ -85,9 +91,12 @@ func (m *mockDeployer) Deploy(cert, chain, key string) error {
 	}
 	return nil
 }
-func (m *mockDeployer) Reload() error { return nil }
-func (m *mockDeployer) Test() error   { return nil }
-func (m *mockDeployer) Rollback(backupCertPath, backupKeyPath, backupChainPath string) error {
+func (m *mockDeployer) Reload(ctx context.Context) error { return ctx.Err() }
+func (m *mockDeployer) Test(ctx context.Context) error   { return ctx.Err() }
+func (m *mockDeployer) Rollback(ctx context.Context, backupCertPath, backupKeyPath, backupChainPath string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	// 实际执行回滚
 	if backupCertPath != "" && m.certPath != "" {
 		data, err := os.ReadFile(backupCertPath)

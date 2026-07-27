@@ -2,6 +2,7 @@
 package deployer
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -33,7 +34,7 @@ func NewApacheDeployer(cfg baseDeployer.Config) *ApacheDeployer {
 }
 
 // Deploy 部署证书（cert=服务器证书, intermediate=中间证书, key=私钥）
-func (d *ApacheDeployer) Deploy(cert, intermediate, key string) error {
+func (d *ApacheDeployer) Deploy(ctx context.Context, cert, intermediate, key string) error {
 	// 确保目录存在（0700 权限保护敏感文件）
 	if err := util.EnsureDir(filepath.Dir(d.certPath), 0700); err != nil {
 		return errors.NewStructuredDeployError(
@@ -100,21 +101,21 @@ func (d *ApacheDeployer) Deploy(cert, intermediate, key string) error {
 		}
 	}
 
-	return d.TestAndReload()
+	return d.TestAndReload(ctx)
 }
 
 // Reload 重载 Apache 服务
-func (d *ApacheDeployer) Reload() error {
-	return d.ReloadService()
+func (d *ApacheDeployer) Reload(ctx context.Context) error {
+	return d.ReloadService(ctx)
 }
 
 // Test 测试 Apache 配置
-func (d *ApacheDeployer) Test() error {
-	return d.TestConfig()
+func (d *ApacheDeployer) Test(ctx context.Context) error {
+	return d.TestConfig(ctx)
 }
 
 // Rollback 回滚到备份的证书
-func (d *ApacheDeployer) Rollback(backupCertPath, backupKeyPath, backupChainPath string) error {
+func (d *ApacheDeployer) Rollback(ctx context.Context, backupCertPath, backupKeyPath, backupChainPath string) error {
 	if err := baseDeployer.RestoreFile(backupCertPath, d.certPath); err != nil {
 		return errors.NewStructuredDeployError(
 			errors.DeployErrorPermission, errors.PhaseRollback,
@@ -138,5 +139,5 @@ func (d *ApacheDeployer) Rollback(backupCertPath, backupKeyPath, backupChainPath
 		}
 	}
 
-	return d.TestAndReloadForRollback()
+	return d.TestAndReloadForRollback(ctx)
 }

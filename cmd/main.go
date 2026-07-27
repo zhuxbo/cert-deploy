@@ -8,6 +8,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"runtime"
 	"strings"
@@ -157,6 +158,9 @@ func printUsage() {
   sslctl upgrade --check                     检查更新
   sslctl service repair                      修复 systemd 服务
 
+诊断命令:
+%s
+
 一键部署:
   sslctl setup --url <url> --token <token> --order <order_id>
   sslctl setup --url <url> --token <token> --order <order_id> --local-key
@@ -169,7 +173,14 @@ func printUsage() {
   sslctl scan
   sslctl --debug deploy --cert example.com
   sslctl setup --url https://api.example.com --token abc123 --order 12345
-`, version)
+`, version, diagnosticCommandsHelp())
+}
+
+func diagnosticCommandsHelp() string {
+	return `  sslctl status                              查看 sslctl、证书及 Web 服务器状态
+  systemctl status sslctl                    查看 Linux 服务状态
+  journalctl -u sslctl -f                    跟踪 Linux 服务日志
+  sc query sslctl                            查看 Windows 服务状态`
 }
 
 // runWindowsService 以 Windows 服务方式运行
@@ -187,7 +198,7 @@ func runWindowsService() {
 func runScan(args []string, debug bool) {
 	fs := flag.NewFlagSet("scan", flag.ExitOnError)
 	sslOnly := fs.Bool("ssl-only", false, "仅扫描 SSL 站点")
-	nginxPrefix := fs.String("nginx-prefix", "", "显式指定 nginx 相对路径解析基准（仅本次生效，不写入配置）")
+	nginxPrefix := fs.String("nginx-prefix", "", "显式指定 nginx 普通相对路径的 prefix（不影响证书路径，仅本次生效）")
 	apachePrefix := fs.String("apache-prefix", "", "显式指定 Apache ServerRoot 解析基准（仅本次生效，不写入配置）")
 
 	fs.Usage = func() {
@@ -269,13 +280,15 @@ func runStatus() {
 	fmt.Printf("版本: %s (编译时间: %s)\n", version, buildTime)
 	fmt.Printf("系统: %s/%s\n", runtime.GOOS, runtime.GOARCH)
 
-	// 2. Web 服务器检测
-	serverType := webserver.DetectWebServerType()
-	if serverType != "" {
-		fmt.Printf("Web 服务器: %s\n", serverType)
-	} else {
-		fmt.Println("Web 服务器: 未检测到")
+	// 提前读取配置，让纯 Docker 环境也能展示 setup 保存的站点绑定。
+	var cfg *config.Config
+	cfgManager, cfgManagerErr := config.NewConfigManager()
+	if cfgManagerErr == nil {
+		cfg, _ = cfgManager.Load()
 	}
+
+	// 2. Web 服务器检测
+	fmt.Printf("Web 服务器: %s\n", webServerStatusSummary(webserver.DetectWebServerType(), cfg))
 
 	// 3. 服务状态（使用跨平台服务模块）
 	fmt.Printf("\n服务管理: %s\n", service.GetInitSystemName())
@@ -302,13 +315,7 @@ func runStatus() {
 	}
 
 	// 4. 证书详情
-	cfgManager, err := config.NewConfigManager()
-	if err != nil {
-		return
-	}
-
-	cfg, err := cfgManager.Load()
-	if err != nil {
+	if cfg == nil {
 		return
 	}
 
@@ -380,7 +387,111 @@ func runStatus() {
 		if !cert.Metadata.LastDeployAt.IsZero() {
 			fmt.Printf("    上次部署: %s\n", cert.Metadata.LastDeployAt.Format("2006-01-02 15:04:05"))
 		}
+		printCertHaltState(os.Stdout, &cert)
 	}
+}
+
+// printCertHaltState 展示停机/阻断/陈旧绑定状态。
+// 这些状态此前只出现在日志里，`status` 看上去一切正常，人工排查无从下手。
+func printCertHaltState(w io.Writer, cert *config.CertConfig) {
+	if !cert.Metadata.NoBindingBlockedAt.IsZero() {
+		_, _ = fmt.Fprintf(w, "    %s 无启用绑定，自动续签与部署已阻断（自 %s），请重新 setup 或恢复绑定\n",
+			colorize("[阻断]", colorRed), cert.Metadata.NoBindingBlockedAt.Format("2006-01-02 15:04:05"))
+	}
+	if cert.Metadata.LastIssueState == config.IssueStateCapped {
+		// 停更与计数触顶成因不同：前者是长期只查询无进展（订单卡死/被删等），
+		// 后者是尝试次数用尽，展示上必须可区分，否则运维不知道该查哪一头
+		if cert.Metadata.CappedPhase == config.CappedPhaseStalled {
+			_, _ = fmt.Fprintf(w, "    %s 连续 %d 天无任何进展（订单长期未推进），已停止拉取，需人工核对订单状态\n",
+				colorize("[停更]", colorRed), config.MaxNoProgressDays)
+		} else {
+			phase := cert.Metadata.CappedPhase
+			if phase == "" {
+				phase = "未知阶段"
+			}
+			_, _ = fmt.Fprintf(w, "    %s 已达尝试次数上限（阶段: %s），已停止自动重试，需人工处理\n",
+				colorize("[停机]", colorRed), phase)
+		}
+	}
+	if !cert.Metadata.NoProgressSince.IsZero() {
+		_, _ = fmt.Fprintf(w, "    %s 自 %s 起无进展（%d 天后停止拉取）\n",
+			colorize("[无进展]", colorYellow), formatStatusTime(cert.Metadata.NoProgressSince),
+			config.MaxNoProgressDays)
+	}
+	if cert.Metadata.LastDeployBlockReason != "" {
+		// 环境阻断与部署失败要能区分：前者是既有 Web 配置损坏、与本证书无关，
+		// 修好配置即自动恢复，不需要人工解除任何状态
+		_, _ = fmt.Fprintf(w, "    %s %s（自 %s，已上报 %d/%d 次）\n",
+			colorize("[环境阻断]", colorRed), cert.Metadata.LastDeployBlockReason,
+			formatStatusTime(cert.Metadata.LastDeployBlockAt),
+			cert.Metadata.BlockReportCount, config.MaxBlockReportCount)
+	}
+	if cert.Metadata.UnchangedCertRounds > 0 {
+		_, _ = fmt.Fprintf(w, "    %s 服务端连续 %d/%d 轮返回同一张证书，证书未实际更新\n",
+			colorize("[未更替]", colorYellow), cert.Metadata.UnchangedCertRounds,
+			config.CertUnchangedRounds)
+	}
+	if len(cert.Metadata.StaleBindings) > 0 {
+		_, _ = fmt.Fprintf(w, "    %s 长期未部署成功的站点: %s（自 %s），这些站点仍在使用旧证书\n",
+			colorize("[陈旧]", colorRed), strings.Join(cert.Metadata.StaleBindings, ", "),
+			formatStatusTime(cert.Metadata.StaleSince))
+	}
+	if len(cert.Metadata.FailedBindings) > 0 {
+		_, _ = fmt.Fprintf(w, "    %s 待重试的失败站点: %s（已重试 %d/%d 轮）\n",
+			colorize("[重试中]", colorYellow), strings.Join(cert.Metadata.FailedBindings, ", "),
+			cert.Metadata.RetryAttemptCount, certops.MaxRetryAttemptCount)
+	}
+}
+
+// formatStatusTime 缺失时间时给出明确占位，避免打印空串
+func formatStatusTime(t time.Time) string {
+	if t.IsZero() {
+		return "时间未知"
+	}
+	return t.Format("2006-01-02 15:04:05")
+}
+
+func webServerStatusSummary(localServerType string, cfg *config.Config) string {
+	var servers []string
+	seen := make(map[string]struct{})
+	if localServerType != "" {
+		servers = append(servers, localServerType)
+		seen[localServerType+"\x00"] = struct{}{}
+	}
+
+	if cfg != nil {
+		for _, cert := range cfg.Certificates {
+			if !cert.Enabled {
+				continue
+			}
+			for _, binding := range cert.Bindings {
+				if !binding.Enabled || binding.ServerType == "" {
+					continue
+				}
+
+				containerName := ""
+				if binding.Docker != nil {
+					containerName = binding.Docker.ContainerName
+				}
+				key := binding.ServerType + "\x00" + containerName
+				if _, exists := seen[key]; exists {
+					continue
+				}
+
+				label := binding.ServerType + "（已配置）"
+				if containerName != "" {
+					label = fmt.Sprintf("%s（已配置，容器: %s）", binding.ServerType, containerName)
+				}
+				servers = append(servers, label)
+				seen[key] = struct{}{}
+			}
+		}
+	}
+
+	if len(servers) == 0 {
+		return "未检测到"
+	}
+	return strings.Join(servers, ", ")
 }
 
 // runService 管理服务

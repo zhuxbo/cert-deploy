@@ -2,6 +2,7 @@
 package setup
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 
@@ -54,6 +55,17 @@ func (m *mockScanner) ScanLocal() ([]webserver.Site, error)  { return nil, nil }
 func (m *mockScanner) ScanDocker() ([]webserver.Site, error) { return nil, nil }
 func (m *mockScanner) ServerType() webserver.ServerType      { return m.serverType }
 
+type staticScanner struct {
+	serverType webserver.ServerType
+	sites      []webserver.Site
+	scanErr    error
+}
+
+func (s *staticScanner) Scan() ([]webserver.Site, error)       { return s.sites, s.scanErr }
+func (s *staticScanner) ScanLocal() ([]webserver.Site, error)  { return nil, nil }
+func (s *staticScanner) ScanDocker() ([]webserver.Site, error) { return s.sites, nil }
+func (s *staticScanner) ServerType() webserver.ServerType      { return s.serverType }
+
 // mockInstaller 测试用 mock 安装器
 type mockInstaller struct {
 	configPath string
@@ -72,7 +84,7 @@ type mockDeployer struct {
 	chainPath string
 }
 
-func (m *mockDeployer) Deploy(cert, chain, key string) error {
+func (m *mockDeployer) Deploy(_ context.Context, cert, chain, key string) error {
 	if m.certPath != "" {
 		fullchain := cert
 		if chain != "" {
@@ -103,8 +115,8 @@ func (m *mockDeployer) Deploy(cert, chain, key string) error {
 	}
 	return nil
 }
-func (m *mockDeployer) Reload() error { return nil }
-func (m *mockDeployer) Test() error   { return nil }
-func (m *mockDeployer) Rollback(backupCertPath, backupKeyPath, backupChainPath string) error {
+func (m *mockDeployer) Reload(_ context.Context) error { return nil }
+func (m *mockDeployer) Test(_ context.Context) error   { return nil }
+func (m *mockDeployer) Rollback(_ context.Context, backupCertPath, backupKeyPath, backupChainPath string) error {
 	return nil
 }

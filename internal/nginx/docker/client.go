@@ -305,7 +305,7 @@ func (c *Client) GetContainerInfo(ctx context.Context) (*ContainerInfo, error) {
 		ID    string `json:"Id"`
 		Name  string `json:"Name"`
 		State struct {
-			Running bool `json:"Running"`
+			Running bool   `json:"Running"`
 			Status  string `json:"Status"`
 		} `json:"State"`
 		Config struct {

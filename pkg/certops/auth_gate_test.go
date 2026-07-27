@@ -239,6 +239,10 @@ func TestAuthBlockOnCSRSubmitRollsBackIssueCount(t *testing.T) {
 	if stored.Metadata.IssueRetryCount != 0 {
 		t.Errorf("issue_retry_count = %d, 期望 0（中间件拦截不占签发额度）", stored.Metadata.IssueRetryCount)
 	}
+	if stored.Metadata.LastCSRHash != "" || !stored.Metadata.CSRSubmittedAt.IsZero() || stored.Metadata.LastIssueState != "" {
+		t.Errorf("认证阻断应完整回滚 CSR 提交意图: hash=%q at=%v state=%q",
+			stored.Metadata.LastCSRHash, stored.Metadata.CSRSubmittedAt, stored.Metadata.LastIssueState)
+	}
 	// 服务端没收到 CSR，这把私钥永远配不上证书，必须清理
 	if _, e := readPendingKey(cm.GetWorkDir(), cert.CertName); e == nil {
 		t.Error("提交未被服务端接收时应清理待确认私钥")

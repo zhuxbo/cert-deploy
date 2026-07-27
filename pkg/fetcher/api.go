@@ -52,6 +52,7 @@ type CertData struct {
 	OrderID          int            `json:"order_id"`
 	Status           string         `json:"status"`
 	Domains          string         `json:"domains"`
+	CSR              string         `json:"csr"`
 	Cert             string         `json:"certificate"`
 	IntermediateCert string         `json:"ca_certificate"`
 	PrivateKey       string         `json:"private_key"`
@@ -304,7 +305,8 @@ type Fetcher struct {
 // - DNS Rebinding 防护：在 TCP 连接时二次校验目标 IP
 //
 // 超时统一在 doAttempt 内按方法套用（含响应体读取），client 本身不设 Timeout；
-// 新增的请求路径必须走 doWithRetry，直连 f.client.Do 将完全没有超时保护。
+// 可重试请求走 doWithRetry；结果不确定时不得重放的请求走 doOnce。
+// 两者都复用 doAttempt 的方法级超时、响应体读取与大小限制，不能直连 f.client.Do。
 func New() *Fetcher {
 	dialer := &net.Dialer{
 		Timeout:   10 * time.Second,
@@ -465,6 +467,17 @@ func (f *Fetcher) doAttempt(req *http.Request, maxBodySize int64) (int, []byte, 
 		return resp.StatusCode, nil, err
 	}
 	return resp.StatusCode, body, nil
+}
+
+// doOnce 执行一次请求，不做传输层重试。
+// 用于携带非空 CSR 的 POST：请求一旦可能送达，超时、断连、5xx 或响应读取失败都必须
+// 交给上层 query-first 收敛，不能直接重放。
+func (f *Fetcher) doOnce(newRequest func() (*http.Request, error), maxBodySize int64) (int, []byte, error) {
+	req, err := newRequest()
+	if err != nil {
+		return 0, nil, err
+	}
+	return f.doAttempt(req, maxBodySize)
 }
 
 // doWithRetry 带重试的 HTTP 请求，返回状态码与已读取的响应体。
@@ -658,7 +671,13 @@ func (f *Fetcher) Update(ctx context.Context, baseURL, token string, orderID int
 		return req, nil
 	}
 
-	statusCode, body, err := f.doWithRetry(ctx, newRequest, defaultMaxResponseSize)
+	var statusCode int
+	var body []byte
+	if strings.TrimSpace(csr) != "" {
+		statusCode, body, err = f.doOnce(newRequest, defaultMaxResponseSize)
+	} else {
+		statusCode, body, err = f.doWithRetry(ctx, newRequest, defaultMaxResponseSize)
+	}
 	if err != nil {
 		return nil, 0, errors.NewNetworkError("failed to update certificate", err)
 	}

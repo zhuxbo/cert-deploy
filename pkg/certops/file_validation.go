@@ -111,11 +111,14 @@ func (s *Service) applyValidationFiles(cert *config.CertConfig, file *fetcher.Fi
 	return nil
 }
 
-// cleanupValidationFiles 清理已放置的验证文件（非关键路径，失败仅记录日志）
-func cleanupValidationFiles(files []string, log *logger.Logger) {
+// cleanupValidationFiles 清理已放置的验证文件，返回仍未清理的路径。
+func cleanupValidationFiles(files []string, log *logger.Logger) []string {
+	var failed []string
 	for _, f := range files {
 		if err := os.Remove(f); err != nil && !os.IsNotExist(err) {
 			log.Warn("清理验证文件 %s 失败: %v", f, err)
+			failed = append(failed, f)
+			continue
 		}
 		// 尝试删除空父目录（如 .well-known/pki-validation/）
 		parentDir := filepath.Dir(f)
@@ -124,4 +127,5 @@ func cleanupValidationFiles(files []string, log *logger.Logger) {
 		grandParentDir := filepath.Dir(parentDir)
 		_ = os.Remove(grandParentDir)
 	}
+	return failed
 }

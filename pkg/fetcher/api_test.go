@@ -221,6 +221,188 @@ func TestUpdate(t *testing.T) {
 	}
 }
 
+type failingReadCloser struct{}
+
+func (failingReadCloser) Read([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }
+func (failingReadCloser) Close() error             { return nil }
+
+// TestUpdateWithCSR_DoesNotRetryAfterPossibleDelivery 防止结果不确定的 CSR POST 被传输层重放。
+// 网络错误、5xx 和响应体读取失败都可能发生在服务端已受理之后，必须统一交给上层 query-first。
+func TestUpdateWithCSR_DoesNotRetryAfterPossibleDelivery(t *testing.T) {
+	tests := []struct {
+		name      string
+		transport roundTripperFunc
+	}{
+		{
+			name: "network error",
+			transport: func(*http.Request) (*http.Response, error) {
+				return nil, io.ErrUnexpectedEOF
+			},
+		},
+		{
+			name: "HTTP 500",
+			transport: func(*http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusInternalServerError,
+					Body:       io.NopCloser(strings.NewReader("temporary failure")),
+					Header:     make(http.Header),
+				}, nil
+			},
+		},
+		{
+			name: "response read failure",
+			transport: func(*http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       failingReadCloser{},
+					Header:     make(http.Header),
+				}, nil
+			},
+		},
+		{
+			name: "invalid JSON response",
+			transport: func(*http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader("not-json")),
+					Header:     make(http.Header),
+				}, nil
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			attempts := 0
+			f := NewWithRetry(RetryConfig{
+				MaxRetries:  3,
+				InitialWait: time.Millisecond,
+				MaxWait:     time.Millisecond,
+				Multiplier:  1,
+			})
+			f.client.Transport = roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				attempts++
+				return tt.transport.RoundTrip(req)
+			})
+
+			_, _, err := f.Update(
+				context.Background(),
+				"http://127.0.0.1",
+				"token",
+				12345,
+				"-----BEGIN CERTIFICATE REQUEST-----\nCSR\n-----END CERTIFICATE REQUEST-----",
+				"example.com",
+				"file",
+			)
+			if err == nil {
+				t.Fatal("Update() error = nil, want failure")
+			}
+			if attempts != 1 {
+				t.Fatalf("CSR POST attempts = %d, want 1", attempts)
+			}
+		})
+	}
+}
+
+// TestUpdateWithoutCSRStillRetries 验证 order_id-only 的兼容/self-heal 请求仍适用通用重试。
+func TestUpdateWithoutCSRStillRetries(t *testing.T) {
+	attempts := 0
+	f := NewWithRetry(RetryConfig{
+		MaxRetries:  1,
+		InitialWait: time.Millisecond,
+		MaxWait:     time.Millisecond,
+		Multiplier:  1,
+	})
+	f.client.Transport = roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		attempts++
+		status := http.StatusInternalServerError
+		body := "temporary failure"
+		if attempts == 2 {
+			status = http.StatusOK
+			body = `{"code":1,"msg":"ok","data":{"order_id":12345,"status":"active"}}`
+		}
+		return &http.Response{
+			StatusCode: status,
+			Body:       io.NopCloser(strings.NewReader(body)),
+			Header:     make(http.Header),
+		}, nil
+	})
+
+	if _, _, err := f.Update(context.Background(), "http://127.0.0.1", "token", 12345, " \t", "", ""); err != nil {
+		t.Fatalf("order_id-only Update() error = %v", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("order_id-only POST attempts = %d, want 2", attempts)
+	}
+}
+
+func TestCallbackStillRetriesTransportFailures(t *testing.T) {
+	failures := []struct {
+		name string
+		fail func() (*http.Response, error)
+	}{
+		{
+			name: "HTTP 500",
+			fail: func() (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusInternalServerError,
+					Body:       io.NopCloser(strings.NewReader("temporary failure")),
+					Header:     make(http.Header),
+				}, nil
+			},
+		},
+		{
+			name: "network error",
+			fail: func() (*http.Response, error) {
+				return nil, io.ErrUnexpectedEOF
+			},
+		},
+		{
+			name: "response read failure",
+			fail: func() (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       failingReadCloser{},
+					Header:     make(http.Header),
+				}, nil
+			},
+		},
+	}
+
+	for _, tt := range failures {
+		t.Run(tt.name, func(t *testing.T) {
+			attempts := 0
+			f := NewWithRetry(RetryConfig{
+				MaxRetries:  1,
+				InitialWait: time.Millisecond,
+				MaxWait:     time.Millisecond,
+				Multiplier:  1,
+			})
+			f.client.Transport = roundTripperFunc(func(*http.Request) (*http.Response, error) {
+				attempts++
+				if attempts == 1 {
+					return tt.fail()
+				}
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader(`{"code":1,"msg":"ok","data":{}}`)),
+					Header:     make(http.Header),
+				}, nil
+			})
+
+			if _, err := f.Callback(context.Background(), "http://127.0.0.1/callback", "token", &CallbackRequest{
+				OrderID: 12345,
+				Status:  "success",
+			}); err != nil {
+				t.Fatalf("Callback() error = %v", err)
+			}
+			if attempts != 2 {
+				t.Fatalf("Callback attempts = %d, want 2", attempts)
+			}
+		})
+	}
+}
+
 // TestCallback 测试回调
 func TestCallback(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1004,6 +1186,7 @@ func TestCertData_Fields(t *testing.T) {
 			"order_id":       99999,
 			"status":         "active",
 			"domains":        "test.example.com,www.test.example.com",
+			"csr":            "-----BEGIN CERTIFICATE REQUEST-----\ncsr\n-----END CERTIFICATE REQUEST-----",
 			"certificate":    "-----BEGIN CERTIFICATE-----\ncert\n-----END CERTIFICATE-----",
 			"ca_certificate": "-----BEGIN CERTIFICATE-----\nca\n-----END CERTIFICATE-----",
 			"private_key":    "-----BEGIN RSA PRIVATE KEY-----\nkey\n-----END RSA PRIVATE KEY-----",
@@ -1031,6 +1214,9 @@ func TestCertData_Fields(t *testing.T) {
 	}
 	if data.Domains != "test.example.com,www.test.example.com" {
 		t.Errorf("Domains = %s", data.Domains)
+	}
+	if data.CSR != "-----BEGIN CERTIFICATE REQUEST-----\ncsr\n-----END CERTIFICATE REQUEST-----" {
+		t.Errorf("CSR = %q", data.CSR)
 	}
 	if data.IssuedAt != "2024-06-01" {
 		t.Errorf("IssuedAt = %s", data.IssuedAt)

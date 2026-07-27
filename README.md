@@ -131,13 +131,13 @@ CI 覆盖 linux/amd64、linux/arm64、windows/amd64 三平台交叉编译验证�
 
 开发与发布的权威入口：项目规则见 `AGENTS.md`，任务路由见 `skills/SKILL.md`；构建/签名契约见 `skills/build-release.md`，远程发布与中断恢复见 `skills/remote-release.md`，完整完成检查见 `skills/finish-check.md`。脚本参数速查见 `build/README.md`。发布规则不在 README 中重复维护。
 
-支持 Docker 容器 Nginx（挂载卷/docker cp 双模式），自动检测本地或容器环境。
+支持自动检测 Docker 容器 Nginx；统一 setup/deploy/续签自动链当前只支持可验证宿主机路径的挂载卷模式。
 
 ## Debug 模式
 
 ```bash
 # 启用调试模式
-sslctl --debug deploy --site example.com
+sslctl --debug deploy --cert <cert_name> --site example.com
 ```
 
 - 详细日志输出（请求/响应、配置解析、文件操作）
@@ -259,7 +259,7 @@ sslctl status
 
 - **本机提交**：由本地控制私钥，通过 POST 部署接口提交本地生成的 CSR
 - **自动签发**：查询已签发的证书直接部署
-- **定时检查**：每天一次，随机选择明天 09:00~23:59 的时间点执行；多证书续签间随机延迟 30~90 秒
+- **定时检查**：每天一次，随机选择明天 09:00~23:59 的时间点执行；多证书续签按证书数动态分散 5~120 秒，整轮预算上限 600 秒
 - **已过期证书**不再触发续签
 
 ### 自动停机与人工介入
@@ -270,7 +270,7 @@ sslctl status
 | 状态       | 触发条件                                                   | 影响                                                         | 恢复方式                                     |
 | ---------- | ---------------------------------------------------------- | ------------------------------------------------------------ | -------------------------------------------- |
 | **阻断**   | 证书已启用，但没有任何启用的站点绑定                       | 完全退出自动流程：不发起 API 请求、不部署、不上报回调         | 恢复绑定或重新 `setup` 后自动解除             |
-| **停机**   | 签发或部署连续失败达到 10 次                               | 停止自动重试，不再发送回调                                   | 修复问题后执行一次 `sslctl deploy`            |
+| **停机**   | 准备新尝试时发现对应计数已达到 10                          | 不启动第 11 次尝试，进入静默停机                             | 修复问题后执行一次 `sslctl deploy`            |
 | **重试中** | 部分站点部署失败但属于可修复错误                           | 保留绑定，守护进程每天重试一次并上报一次失败回调             | 修好站点后等待自动重试，或手动 `sslctl deploy` |
 | **陈旧**   | 某站点重试 10 轮仍失败                                     | 停止重试该站点，每天告警；**证书本身继续正常续签**            | 修复站点后执行 `sslctl deploy`                |
 
@@ -278,8 +278,8 @@ sslctl status
 
 - 对某个站点执行 `sslctl deploy local` 会把该站点从原有 API 证书上摘走。若原证书因此再无启用绑定，它会**当场转入阻断状态**。
 - 阻断发生时如果证书正处于签发中，在途订单与待转正的私钥会保留到人工处理，日志会额外标注。
-- `sslctl deploy` 成功后会清除停机状态与各项计数，并上报一次部署结果。**不要把它挂进 cron**——那会反复复位停机保护，绕过尝试次数上限的约束。
-- `sslctl setup` 每次也会上报一次部署结果（批量模式逐证书上报）；因缺少私钥而跳过的证书不上报，也不再写入配置。
+- `sslctl deploy` 成功后会清除停机状态与相关尝试计数，并上报一次部署结果。**不要把它挂进 cron**——那会反复复位停机保护，绕过尝试次数上限的约束。
+- `sslctl setup` 对每个有资格的证书逐一尝试上报部署结果；本轮回调熔断后允许余下结果缺行。因缺少私钥而跳过的证书不上报，也不再写入配置。
 - 配置中出现同名证书条目时会每轮告警并提示人工处理，自动改名遇到重名会放弃改名以免覆盖健康条目。
 
 ## API 接口
@@ -296,23 +296,32 @@ sslctl status
 
 ```bash
 sslctl scan              # 自动检测本地或 Docker
-sslctl deploy --site example.com  # 根据配置选择部署方式
+sslctl deploy --cert <cert_name> --site example.com  # 根据配置选择部署方式
 ```
 
-Docker 站点配置添加 `docker` 字段：
+Docker 站点绑定由通用路径、重载命令和 `docker` 字段共同描述：
 
 ```json
 {
+  "server_name": "example.com",
+  "server_type": "docker-nginx",
+  "enabled": true,
+  "paths": {
+    "certificate": "/opt/app/certs/cert.pem",
+    "private_key": "/opt/app/certs/key.pem"
+  },
+  "reload": {
+    "test_command": "docker exec nginx nginx -t",
+    "reload_command": "docker exec nginx nginx -s reload"
+  },
   "docker": {
-    "enabled": true,
-    "compose_file": "/opt/app/docker-compose.yml",
-    "service_name": "nginx",
-    "deploy_mode": "auto"
+    "container_name": "nginx",
+    "deploy_mode": "volume"
   }
 }
 ```
 
-部署模式：`volume`（挂载卷）、`copy`（docker cp）、`auto`（自动检测）
+配置结构允许记录 `volume`（挂载卷）或 `copy`（docker cp）；当前 setup/deploy/续签统一自动部署链只接受可验证宿主机路径的 `volume` 绑定。
 
 ### 存量 Docker 绑定升级说明
 

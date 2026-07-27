@@ -124,7 +124,7 @@ func TestPrepareLocalRenew_BusinessRejectCleansPending(t *testing.T) {
 			_, _ = w.Write([]byte(`{"code":0,"msg":"订单状态不允许重签"}`))
 			return
 		}
-		_, _ = w.Write([]byte(`{"code":1,"msg":"ok","data":{"order_id":990,"status":"processing"}}`))
+		_, _ = w.Write([]byte(`{"code":1,"msg":"ok","data":{"order_id":990,"status":"active"}}`))
 	}))
 	defer server.Close()
 
@@ -147,6 +147,9 @@ func TestPrepareLocalRenew_BusinessRejectCleansPending(t *testing.T) {
 	// 不归一 processing：下轮可重新提交（受签发计数上限约束）
 	if cert.Metadata.LastIssueState == config.IssueStateProcessing {
 		t.Errorf("业务拒绝不应归一为 processing，实际 %q", cert.Metadata.LastIssueState)
+	}
+	if cert.Metadata.LastCSRHash != "" || !cert.Metadata.CSRSubmittedAt.IsZero() {
+		t.Errorf("业务拒绝应清理 CSR 元数据: hash=%q at=%v", cert.Metadata.LastCSRHash, cert.Metadata.CSRSubmittedAt)
 	}
 	// 提交意图已递增签发计数
 	if cert.Metadata.IssueRetryCount != 1 {
@@ -317,14 +320,8 @@ func TestPrepareLocalRenew_CancellingWaits(t *testing.T) {
 	}
 }
 
-// TestPrepareLocalRenew_OrderInProgressNormalizes order_in_progress 必须归一为 processing，
-// 不得按普通业务拒绝处理。
-//
-// 它是 deploy-spec §2.2 中唯一的过渡态：服务端明确告知订单已在途（unpaid/pending，
-// 签发进行中），完成后自行消失。若按业务拒绝处理，会清理 pending key 并保持
-// last_issue_state 为空，于是下轮再次提交 CSR、再次被拒、签发计数再递增——
-// 10 轮后把一张正在正常签发的证书误判触顶，正是 spec 要求「不做永久停止或
-// 退避升级」所禁止的。
+// TestPrepareLocalRenew_OrderInProgressNormalizes 验证服务端告知已有另一笔在途订单时，
+// 客户端清理本次未被采用的 CSR/pending，保留逻辑尝试计数，并归一为 processing 查询等待。
 func TestPrepareLocalRenew_OrderInProgressNormalizes(t *testing.T) {
 	tmpDir := t.TempDir()
 	cm, err := config.NewConfigManagerWithDir(tmpDir)
@@ -341,7 +338,11 @@ func TestPrepareLocalRenew_OrderInProgressNormalizes(t *testing.T) {
 			_, _ = fmt.Fprint(w, `{"code":0,"msg":"订单处于pending状态（签发进行中）","errors":{"error_code":"order_in_progress"}}`)
 			return
 		}
-		_, _ = fmt.Fprint(w, `{"code":1,"msg":"ok","data":{"order_id":777,"status":"processing"}}`)
+		status := "active"
+		if posts > 0 {
+			status = "processing"
+		}
+		_, _ = fmt.Fprintf(w, `{"code":1,"msg":"ok","data":{"order_id":777,"status":%q}}`, status)
 	}))
 	defer server.Close()
 
@@ -361,9 +362,15 @@ func TestPrepareLocalRenew_OrderInProgressNormalizes(t *testing.T) {
 	if cert.Metadata.LastIssueState != config.IssueStateProcessing {
 		t.Errorf("应归一为 processing 以便下轮只查询，实际 %q", cert.Metadata.LastIssueState)
 	}
-	// pending key 必须保留：订单在途，之后签发成功需要它与新证书配对
-	if _, e := readPendingKey(cm.GetWorkDir(), cert.CertName); e != nil {
-		t.Error("order_in_progress 应保留 pending key（订单在途，签发完成后需与新证书配对）")
+	// 本次 CSR 未被服务端采用，pending 与归属元数据必须清理；尝试计数保留。
+	if _, e := readPendingKey(cm.GetWorkDir(), cert.CertName); e == nil {
+		t.Error("order_in_progress 应清理本次未被采用的 pending key")
+	}
+	if cert.Metadata.LastCSRHash != "" || !cert.Metadata.CSRSubmittedAt.IsZero() {
+		t.Fatalf("order_in_progress 应清理 CSR 元数据: hash=%q at=%v", cert.Metadata.LastCSRHash, cert.Metadata.CSRSubmittedAt)
+	}
+	if cert.Metadata.IssueRetryCount != 1 {
+		t.Fatalf("order_in_progress 应保留逻辑尝试计数 1，实际 %d", cert.Metadata.IssueRetryCount)
 	}
 
 	// 次轮：已归一，只查询、不再提交

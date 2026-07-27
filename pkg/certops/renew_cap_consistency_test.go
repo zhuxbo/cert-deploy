@@ -59,6 +59,16 @@ func TestCappedPhaseFor_MatchesWillMakeAPICall(t *testing.T) {
 			wantPhase: config.CappedPhaseDeploy,
 		},
 		{
+			name: "第十次部署已落盘但结果未落盘：继续重放同一意图",
+			meta: config.CertMetadata{
+				CertExpiresAt:      future,
+				DeployAttemptCount: MaxDeployAttemptCount,
+				DeployStartedAt:    time.Now(),
+				LastIssueState:     config.IssueStateActive,
+			},
+			wantPhase: "",
+		},
+		{
 			name:      "均未触顶",
 			meta:      config.CertMetadata{CertExpiresAt: future, IssueRetryCount: 3, DeployAttemptCount: 3},
 			wantPhase: "",
@@ -90,9 +100,15 @@ func TestCappedPhaseFor_MatchesWillMakeAPICall(t *testing.T) {
 				t.Fatalf("cappedPhaseFor = %q, want %q", got, tt.wantPhase)
 			}
 
-			// 预估必须与编排层实际行为一致：触顶、零绑定均不发请求，其余需续签时会发请求
+			// 预估必须与编排层实际行为一致：触顶、零绑定均不发请求；
+			// 需续签或已有在途意图时会发请求。
 			gotCall := svc.willMakeAPICall(cert, schedule)
-			wantCall := tt.wantPhase == "" && cert.HasEnabledBinding() && cert.NeedsRenewal(schedule)
+			entryState := normalizeIssueState(cert.Metadata.LastIssueState)
+			hasInFlight := hasLocalCSRIntent(cert) ||
+				entryState == config.IssueStateProcessing ||
+				entryState == config.IssueStateActive
+			wantCall := tt.wantPhase == "" && cert.HasEnabledBinding() &&
+				(cert.NeedsRenewal(schedule) || hasInFlight)
 			if gotCall != wantCall {
 				t.Fatalf("willMakeAPICall = %v, want %v（应与 cappedPhaseFor + HasEnabledBinding 一致）", gotCall, wantCall)
 			}

@@ -17,16 +17,15 @@ $env:SSLCTL_RELEASE_URL="https://example.com/sslctl"; irm https://example.com/ss
 ### 手动安装
 
 ```bash
-# 下载
-wget https://example.com/releases/sslctl-linux-amd64.tar.gz
-tar -xzf sslctl-linux-amd64.tar.gz
+# 下载并解压实际发布资产（版本号仅作示例）
+wget https://example.com/sslctl/main/v1.2.3/sslctl-linux-amd64.gz
+gzip -dc sslctl-linux-amd64.gz > sslctl
 
 # 安装
-sudo mv sslctl /usr/local/bin/
-sudo chmod +x /usr/local/bin/sslctl
+sudo install -m 0755 sslctl /usr/local/bin/sslctl
 
 # 创建配置目录
-sudo mkdir -p /opt/sslctl/{certs,logs,backup,sites}
+sudo mkdir -p /opt/sslctl/{certs,pending-keys,logs,backup}
 ```
 
 ---
@@ -35,19 +34,18 @@ sudo mkdir -p /opt/sslctl/{certs,logs,backup,sites}
 
 ```
 /opt/sslctl/
-├── certs/              # 证书存储
-│   └── {domain}/
+├── config.json         # 统一配置
+├── config.json.lock    # 配置写锁
+├── scan-result.json    # 最近一次扫描结果
+├── certs/              # 已转正证书与私钥
+│   └── {server_name}/
 │       ├── cert.pem
-│       ├── privkey.pem
-│       ├── chain.pem
-│       └── fullchain.pem
-├── sites/              # 站点配置
-│   └── {site}.json
-├── logs/               # 日志文件
-│   ├── sslctl.log
-│   └── debug-{date}.log
+│       └── key.pem
+├── pending-keys/       # local 模式待签发私钥
+├── logs/               # {module}-YYYY-MM-DD.log
+│   └── debug/          # Debug 模式日志
 └── backup/             # 证书备份
-    └── {domain}/{timestamp}/
+    └── {server_name}/{timestamp}/
 ```
 
 ---
@@ -58,20 +56,20 @@ sudo mkdir -p /opt/sslctl/{certs,logs,backup,sites}
 
 ```bash
 # 扫描站点
-sslctl nginx scan
+sslctl scan
 
 # 部署证书
-sslctl nginx deploy --site example.com
+sslctl deploy --cert <cert_name> --site example.com
 
 # Debug 模式
-sslctl --debug nginx deploy --site example.com
+sslctl --debug deploy --cert <cert_name> --site example.com
 ```
 
 ### Daemon 模式
 
 ```bash
 # 前台运行
-sslctl nginx daemon
+sslctl daemon
 
 # 后台运行（配合 systemd）
 systemctl start sslctl
@@ -102,7 +100,11 @@ StandardOutput=journal
 StandardError=journal
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=/opt/sslctl /etc/nginx /etc/apache2 /etc/httpd /etc/letsencrypt
+ReadWritePaths=/opt/sslctl
+ReadWritePaths=-/etc/nginx
+ReadWritePaths=-/etc/apache2
+ReadWritePaths=-/etc/httpd
+ReadWritePaths=-/etc/letsencrypt
 
 [Install]
 WantedBy=multi-user.target
@@ -143,15 +145,15 @@ sudo journalctl -u sslctl -f
 
 ### 日志文件
 
-- 生产模式：`/opt/sslctl/logs/sslctl.log`
-- Debug 模式：`/opt/sslctl/logs/debug-{date}.log`
+- 生产模式：`/opt/sslctl/logs/{module}-YYYY-MM-DD.log`
+- Debug 模式：`/opt/sslctl/logs/debug/{module}-YYYY-MM-DD.log`
 
 ### JSON 日志模式
 
 设置 `SSLCTL_LOG_FORMAT=json` 启用 JSON 输出，适合 ELK/Loki 聚合：
 
 ```json
-{"level":"INFO","msg":"证书部署成功: domain=example.com","site":"sslctl","time":"2026-03-14T15:00:00+08:00"}
+{"level":"INFO","msg":"证书部署成功: domain=example.com","module":"sslctl","time":"2026-03-14T15:00:00+08:00"}
 ```
 
 敏感信息过滤在两种模式下均生效。
@@ -190,8 +192,7 @@ sudo journalctl -u sslctl -f
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/api/deploy?order_id=xxx` | 按订单 ID 查询（推荐） |
-| GET | `/api/deploy?domain=xxx` | 按域名查询（首次获取 order_id） |
+| GET | `/api/deploy?order=123` | 按订单 ID 查询；批量用逗号分隔，上限 100 |
 | POST | `/api/deploy` | 更新/续费证书（需要 order_id） |
 | POST | `/api/deploy/callback` | 部署结果回调 |
 
@@ -202,46 +203,54 @@ sudo journalctl -u sslctl -f
 - **单次尝试超时按方法套用**（deploy-spec §11）：GET 30s、POST 60s，与父 ctx deadline 取更早者。
   不使用 `http.Client.Timeout`——它是覆盖整个请求的单一上限、无法按方法区分，会把 POST 一并压到 GET 的时长。
 - **超时作用域覆盖响应体读取**：`doAttempt` 在同一超时内读完 body 并关闭响应，`doWithRetry` 返回 `(statusCode, body, error)`，
-  调用方**不再持有 `*http.Response`**。新增请求路径必须走 `doWithRetry`，直连 `f.client.Do` 将完全没有超时保护。
+  调用方**不再持有 `*http.Response`**。可重试请求走 `doWithRetry`；CSR 提交须走复用同等超时、响应体读取和大小限制的单次 helper，不得直连无超时保护的 `f.client.Do`。
 - **响应体上限分级**：仅 `200` 按调用方给定的 `maxBodySize` 读（批量 5MB / 一般 512KB / 回调 64KB）；
   非 200 一律限 1KB，避免 5MB × 最多 4 次尝试让错误信息本身变成 MB 级字符串流进日志与回调 `message` 的脱敏正则。
-- **响应体读取中断按可重试处理**：一次连接中断不应直接变成 JSON 解析失败并终止整条链路。
-- 退避：最多 3 次重试，指数退避 1s→2s→4s，带 ±25% 抖动。
+- **响应体读取中断按可重试处理**：一次连接中断不应直接变成 JSON 解析失败并终止整条链路；
+  但携带非空 `csr` 的提交 POST 例外，一旦可能送达即不做传输层重试，交由状态机 query-first 恢复。
+- 退避：GET、部署回调与自动重签开关最多 3 次重试，指数退避 1s→2s→4s，带 ±25% 抖动；
+  CSR 提交 POST 不重试。
 
 ### POST 请求参数
 
 ```json
 {
-  "order_id": 12345,           // 必需（重签/续费时）
-  "csr": "-----BEGIN...",      // 可选：有=本地私钥，空=服务端生成
-  "domains": "a.com,b.com",    // 可选
-  "validation_method": "file"  // 可选
+  "order_id": 12345,
+  "csr": "-----BEGIN CERTIFICATE REQUEST-----...",
+  "domains": "a.com,b.com",
+  "validation_method": "file"
 }
 ```
 
-**关键逻辑**：`csr` 为空时服务端设置 `csr_generate=1` 自动生成私钥
+本节描述 local 模式：客户端先 GET 确认订单仍为 `active`，再提交本机生成的非空 CSR。
 
 ### 响应格式
+
+GET 查询响应：
 
 ```json
 {
   "code": 1,
   "msg": "success",
-  "data": [{
-    "order_id": 123,
-    "domain": "example.com",
-    "domains": "example.com,www.example.com",
-    "status": "active",
-    "certificate": "-----BEGIN CERTIFICATE-----...",
-    "private_key": "-----BEGIN PRIVATE KEY-----...",
-    "ca_certificate": "-----BEGIN CERTIFICATE-----...",
-    "expires_at": "2025-12-31",
-    "file": {"path": "/.well-known/pki-validation/xxx.txt", "content": "..."}
-  }]
+  "data": {
+    "data": [{
+      "order_id": 123,
+      "domains": "example.com,www.example.com",
+      "status": "active",
+      "csr": "-----BEGIN CERTIFICATE REQUEST-----...",
+      "certificate": "-----BEGIN CERTIFICATE-----...",
+      "private_key": "-----BEGIN PRIVATE KEY-----...",
+      "ca_certificate": "-----BEGIN CERTIFICATE-----...",
+      "expires_at": "2025-12-31"
+    }],
+    "renew_before_days": 14
+  }
 }
 ```
 
-**重要**：API 返回的 `ca_certificate` 字段为必需项（空则报错，等待下一周期重试）。`deploy local` 命令的 `--ca` 参数仍然可选。
+POST 成功响应中的 `data` 是单个 CertData，并在同层返回 `renew_before_days`。`certificate`、
+`ca_certificate`、`private_key`、`issued_at`、`expires_at` 仅在 `active` 时返回；API 部署 active
+证书时 `ca_certificate` 必须非空。`deploy local` 命令的 `--ca` 参数仍然可选。
 
 ### 证书状态
 
@@ -251,17 +260,21 @@ sudo journalctl -u sslctl -f
 | `processing` | 验证中 | 放置验证文件，轮询等待 |
 | `pending` | 已提交但仍在处理 | 归一为 `processing`，后续只 GET 查询，不重复 POST |
 | `approving` | 审批中（processing 与 active 之间的短暂中间态） | 归一为 `processing`，继续查询等待 |
-| `unpaid` | 待支付 | POST 触发支付 |
+| `unpaid` | 待支付 | 只查询等待，不提交 CSR |
+| `cancelling` | 取消中 | 只查询等待，不提交 CSR |
+| `failed` / `cancelled` / `revoked` / `expired` | 真终态 | 记录展示状态，停止本轮，后续仅查询自愈 |
+| `renewed` / `reissued` | 续费链异常 | 按终态告警并停止本轮 |
+| 其他未知状态 | 服务端扩展状态 | 按等待态处理，只 GET 查询 |
 
 ### 部署流程
 
 ```
 sslctl                    Manager API                    CA
     │                              │                          │
-    │ 1. GET /api/deploy?domain=   │                          │
+    │ 1. GET /api/deploy?order=123 │                          │
     │ ────────────────────────────>│                          │
     │ <────────────────────────────│                          │
-    │   {order_id, status, cert}   │                          │
+    │ {order_id,status,csr,cert}   │                          │
     │                              │                          │
     │ [status=processing 时]       │                          │
     │ 写入验证文件到 webroot       │                          │
@@ -274,7 +287,7 @@ sslctl                    Manager API                    CA
     │ - nginx -t && reload        │                          │
     │                              │                          │
     │ 2. POST /api/deploy/callback │                          │
-    │ {order_id, domain, status}   │                          │
+    │ {order_id,status,deployed_at}│                          │
     │ ────────────────────────────>│                          │
     │ <────────────────────────────│                          │
     │                              │                          │
@@ -299,7 +312,7 @@ sslctl                    Manager API                    CA
 - **绑定重试触顶**：仅"确实发生了部署且仍失败"的出口上报一次带「绑定重试已达上限」标注的 failure；查询失败、私钥不可读等未发生部署的出口按 deploy-spec §2.8 触顶静默；证书处于 `processing` 不计入配额也不上报。
 - **手动 `sslctl deploy` 上报一次部署结果**（deploy-spec §5.1 步骤 6）：CLI 无 deadline，回调显式限定 `certops.CallbackFallbackBudget`（90s）。
 - **回调脱离取消传播**（`certops.callbackContext`）：回调是部署结果的唯一出口，父 ctx 取消（daemon SIGTERM、检查超时）时沿用会让整轮结果凭空消失，因此基于 `context.WithoutCancel` 重建，并按四条分支定预算——已取消 → 90s 兜底（**必须先于余量判断**，`cancel()` 不改变 deadline，此时父预算余量可能仍有几十分钟）；余量 ≤90s → 90s 兜底；余量充裕 → 保留父 deadline；无 deadline → 不设限，由单次请求超时与重试上限兜底。90s ≈ 一次完整 POST + 约 1s 退避 + 被截断的第二次尝试，daemon 60s 关停预算可能将其截断。
-- **`sslctl setup` 上报部署结果**（deploy-spec §5.1 步骤 6）：单证书一次、批量逐证书一次，`success`/`failure` 由该证书是否有失败站点决定。调用位置有硬性要求——必须紧跟部署循环，早于全失败 `os.Exit(1)` 与保存门禁；放到保存阶段会被这两道关卡同时吃掉，而它们拦下的恰是最该上报的那批。三条未发生部署的 `continue`（无绑定、缺私钥、私钥验证失败）不上报，其中"需要私钥"按 deploy-spec §5.3 属区别于"失败"的第三类。
+- **`sslctl setup` 上报部署结果**（deploy-spec §5.1 步骤 6）：单证书尝试一次，批量中每个有资格的证书逐一尝试；本轮回调熔断后允许余下结果缺行并在汇总中说明。`success`/`failure` 由该证书是否有失败站点决定。调用位置有硬性要求——必须紧跟部署循环，早于全失败 `os.Exit(1)` 与保存门禁；放到保存阶段会被这两道关卡同时吃掉，而它们拦下的恰是最该上报的那批。三条未发生部署的 `continue`（无绑定、缺私钥、私钥验证失败）不上报，其中"需要私钥"按 deploy-spec §5.3 属区别于"失败"的第三类。
 - **已知偏离**：`retryFailedBindings` 的 `QueryOrder` 失败出口在未发生部署时仍报 failure（查询失败不是部署结果，与 deploy-spec §2.8 不符），本次维持现状不扩大——触顶后停止。
 
 ### 部署链语义（setup/deploy/续签）
@@ -322,7 +335,7 @@ sslctl                    Manager API                    CA
 - **回滚必须脱离取消传播**（`certops.RollbackBudget`）：部署失败往往正是 ctx 被取消所致，回滚沿用同一个 ctx 会当场失败，
   直接落进"部署失败且回滚失败（服务可能不可用）"——比不贯通 ctx 更糟。回滚走 `WithoutCancel` + 独立预算，仍然有界。
   测试侧的 mock 部署器必须如实返回 `ctx.Err()`，否则这类用例永远是绿的、测不出任何东西。
-- **pending 私钥转正时机**（local 续签，deploy-spec §3.8）：签发 active 后先校验服务端证书与 pending 私钥配对，不配对按失败处理（保留 pending、不动线上私钥）；配对通过并部署成功后才转正，旧线上私钥由部署路径覆盖前备份。部署全失败时不得更新到期元数据，保持下轮完整自愈。
+- **pending 私钥转正时机**（local 续签，deploy-spec §3.8）：签发 active 后先校验服务端证书与 pending 私钥配对；任一绑定部署成功即接纳新证书并转正私钥，旧线上私钥由部署路径覆盖前备份。失败绑定写入独立有限重试状态，订单级回调仍为 failure；部署全失败时不得转正或更新到期元数据。
 
 ---
 
@@ -353,10 +366,6 @@ sslctl                    Manager API                    CA
 
 ```json
 {
-  "api": {
-    "url": "https://api.example.com",
-    "token": "xxx"
-  },
   "schedule": {
     "renew_before_days": 14,
     "renew_mode": "pull"
@@ -368,6 +377,10 @@ sslctl                    Manager API                    CA
       "enabled": true,
       "domains": ["*.example.com", "example.com"],
       "renew_mode": "pull",
+      "api": {
+        "url": "https://api.example.com",
+        "token": "xxx"
+      },
       "bindings": [
         {
           "server_name": "www.example.com",
@@ -437,7 +450,7 @@ sslctl                    Manager API                    CA
 - **到期时间未知不再静默跳过**：元数据零值（部署成功但保存失败、带外换证等）会自动查询 API 回填元数据后按正常逻辑判定；过期告警对该情况输出"到期时间未知"。
 - **定时检查**：每天一次，随机选择明天 09:00~23:59 的时间点执行（服务端 0:00~7:59 续签，预留 1 小时签发）；启动即检查一次；运行中若 `LastCheckAt` 距今超 25 小时（停摆/睡眠/任务跳过）则在 30~60 分钟内补偿一轮。
 - **单证书 panic 隔离**：续签循环中单证书处理 panic 记为该证书 failure（Error 日志 + 计入统计），不拖垮整轮。
-- **多证书续签间隔**：每个证书处理后随机延迟 30~90 秒，分散 API 请求压力。
+- **多证书续签间隔**：按证书数动态计算 5~120 秒的随机延迟，整轮分散预算上限 600 秒。
 - **陈旧绑定告警**（`stale_bindings`/`stale_since`，metadata 平台扩展字段）：该绑定当前未持有本证书的最新证书。
   证书级到期日只反映最新签发的证书，这些站点仍挂旧证书，按证书级判断永远看不出风险——因此 `CheckExpiry` 每轮单独 Error。
   迁入点：`parkExhaustedRetries`（主）与 `persistTerminalState`（终止态兜底）；迁移一律经 `retainableStaleNames` 过滤掉不在 `cert.Bindings` 中的名字，
@@ -446,7 +459,7 @@ sslctl                    Manager API                    CA
 - **证书过期告警**（守护进程 `CheckExpiry` 周期检查）：剩余不足 7 天输出 Error，不足 13 天输出 Warn，已过期输出 Error（阈值来自 `pkg/certops/service.go` 的 `7*24h`/`13*24h`）。
   该告警以 `defer` 覆盖 `checkAndDeploy` 的**全部**出口——未取到续签锁、`CheckAndRenewAll` 出错时同样告警，否则"另一个进程在跑"与"API 持续失败"会连告警一起静默，恰是最需要告警的场景。
   `CheckAndRenewAll` 被取消时会连同已完成证书的结果一起返回，daemon 先输出统计再报错，不丢这批结果。
-- **尝试次数上限**：签发与部署分别计数，各自达到 10 次即进入 `CAPPED`，静默停止并等待人工处理（不发送回调；部署成功——含手动 `sslctl deploy`——会清零计数并解除停机）。
+- **尝试次数上限**：签发与部署分别计数；计数达到 10 只阻止建立下一次新尝试，已持久化或已被服务端接受的第 10 次尝试仍可查询、部署和崩溃恢复（不发送触顶回调；部署成功——含手动 `sslctl deploy`——会清零计数并解除停机）。
 - **零启用绑定阻断**（`no_binding_blocked_at`，metadata 平台扩展字段）：证书 enabled 却无任何启用绑定（站点被改绑到其它证书、人工禁用、改名孤儿条目）时退出自动流程——**不发起任何 API 请求**、不部署、不计数、不回调，落标记等待人工处理；恢复启用绑定或重跑 setup 后自动解除，**计数不复位**。闸门内部先跑纯本地判定：已过期仍转 `EXPIRED`、部署触顶仍转 `CAPPED`（deploy-spec §3.2）。
 - **零绑定 + 在途签发无终止态**：闸门命中且 `last_issue_state` 为 `processing`/`active` 时不会进入任何终止态，在途订单与 `pending-keys/` 私钥会滞留至人工处理（日志会额外标注）。
 - **失败绑定重试用独立配额**（`retry_attempt_count`，metadata 平台扩展字段）：与证书级 `deploy_attempt_count` 分离，10 轮后把绑定转入 `stale_bindings` 并停止重试，**不会把整张证书打进 `CAPPED`**——共用公共计数时一个坏站点或一次 API 宕机就会连健康站点一起停掉续签。计数在入口递增（早于订单查询，保证 API 持续不可达时也能终止）；证书处于 `processing` 属上游在途状态，回滚本轮计数、不计入配额。
@@ -455,8 +468,9 @@ sslctl                    Manager API                    CA
 
 - `processing`（含 `pending` / `approving` 归一）：保持查询等待，不自动重提交；返回 `file` 字段时放置验证文件后等待下次检查。
 - 异常状态（订单终态）：持久化后停止，交人工处理；后续轮次仍只 GET 查询自愈，状态未变化不重复记录/落盘，绝不重新提交 CSR。
-- 提交 CSR 遇明确业务拒绝（API code != 1）：属确定结果，清理在途 pending 私钥后停止；超时/断连/解析失败等不确定结果保留 pending 私钥并归一 `processing`，下轮只查询恢复。
-- `active` 时若 pending 私钥缺失且正式私钥与服务端证书不配对（历史改名残留 / 误删）：重置签发状态走重新提交 CSR（递增 retry，受 10 次上限约束），避免永久卡死。
+- 提交 CSR 遇明确业务拒绝（API code != 1）：属确定结果，清理在途 pending 私钥后停止；超时、断连、HTTP 5xx、响应读取或解析失败等不确定结果不做传输层重试，保留 pending 私钥与 CSR metadata，下轮只查询并比较服务端 CSR。CSR 与 pending 私钥配对表示本机提交已收敛；active 且不配对时清理旧状态，先尝试 API/正式本地私钥部署当前证书，全部不可用时才按门禁建立新的逻辑尝试并重新计数；在途状态且不配对时清理本机状态、只 GET 跟随服务端当前动作。
+- `active` 时若 pending 私钥缺失，依次尝试 API 私钥和正式本地私钥；均与服务端证书不配对
+  （历史改名残留 / 误删）时，才重置签发状态走新 CSR 尝试（递增 retry，受 10 次上限约束）。
 
 ### order_id 变更（订单续费）改名迁移
 
@@ -495,46 +509,39 @@ sslctl setup --key /path/key.pem --webroot /var/www/html --url <url> --token <to
 ```
 定时任务 → NeedsRenewal() == true
     │
-    └─ renewLocalKeyMode() → issuer.CheckAndIssue()
+    └─ prepareLocalRenew()
         │
-        ├─ OrderID > 0 → QueryOrder(order_id)
-        │   ├─ processing + File → 放置验证文件，等待下次
-        │   ├─ processing 无 File → 等待下次
-        │   ├─ active → 检查私钥匹配 → 部署
-        │   └─ 失败/其他 → Update(order_id, csr) 重签
-        │
-        └─ OrderID == 0 → Update(0, csr) 首次提交
-            ├─ processing + File → 放置验证文件，等待下次
-            └─ 保存返回的 order_id
+        ├─ OrderID <= 0 → 配置错误，停止并要求重新 setup
+        └─ QueryOrder(order_id)
+            ├─ processing/pending/approving/unpaid/cancelling/unknown → 只 GET 查询
+            ├─ active + 可用私钥 → 按 deploy-spec 的私钥选择规则部署
+            ├─ active + 需建立新尝试 → 生成 CSR，持久化 pending 私钥、CSR 哈希/提交时间与计数
+            │   └─ 持久化成功后单次 POST；结果不确定时下轮只 GET
+            └─ 明确终态 → 只展示并等待人工处理
 ```
 
-关键方法：`issuer.CheckAndIssue()`
+关键方法：`prepareLocalRenew()`
 
 ### 自动签发流程
 
 ```
 定时任务 → NeedsRenewal() == true
     │
-    └─ renewPullMode()
+    └─ preparePullRenew()
         │
-        ├─ 保存 order_id（无论状态）
-        │
-        ├─ OrderID > 0 → QueryOrder(order_id)
-        │   ├─ processing + File → 放置验证文件，等待下次
-        │   ├─ processing 无 File → 等待下次
-        │   ├─ 失败/非 active → 跳过
-        │   └─ active → 部署
-        │
-        └─ OrderID == 0 → Query(domain)
-            └─ 获取初始 order_id，保存并部署
+        ├─ OrderID <= 0 → 配置错误，停止并要求重新 setup
+        └─ QueryOrder(order_id)
+            ├─ processing/pending/approving/unpaid/cancelling/unknown → 只 GET 查询
+            ├─ active → 部署
+            └─ 明确终态 → 只展示并等待人工处理
 ```
 
 ### order_id 处理规则
 
-1. **两种模式都保存 order_id** - 用于后续查询和重签
-2. **通过 order_id 查询** - 优先使用 `QueryOrder(order_id)`
-3. **本机提交 POST 带 order_id** - `Update(order_id, csr)` 用于重签/续费
-4. **首次部署用域名查询** - `Query(domain)` 获取初始 order_id
+1. **order_id 必须为正整数** - setup 由用户提供，自动流程不通过域名发现或创建订单
+2. **提交前必须先查询** - `QueryOrder(order_id)` 确认服务端仍为 `active`
+3. **只有 active 可以提交** - waiting、终态和未知状态均不得 POST
+4. **本机提交固定携带 order_id** - 每个逻辑尝试只提交一次 CSR；结果不确定时只 GET 收敛
 
 ### 验证方法校验
 
@@ -558,7 +565,7 @@ sslctl setup --key /path/key.pem --webroot /var/www/html --url <url> --token <to
 4. 返回等待下次检查（次日 CA 完成验证后 status 变为 active）
 5. 签发完成后无论部署成败均由 `cleanupValidationFiles()` 删除文件并清理空目录，不残留 webroot
 
-**全部放置失败按失败处理**：若无可用 webroot、或所有 webroot 写入均失败，按失败处理并上报原因（回调 failure），不再静默永远 pending。
+**全部放置失败按签发失败处理**：若无可用 webroot、或所有 webroot 写入均失败，记录错误并停止本轮，不发送部署结果回调。
 
 **配置字段**：
 - `certificates[].validation_method`：验证方法（`file` | `delegation`），传递给 API 的 `validation_method` 参数
@@ -586,19 +593,19 @@ sslctl setup --key /path/key.pem --webroot /var/www/html --url <url> --token <to
 必填变量：
 - `TEST_API_URL`：部署 API 地址（例：`https://xxx/api/deploy`）
 - `TEST_API_TOKEN`：部署 Token
+- `TEST_ORDER_ID`：正整数订单 ID
 - `TEST_API_DOMAIN`：用于校验的域名（例：`*.example.com`）
 
 可选变量（写入型测试）：
 - `TEST_API_ALLOW_WRITE=1`：允许调用更新接口
-- `TEST_API_METHOD=http`：更新时的验证方式（默认 `http`）
+- `TEST_API_METHOD`：更新时提交的验证方式，必须显式设为 `file` 或 `delegation`；当前代码默认
+  `http` 不符合公开契约，属待修测试缺口
 - `TEST_API_DOMAINS`：更新时提交的域名列表（逗号分隔）
 - `TEST_API_ALLOW_CALLBACK=1`：允许回调接口测试
 
 ### 覆盖的业务流
 
 只读/安全测试（默认执行）：
-- 获取证书信息（Info）
-- 按域名查询（Query）
 - 按订单号查询（QueryOrder）
 - API 响应解析与字段格式校验
 - 本地部署写入与权限校验

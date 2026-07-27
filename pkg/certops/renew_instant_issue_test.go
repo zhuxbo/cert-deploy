@@ -33,6 +33,7 @@ type signingAPI struct {
 	caPEM       string
 	mu          sync.Mutex
 	lastCertPEM string
+	lastCSRPEM  string
 	postCount   int
 	getCount    int
 }
@@ -108,13 +109,14 @@ func (a *signingAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			CSR string `json:"csr"`
 		}
 		_ = json.Unmarshal(body, &req)
+		a.lastCSRPEM = req.CSR
 		a.lastCertPEM = a.signCSR(req.CSR)
 	} else {
 		a.getCount++
 	}
 
-	resp := fmt.Sprintf(`{"code":1,"msg":"ok","data":{"order_id":%d,"status":"active","certificate":%q,"ca_certificate":%q}}`,
-		a.orderID, a.lastCertPEM, a.caPEM)
+	resp := fmt.Sprintf(`{"code":1,"msg":"ok","data":{"order_id":%d,"status":"active","certificate":%q,"ca_certificate":%q,"csr":%q}}`,
+		a.orderID, a.lastCertPEM, a.caPEM, a.lastCSRPEM)
 	_, _ = w.Write([]byte(resp))
 }
 

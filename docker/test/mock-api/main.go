@@ -43,6 +43,7 @@ type CertData struct {
 	OrderID          int            `json:"order_id"`
 	Status           string         `json:"status"`
 	Domains          string         `json:"domains,omitempty"`
+	CSR              string         `json:"csr,omitempty"`
 	Cert             string         `json:"certificate"`
 	IntermediateCert string         `json:"ca_certificate"`
 	PrivateKey       string         `json:"private_key"`
@@ -562,8 +563,8 @@ func handleDeploy(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleGetOrders(w http.ResponseWriter, r *http.Request) {
-	ordersMutex.RLock()
-	defer ordersMutex.RUnlock()
+	ordersMutex.Lock()
+	defer ordersMutex.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
 	scenario := getScenario()
@@ -608,6 +609,9 @@ func handleGetOrders(w http.ResponseWriter, r *http.Request) {
 		// local CSR 已提交：POST 仅返回 processing；后续 GET 返回按该 CSR 公钥签发的证书。
 		if order.CertData.Cert != "" {
 			certData := order.CertData
+			// Mock CA 已完成签发，本次查询把当前动作推进为 active。
+			// 状态更新与 CSR POST 共用 ordersMutex，模拟服务端同订单串行化边界。
+			order.Status = certData.Status
 			_ = json.NewEncoder(w).Encode(APIResponse{
 				Code:    1,
 				Message: "success",
@@ -698,6 +702,20 @@ func handleRenewRequest(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, "Order not found", "order_not_found", 0)
 		return
 	}
+	hasMutation := strings.TrimSpace(req.CSR) != "" ||
+		strings.TrimSpace(req.Domains) != "" ||
+		strings.TrimSpace(req.ValidationMethod) != ""
+	if hasMutation && order.Status != "active" {
+		errorCode := ""
+		switch order.Status {
+		case "unpaid", "pending", "processing", "approving", "cancelling":
+			errorCode = "order_in_progress"
+		}
+		writeAPIError(w,
+			fmt.Sprintf("Order status %s does not allow CSR, domains, or validation method updates", order.Status),
+			errorCode, 0)
+		return
+	}
 
 	issued, err := issueCertificateForCSR(req.CSR, order.OrderID, order.CommonName)
 	if err != nil {
@@ -706,6 +724,7 @@ func handleRenewRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	order.Status = "processing"
+	issued.CSR = req.CSR
 	order.CertData = issued
 	order.ExpiresAt = issued.ExpiresAt
 
@@ -713,6 +732,7 @@ func handleRenewRequest(w http.ResponseWriter, r *http.Request) {
 		OrderID:  order.OrderID,
 		Status:   "processing",
 		Domains:  order.Domains,
+		CSR:      req.CSR,
 		IssuedAt: "",
 	}
 	if req.ValidationMethod == "file" {
@@ -730,6 +750,7 @@ func handleRenewRequest(w http.ResponseWriter, r *http.Request) {
 			"order_id":          processing.OrderID,
 			"status":            processing.Status,
 			"domains":           processing.Domains,
+			"csr":               processing.CSR,
 			"file":              processing.File,
 			"renew_before_days": 14,
 		},

@@ -278,7 +278,16 @@ const WinSvcFallbackSep = "|"
 // winsvc:<服务名>|<reload 命令> 哨兵；部署层先走 SCM 控制路径，失败时回退到
 // reload 命令，避免误命中残留服务或 SCM 异常时无法部署。
 func DetectNginxCommands() ServerCommands {
-	nginxBin := findNginxBin()
+	return DetectNginxCommandsFor(findNginxBin())
+}
+
+// DetectNginxCommandsFor 为已经扫描到的 Nginx 实例生成命令。
+// executable 非空时不得再次从 PATH 或运行进程选择另一套 Nginx。
+func DetectNginxCommandsFor(executable string) ServerCommands {
+	nginxBin := executable
+	if nginxBin == "" {
+		nginxBin = findNginxBin()
+	}
 	prefixArgs := getNginxPrefixArgs(nginxBin)
 	reloadCmd := nginxBin + prefixArgs + " -s reload"
 	cmds := ServerCommands{
@@ -286,7 +295,13 @@ func DetectNginxCommands() ServerCommands {
 		ReloadCmd: reloadCmd,
 	}
 	if runtime.GOOS == "windows" {
-		if svc := FindWebServerService("nginx", "nginx.exe"); svc != "" {
+		var svc string
+		if executable != "" {
+			svc = FindWebServerServiceForExecutable("nginx", nginxBin)
+		} else {
+			svc = FindWebServerService("nginx", "nginx.exe")
+		}
+		if svc != "" {
 			cmds.ReloadCmd = WinSvcReloadPrefix + svc + WinSvcFallbackSep + reloadCmd
 		}
 	}

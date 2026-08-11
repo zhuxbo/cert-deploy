@@ -538,7 +538,7 @@ func installSSLForSite(ctx context.Context, site *config.ScannedSite, binding *c
 	if serverType == config.ServerTypeApache {
 		testCmd = webserver.DetectApacheCommands().TestCmd
 	} else {
-		testCmd = webserver.DetectNginxCommands().TestCmd
+		testCmd = webserver.DetectNginxCommandsFor(site.ExecutablePath).TestCmd
 	}
 
 	installer, err := webserver.NewInstaller(
@@ -856,7 +856,7 @@ func buildBindingFromScanResult(site *config.ScannedSite, cfgManager *config.Con
 	case isDocker:
 		cmds = webserver.DetectDockerCommands(webserver.ServerType(serverType), site.ContainerName)
 	case serverType == config.ServerTypeNginx:
-		cmds = webserver.DetectNginxCommands()
+		cmds = webserver.DetectNginxCommandsFor(site.ExecutablePath)
 	case serverType == config.ServerTypeApache:
 		cmds = webserver.DetectApacheCommands()
 	}

@@ -465,6 +465,30 @@ func TestBuildBindingFromScanResult(t *testing.T) {
 	}
 }
 
+func TestBuildBindingFromScanResultUsesScannedNginxExecutable(t *testing.T) {
+	cfgManager, err := config.NewConfigManagerWithDir(t.TempDir())
+	if err != nil {
+		t.Fatalf("创建配置管理器失败: %v", err)
+	}
+	const scannedExe = `G:\soft\nginx-1.26.3\nginx.exe`
+	site := &config.ScannedSite{
+		ServerName:      "blait-selector.com",
+		Source:          "local",
+		ConfigFile:      `G:\soft\nginx-1.26.3\conf\nginx.conf`,
+		CertificatePath: `G:\soft\nginx-1.26.3\ssl\blait-selector.com.pem`,
+		PrivateKeyPath:  `G:\soft\nginx-1.26.3\ssl\blait-selector.com.key`,
+		ExecutablePath:  scannedExe,
+	}
+
+	binding := buildBindingFromScanResult(site, cfgManager)
+	if !strings.HasPrefix(binding.Reload.TestCommand, scannedExe+" ") {
+		t.Fatalf("TestCommand = %q，应绑定扫描实例 %q", binding.Reload.TestCommand, scannedExe)
+	}
+	if !strings.HasPrefix(binding.Reload.ReloadCommand, scannedExe+" ") {
+		t.Fatalf("ReloadCommand = %q，应绑定扫描实例 %q", binding.Reload.ReloadCommand, scannedExe)
+	}
+}
+
 // TestGetSiteBindingForLocal_ConfigPriority 测试 config.json 优先
 func TestGetSiteBindingForLocal_ConfigPriority(t *testing.T) {
 	tmpDir := t.TempDir()

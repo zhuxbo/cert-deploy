@@ -69,6 +69,34 @@ func TestCreateBinding_Nginx(t *testing.T) {
 	}
 }
 
+// TestCreateBinding_NginxUsesScannedExecutable 验证多套 Nginx 共存时，
+// 绑定命令使用扫描该站点的实例，而不是再次从 PATH 或其他运行进程中选择。
+func TestCreateBinding_NginxUsesScannedExecutable(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgManager, err := config.NewConfigManagerWithDir(tmpDir)
+	if err != nil {
+		t.Fatalf("创建配置管理器失败: %v", err)
+	}
+
+	const scannedExe = `G:\soft\nginx-1.26.3\nginx.exe`
+	site := &matcher.ScannedSiteInfo{
+		ServerName:     "blait-selector.com",
+		ConfigFile:     `G:\soft\nginx-1.26.3\conf\nginx.conf`,
+		CertPath:       `G:\soft\nginx-1.26.3\ssl\blait-selector.com.pem`,
+		KeyPath:        `G:\soft\nginx-1.26.3\ssl\blait-selector.com.key`,
+		ServerType:     config.ServerTypeNginx,
+		ExecutablePath: scannedExe,
+	}
+
+	binding := createBinding(site, cfgManager)
+	if !strings.HasPrefix(binding.Reload.TestCommand, scannedExe+" ") {
+		t.Fatalf("TestCommand = %q，应绑定扫描实例 %q", binding.Reload.TestCommand, scannedExe)
+	}
+	if !strings.HasPrefix(binding.Reload.ReloadCommand, scannedExe+" ") {
+		t.Fatalf("ReloadCommand = %q，应绑定扫描实例 %q", binding.Reload.ReloadCommand, scannedExe)
+	}
+}
+
 // TestHasDeployFailures 验证退出码判定：任一失败/未完成即视为失败。
 func TestHasDeployFailures(t *testing.T) {
 	tests := []struct {

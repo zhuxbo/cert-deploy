@@ -99,6 +99,8 @@ executor.Run("systemctl reload nginx")
 - `service nginx reload/restart`
 - `rc-service nginx reload/restart`
 
+Windows 多套 Nginx 共存时，扫描结果必须携带本次实际使用的 `nginx.exe` 路径，setup、scan-result deploy、配置测试和重载均复用该路径，不得重新从 PATH 或“第一个同名进程”选择实例。非服务模式 reload 失败回退按精确 `ExecutablePath` 查询 PID 并逐 PID 停止，保留原命令的 `-p` 参数拉起同一实例；禁止使用 `taskkill /IM nginx.exe` 终止全部同名实例。进程路径查询失败或存在路径不可读的同名进程时安全失败，不做宽泛终止。
+
 ---
 
 ## Apache

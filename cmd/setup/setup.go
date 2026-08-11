@@ -669,20 +669,21 @@ func scanWebServersAndSitesWithFactory(log *logger.Logger, newScanner func(webse
 		for _, site := range allSites {
 			addServerType(string(site.ServerType))
 			sites = append(sites, &matcher.ScannedSiteInfo{
-				ServerName:    site.ServerName,
-				ServerAlias:   site.ServerAlias,
-				ConfigFile:    site.ConfigFile,
-				HasSSL:        site.CertificatePath != "",
-				CertPath:      site.CertificatePath,
-				KeyPath:       site.PrivateKeyPath,
-				ChainPath:     site.ChainFile,
-				ServerType:    string(site.ServerType),
-				ContainerID:   site.ContainerID,
-				ContainerName: site.ContainerName,
-				HostCertPath:  site.HostCertPath,
-				HostKeyPath:   site.HostKeyPath,
-				HostChainPath: site.HostChainPath,
-				VolumeMode:    site.VolumeMode,
+				ServerName:     site.ServerName,
+				ServerAlias:    site.ServerAlias,
+				ConfigFile:     site.ConfigFile,
+				HasSSL:         site.CertificatePath != "",
+				CertPath:       site.CertificatePath,
+				KeyPath:        site.PrivateKeyPath,
+				ChainPath:      site.ChainFile,
+				ServerType:     string(site.ServerType),
+				ContainerID:    site.ContainerID,
+				ContainerName:  site.ContainerName,
+				HostCertPath:   site.HostCertPath,
+				HostKeyPath:    site.HostKeyPath,
+				HostChainPath:  site.HostChainPath,
+				VolumeMode:     site.VolumeMode,
+				ExecutablePath: site.ExecutablePath,
 			})
 		}
 	}
@@ -837,7 +838,7 @@ func createBinding(site *matcher.ScannedSiteInfo, cm *config.ConfigManager) conf
 			DeployMode:    deployMode,
 		}
 	case site.ServerType == config.ServerTypeNginx:
-		cmds = webserver.DetectNginxCommands()
+		cmds = webserver.DetectNginxCommandsFor(site.ExecutablePath)
 	case site.ServerType == config.ServerTypeApache:
 		cmds = webserver.DetectApacheCommands()
 	}
@@ -969,7 +970,7 @@ func installSSLConfig(site *matcher.ScannedSiteInfo, cm *config.ConfigManager) (
 	if site.ServerType == config.ServerTypeApache {
 		testCmd = webserver.DetectApacheCommands().TestCmd
 	} else {
-		testCmd = webserver.DetectNginxCommands().TestCmd
+		testCmd = webserver.DetectNginxCommandsFor(site.ExecutablePath).TestCmd
 	}
 
 	// 创建安装器

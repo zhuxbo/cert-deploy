@@ -120,6 +120,7 @@ func (a *nginxScannerAdapter) ScanLocal() ([]webserver.Site, error) {
 			CertificatePath: s.CertificatePath,
 			PrivateKeyPath:  s.PrivateKeyPath,
 			ServerType:      webserver.TypeNginx,
+			ExecutablePath:  a.scanner.ExecutablePath(),
 		})
 	}
 	return result, nil

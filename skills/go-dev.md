@@ -374,7 +374,7 @@ safePath, err := util.JoinUnderDir(baseDir, userInput)
 ### 服务重载与守护进程（跨平台）
 
 - **Windows 服务停止等待**：`Stop()` 轮询至 `Stopped` 状态，确保进程完全退出后才返回。
-- **Windows 非服务模式重载**：reload 失败回退到进程重启（taskkill → 等守护进程拉起 → 否则手动启动）；回退白名单含 `Access is denied`，覆盖 sslctl 与 SYSTEM master 进程权限错配。
+- **Windows 非服务模式重载**：reload 失败回退到精确实例重启（按扫描到的 `ExecutablePath` 查询并逐 PID 停止 → 等同一路径实例由守护进程拉起 → 否则保留 `-p`/`-d` 参数手动启动）；禁止 `taskkill /IM` 误停其他同名实例。进程路径查询失败时安全失败。回退白名单含 `Access is denied`，覆盖 sslctl 与 SYSTEM master 进程权限错配。
 - **Windows 服务模式重载**：detector 检测到 nginx/apache 注册为 Windows 服务且 BinaryPath 与当前运行进程路径一致时，`ReloadCmd` 设为 `winsvc:<服务名>|<reload 命令>` 哨兵；`Base.ReloadService` 先走 SCM Stop+Start，SCM 失败回退执行哨兵编入的 reload 命令，再失败按白名单走进程重启。
 - **守护进程优雅停止**：`RunAsService` 通过 context 通知 daemon，不依赖 SIGTERM；Windows SCM 停止立即生效。
 - **SELinux 兼容**：部署后自动 `restorecon` 恢复文件安全上下文，失败返回错误。

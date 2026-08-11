@@ -61,6 +61,7 @@ const maxScanFiles = 1000
 type Scanner struct {
 	mainConfigPath string                       // 主配置文件路径
 	configRoot     string                       // 配置根目录
+	executablePath string                       // 本次自动扫描固定使用的 nginx 可执行文件
 	scannedFiles   map[string]bool              // 已扫描的文件（避免循环）
 	debug          bool                         // 调试模式
 	debugLog       func(string, ...interface{}) // 调试日志函数
@@ -94,6 +95,19 @@ func NewWithConfig(configPath string) *Scanner {
 	}
 }
 
+// ExecutablePath 返回本次自动扫描固定使用的 nginx 可执行文件。
+// 显式配置文件扫描没有可靠的实例关联，返回空字符串。
+func (s *Scanner) ExecutablePath() string {
+	return s.executablePath
+}
+
+func (s *Scanner) ensureExecutablePath() string {
+	if s.executablePath == "" {
+		s.executablePath = findNginxBinary()
+	}
+	return s.executablePath
+}
+
 func mainConfigRoot(configPath string) string {
 	if absolute, err := filepath.Abs(configPath); err == nil {
 		return filepath.Dir(absolute)
@@ -103,16 +117,31 @@ func mainConfigRoot(configPath string) string {
 
 // DetectNginx 检测 Nginx 是否安装并获取配置路径
 func DetectNginx() (configPath string, err error) {
+	return detectNginxFor(findNginxBinary())
+}
+
+func detectNginxFor(nginxPath string) (configPath string, err error) {
 	// 方法1: 通过 nginx -t 获取配置路径
-	configPath, err = getNginxConfigFromTest()
+	configPath, err = getNginxConfigFromTestFor(nginxPath)
 	if err == nil && configPath != "" {
 		return configPath, nil
 	}
 
 	// 方法2: 通过 nginx -V 获取编译时的默认路径
-	configPath, err = getNginxConfigFromVersion()
+	configPath, err = getNginxConfigFromVersionFor(nginxPath)
 	if err == nil && configPath != "" {
 		return configPath, nil
+	}
+
+	// Windows 多实例场景只能回退到同一可执行文件目录下的配置；
+	// 继续检查 C:\nginx 等全局常见路径会把 G 盘实例与另一套配置串线。
+	if runtime.GOOS == "windows" {
+		if exactPath := windowsConfigPathForExecutable(nginxPath); exactPath != "" {
+			if _, statErr := os.Stat(exactPath); statErr == nil {
+				return exactPath, nil
+			}
+			return "", fmt.Errorf("无法检测目标 Nginx 实例的配置文件: %s", exactPath)
+		}
 	}
 
 	// 方法3: 尝试常见路径
@@ -126,10 +155,21 @@ func DetectNginx() (configPath string, err error) {
 	return "", fmt.Errorf("无法检测 Nginx 配置文件路径")
 }
 
-// getNginxConfigFromTest 通过 nginx -t 获取配置路径
-func getNginxConfigFromTest() (string, error) {
-	// 优先使用动态路径（避免 PATH 里的 nginx 不可用）
-	nginxPath := findNginxBinary()
+func windowsConfigPathForExecutable(executable string) string {
+	path := strings.ReplaceAll(strings.TrimSpace(executable), "/", `\`)
+	idx := strings.LastIndex(path, `\`)
+	if idx <= 2 {
+		return ""
+	}
+	if !strings.EqualFold(path[idx+1:], "nginx.exe") {
+		return ""
+	}
+	return path[:idx] + `\conf\nginx.conf`
+}
+
+// getNginxConfigFromTestFor 通过指定 nginx 的 -t 输出获取配置路径。
+func getNginxConfigFromTestFor(nginxPath string) (string, error) {
+	// 优先使用传入的动态路径（避免 PATH 里的另一套 nginx 串线）
 	var output []byte
 	if nginxPath != "" {
 		args := buildNginxArgs(nginxPath, "-t")
@@ -166,10 +206,9 @@ func parseMainConfigPath(output []byte) string {
 	return ""
 }
 
-// getNginxConfigFromVersion 通过 nginx -V 获取配置路径
-func getNginxConfigFromVersion() (string, error) {
+// getNginxConfigFromVersionFor 通过指定 nginx 的 -V 输出获取配置路径。
+func getNginxConfigFromVersionFor(nginxPath string) (string, error) {
 	// nginx -V 输出编译信息，不需要 -p（与运行时目录无关）
-	nginxPath := findNginxBinary()
 	var output []byte
 	var err error
 	if nginxPath != "" {
@@ -270,7 +309,7 @@ func GetMergedConfig() (string, map[int]string, error) {
 func (s *Scanner) Scan() ([]*SSLSite, error) {
 	// 如果没有指定配置路径，自动检测
 	if s.mainConfigPath == "" {
-		configPath, err := DetectNginx()
+		configPath, err := detectNginxFor(s.ensureExecutablePath())
 		if err != nil {
 			return nil, err
 		}
@@ -294,7 +333,11 @@ func (s *Scanner) Scan() ([]*SSLSite, error) {
 	}
 	for _, site := range sites {
 		if site.Webroot != "" && !filepath.IsAbs(site.Webroot) {
-			prefix, _, ok := getNginxPrefix(findNginxBinary())
+			nginxPath := s.executablePath
+			if nginxPath == "" {
+				nginxPath = findNginxBinary()
+			}
+			prefix, _, ok := getNginxPrefix(nginxPath)
 			if ok && prefix != "" {
 				for _, target := range sites {
 					target.Webroot = resolveNginxPath(prefix, target.Webroot)
@@ -706,7 +749,7 @@ func (s *Scanner) GetConfigPath() string {
 func (s *Scanner) ScanHTTPSites() ([]*HTTPSite, error) {
 	// 如果没有指定配置路径，自动检测
 	if s.mainConfigPath == "" {
-		configPath, err := DetectNginx()
+		configPath, err := detectNginxFor(s.ensureExecutablePath())
 		if err != nil {
 			return nil, err
 		}
@@ -898,7 +941,11 @@ func (s *Scanner) resolveSitePaths(sites []*Site) ([]*Site, error) {
 	// 不影响已经能够准确解析的证书和私钥路径。
 	for _, site := range sites {
 		if site.Webroot != "" && !filepath.IsAbs(site.Webroot) {
-			prefix, _, ok := getNginxPrefix(findNginxBinary())
+			nginxPath := s.executablePath
+			if nginxPath == "" {
+				nginxPath = findNginxBinary()
+			}
+			prefix, _, ok := getNginxPrefix(nginxPath)
 			if ok && prefix != "" {
 				for _, target := range sites {
 					target.Webroot = resolveNginxPath(prefix, target.Webroot)
@@ -1015,13 +1062,13 @@ func getNginxPrefix(nginxPath string) (prefix string, candidates []string, ok bo
 	}
 
 	// 2. nginx -V --prefix=（编译时 prefix，跨平台最可靠）
-	if p := getPrefixFromVersion(); p != "" {
+	if p := getPrefixFromVersion(nginxPath); p != "" {
 		return p, nil, true
 	}
 
 	// 3. Windows 运行进程命令行的 -p 参数
 	if runtime.GOOS == "windows" {
-		if p := getPrefixFromProcessCmdline(); p != "" {
+		if p := getPrefixFromProcessCmdline(nginxPath); p != "" {
 			return p, nil, true
 		}
 	}
@@ -1051,8 +1098,7 @@ func getNginxPrefix(nginxPath string) (prefix string, candidates []string, ok bo
 }
 
 // getPrefixFromVersion 通过 nginx -V 输出解析编译时 --prefix=
-func getPrefixFromVersion() string {
-	nginxPath := findNginxBinary()
+func getPrefixFromVersion(nginxPath string) string {
 	var output []byte
 	if nginxPath != "" {
 		output, _ = executor.RunScan(nginxPath, "-V")
@@ -1078,14 +1124,18 @@ func getPrefixFromVersion() string {
 // getPrefixFromProcessCmdline 从运行中的 nginx 进程命令行解析 -p 参数
 // Windows 专用，使用 PowerShell Get-CimInstance 读取 Win32_Process.CommandLine
 // 失败时（权限不足 / PowerShell 不可用）返回空字符串
-func getPrefixFromProcessCmdline() string {
+func getPrefixFromProcessCmdline(nginxPath string) string {
 	if runtime.GOOS != "windows" {
+		return ""
+	}
+	if nginxPath == "" {
 		return ""
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), processTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "powershell", "-NoProfile", "-NonInteractive", "-Command",
-		"Get-CimInstance Win32_Process -Filter \"Name='nginx.exe'\" | Select-Object -ExpandProperty CommandLine -First 1")
+		"Get-CimInstance Win32_Process -Filter \"Name='nginx.exe'\" | Where-Object { $_.ExecutablePath -and $_.ExecutablePath.Equals($args[0], [System.StringComparison]::OrdinalIgnoreCase) } | Select-Object -ExpandProperty CommandLine -First 1",
+		nginxPath)
 	output, err := cmd.Output()
 	if err != nil {
 		return ""
@@ -1281,7 +1331,7 @@ func rawBlocksToSites(blocks []rawBlock) []*Site {
 
 // scanWithNginxT 使用 nginx -T 获取合并配置并解析
 func (s *Scanner) scanWithNginxT() ([]*Site, error) {
-	nginxPath := findNginxBinary()
+	nginxPath := s.ensureExecutablePath()
 	if nginxPath == "" {
 		return nil, fmt.Errorf("未找到 nginx 可执行文件")
 	}

@@ -642,6 +642,7 @@ func parseServerBlocks(lines []string, defaultConfigFile string, opts parseOptio
 		if matches := sslCertRe.FindStringSubmatch(line); len(matches) > 1 {
 			certPath := strings.TrimSpace(matches[1])
 			certPath = strings.Trim(certPath, `"'`)
+			certPath = strings.ReplaceAll(certPath, `\\`, `\`)
 			current.certificatePath = certPath
 			current.hasSSL = true
 		}
@@ -650,6 +651,7 @@ func parseServerBlocks(lines []string, defaultConfigFile string, opts parseOptio
 		if matches := sslKeyRe.FindStringSubmatch(line); len(matches) > 1 {
 			keyPath := strings.TrimSpace(matches[1])
 			keyPath = strings.Trim(keyPath, `"'`)
+			keyPath = strings.ReplaceAll(keyPath, `\\`, `\`)
 			current.privateKeyPath = keyPath
 		}
 

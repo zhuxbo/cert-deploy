@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"io"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -207,6 +208,35 @@ func TestDiagnosticCommandsHelp(t *testing.T) {
 	} {
 		if !strings.Contains(got, command) {
 			t.Fatalf("diagnosticCommandsHelp() 未包含 %q：%q", command, got)
+		}
+	}
+}
+
+func TestPrintUsageIncludesCleanupCommand(t *testing.T) {
+	readEnd, writeEnd, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe() error = %v", err)
+	}
+	original := os.Stdout
+	os.Stdout = writeEnd
+	t.Cleanup(func() { os.Stdout = original })
+
+	printUsage()
+	if err := writeEnd.Close(); err != nil {
+		t.Fatalf("close stdout pipe error = %v", err)
+	}
+	output, err := io.ReadAll(readEnd)
+	if err != nil {
+		t.Fatalf("ReadAll() error = %v", err)
+	}
+	for _, want := range []string{
+		"cleanup         解除指定站点或证书的 sslctl 管理",
+		"sslctl cleanup --site <site>",
+		"sslctl cleanup --cert <name>",
+		"sslctl cleanup --list",
+	} {
+		if !strings.Contains(string(output), want) {
+			t.Fatalf("printUsage() output missing %q:\n%s", want, output)
 		}
 	}
 }

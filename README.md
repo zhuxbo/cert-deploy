@@ -104,6 +104,19 @@ sslctl rollback --site example.com --version 20240101-120000  # 回滚到指定�
 
 回滚前会自动备份当前文件，包含符号链接防护。
 
+### 解除站点或证书管理
+
+```bash
+sslctl cleanup --site example.com              # 解除指定站点管理
+sslctl cleanup --cert example.com-12345        # 解除指定证书管理
+sslctl cleanup --site example.com --yes        # 跳过交互确认
+sslctl cleanup --list                          # 列出全部受管证书和站点绑定
+```
+
+`--list` 是只读操作，单独使用时列出所有证书记录（包括禁用和重复记录）以及每一条站点绑定。执行清理时，`--site` 与 `--cert` 必须且只能指定一个。按站点清理会移除该站点绑定及相关失败、陈旧状态；如果证书因此失去最后一个绑定，该证书管理记录也会删除。按证书清理会移除证书管理记录、关联站点的内部备份及 pending 私钥。
+
+清理只解除 sslctl 的管理关系，不修改 Web 服务器配置，也不删除当前部署的证书、私钥、证书链或外部验证文件；即使在线证书位于 `/opt/sslctl/certs/` 下也会保留。命令需要 root/管理员权限，且与 setup、deploy、daemon 续签共用互斥锁。
+
 **其他命令:**
 
 ```bash
@@ -114,6 +127,9 @@ sslctl status                                        # 查看服务状态（含�
 sslctl upgrade                                       # 升级到最新版本
 sslctl upgrade --check                               # 检查更新
 sslctl service repair                                # 修复 systemd 服务
+sslctl cleanup --site example.com                    # 解除指定站点管理
+sslctl cleanup --cert example.com-12345              # 解除指定证书管理
+sslctl cleanup --list                                # 列出全部受管证书和站点绑定
 sslctl --debug scan                                  # 调试模式
 sslctl uninstall                                     # 卸载（交互确认是否清理配置）
 ```

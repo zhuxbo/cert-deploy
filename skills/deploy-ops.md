@@ -339,10 +339,21 @@ sslctl                    Manager API                    CA
 
 ---
 
+## 定向解除管理
+
+- `sslctl cleanup --site <server_name>` 精确移除站点绑定、对应失败/陈旧状态和站点内部备份；证书失去最后一个绑定时同步删除证书记录及其 pending 私钥。
+- `sslctl cleanup --cert <cert_name>` 删除全部同名证书记录、其 pending 私钥，以及没有被其它证书继续引用的站点内部备份。
+- `sslctl cleanup --list` 只读列出全部证书记录（包括禁用和重复记录）及全部站点绑定，不加续签锁，也不清理数据；必须单独使用。
+- 执行清理时两种目标必须二选一，默认交互确认，`--yes` 可用于非交互执行；cleanup 与 setup、deploy、rollback、daemon 续签共用 `renewal.lock`。
+- cleanup 只解除 sslctl 管理，不修改 Web 配置、不重载服务，也不删除在线证书、私钥、证书链或外部验证文件；`certs/` 下的在线文件同样保留。
+- 配置先原子落盘，再清理内部文件；内部文件删除失败时返回非零并报告残留，不能静默视为完全成功。
+
+---
+
 ## 安全特性
 
 - **HTTPS 强制**：远程 API 必须使用 HTTPS（仅 localhost 允许 HTTP）
-- **续签/部署进程互斥**：`config.AcquireRenewalLock` 共享 `renewal.lock`，daemon 续签检查与手动 deploy/setup 非阻塞互斥，手动侧被占用时提示"守护进程正在续签"退出（deploy-spec §3.7）
+- **续签/部署进程互斥**：`config.AcquireRenewalLock` 共享 `renewal.lock`，daemon 续签检查与手动 deploy/setup/rollback/cleanup 非阻塞互斥，手动侧被占用时退出（deploy-spec §3.7）
 - **SSRF 防护**：阻止访问内网 IP（10/172.16/192.168）和云元数据地址（169.254.169.254）
 - **命令白名单**：统一的 `internal/executor` 包，只允许执行预定义的 Nginx/Apache 命令
 - **日志脱敏**：自动过滤 PEM 私钥、Bearer Token、password/secret 参数

@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	cleanupcmd "github.com/zhuxbo/sslctl/cmd/cleanup"
 	"github.com/zhuxbo/sslctl/cmd/daemon"
 	"github.com/zhuxbo/sslctl/cmd/deploy"
 	"github.com/zhuxbo/sslctl/cmd/setup"
@@ -111,6 +112,8 @@ func main() {
 		runRollback(subArgs)
 	case "setup":
 		setup.Run(subArgs, debug)
+	case "cleanup":
+		cleanupcmd.Run(subArgs)
 	case "uninstall":
 		runUninstall(subArgs)
 	case "version", "-v", "--version":
@@ -138,6 +141,7 @@ func printUsage() {
   upgrade         升级工具
   service         管理系统服务
   setup           一键部署
+  cleanup         解除指定站点或证书的 sslctl 管理
   uninstall       卸载工具
   version         显示版本信息
   help            显示帮助信息
@@ -157,6 +161,9 @@ func printUsage() {
   sslctl upgrade                             升级到最新版本
   sslctl upgrade --check                     检查更新
   sslctl service repair                      修复 systemd 服务
+  sslctl cleanup --site <site>               解除指定站点管理
+  sslctl cleanup --cert <name>               解除指定证书管理
+  sslctl cleanup --list                      列出全部受管证书和站点绑定
 
 诊断命令:
 %s

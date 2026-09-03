@@ -4,7 +4,7 @@
 
 ## 平台与正式资产
 
-sslctl 使用 Go 1.24、`CGO_ENABLED=0` 和 `./cmd/` 包交叉编译。规范正式资产集合固定为：
+sslctl 使用 Go 1.26、`CGO_ENABLED=0` 和 `./cmd/` 包交叉编译。规范正式资产集合固定为：
 
 | 目标 | 公开文件名 |
 | --- | --- |
@@ -21,7 +21,7 @@ bash build/build.sh <x.y.z[-prerelease]> <output-dir>
 ```
 
 - 版本参数必须是不带 `v` 的有效 SemVer；脚本把该值原样注入 `main.version`，运行 `--version` 必须可见。
-- `build.sh` 从 `go.mod` 的 `toolchain go1.24.x` 读取并强制使用精确工具链；`build/release.sh prepare` 先捕获稳定工作区快照，再从该只读语义快照构建。main 使用目标 commit 的提交时间设置 `SOURCE_DATE_EPOCH`；固定时间、`-trimpath`、`-buildvcs=false`、无时间戳 gzip 保证同提交、同工具链的产物可重建验证。
+- `build.sh` 从 `go.mod` 的 `toolchain go1.26.x` 读取并强制使用精确工具链；`build/release.sh prepare` 先捕获稳定工作区快照，再从该只读语义快照构建。main 使用目标 commit 的提交时间设置 `SOURCE_DATE_EPOCH`；固定时间、`-trimpath`、`-buildvcs=false`、无时间戳 gzip 保证同提交、同工具链的产物可重建验证。
 - 正式发布仍只允许构建一次；可重建性用于审计，tag 创建后的恢复禁止重建。
 - 输出目录必须由调用者显式指定。发布流程不得依赖或混入仓库 `dist/` 的旧文件。
 

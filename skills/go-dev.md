@@ -170,6 +170,18 @@ go tool cover -html=coverage.out         # 生成 HTML 报告
 
 > **整体低于多数核心包属正常**：整体值为 `go tool cover -func` 的全量语句加权，含 `cmd/*`、`internal/deployer` 等低覆盖入口包（CLI 装配层难以单测）。核心业务包普遍在 78%+。internal 侧参考：apache/installer 92.6%、nginx/installer 79.9%、apache/scanner 70.4%、nginx/scanner 59.0%、nginx/docker 51.2%、executor 76.7%。
 
+### 变异测试
+
+覆盖率只说明代码被执行，变异测试用于确认断言能识别行为被破坏。项目固定使用 `gomutants v0.6.0`，默认按 Git 变更执行分钟级门禁：
+
+```bash
+make mutation
+```
+
+必须通过 `build/run-changed-checks.sh` 规划并由 `build/run-mutation.sh` 执行。生产 Go 代码只变异 changed lines；关键包测试变更时执行少量稳定哨兵；混合变更两项都跑。changed-line 的 `LIVED`、`NOT COVERED`、超时和基础设施错误均失败，哨兵必须为 `KILLED`。`--full` 只扩大普通测试、lint 与构建，不升级为全量变异。
+
+真实工作区只作为种子复制一次；gomutants 改写的源码副本、Git 索引、Go build cache、临时文件、运行时 cache 与详细报告都位于一次性 tmpfs/RAM Disk，模块 cache 仅持久复用，小型 gomutants cache 只在结束时写回一次。Linux 默认使用 `/dev/shm`，macOS 使用自动销毁的 3 GiB APFS RAM Disk；不得用普通磁盘目录绕过验证。changed-line 与哨兵共享 20 分钟硬截止时间，默认 2 个 worker；`make mutation-test` 离线验证这些契约。
+
 ### 测试目录结构
 
 ```text

@@ -1,0 +1,9 @@
+# package<TAB>gomutants stable mutant ID
+./pkg/validator	pkg/validator/ssrf.go:CheckSSRF:CONDITIONALS_NEGATION#1
+./pkg/validator	pkg/validator/validator.go:(*Validator).ValidateCertKeyPair:CONDITIONALS_NEGATION#1
+./pkg/upgrade	pkg/upgrade/installer.go:VerifySignature:CONDITIONALS_NEGATION#1
+./pkg/upgrade	pkg/upgrade/installer.go:VerifyChecksum:CONDITIONALS_NEGATION#1
+./pkg/fetcher	pkg/fetcher/api.go:IsAuthBlockErrorCode:RETURN_FALSE#1
+./pkg/fetcher	pkg/fetcher/api.go:isRetryable:CONDITIONALS_BOUNDARY#1
+./pkg/certops	pkg/certops/renew.go:(*Service).tryUpdateRenewBeforeDays:CONDITIONALS_BOUNDARY#1
+./pkg/certops	pkg/certops/renew.go:(*Service).tryUpdateRenewBeforeDays:CONDITIONALS_NEGATION#1

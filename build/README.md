@@ -12,6 +12,11 @@
 | `release.sh` | prepare、全节点 staging/promote/verify、main resume 和 tag 前 abort |
 | `check-agent-config.sh` | 检查智能体、Skill、薄入口和发布结构防漂移 |
 | `test-release.sh` | 在临时目录离线测试发布不变量 |
+| `plan-checks.py` | 结合 Git 变更与 Go 依赖图生成定向完成检查计划 |
+| `run-changed-checks.sh` | 执行计划内的契约、测试、lint、构建和变异门禁 |
+| `run-mutation.sh` | 在一次性 RAM 盘副本中运行固定版本 gomutants 变异测试 |
+| `mutation-canaries.txt` | 维护少量关键测试的稳定变异哨兵 |
+| `test-*mutation*.sh` | 离线验证规划、路由、RAM 隔离、版本和清理边界 |
 | `generate-keys.sh` | 生成 Ed25519 seed、公钥和客户端公钥代码 |
 
 ## 本地构建
@@ -54,3 +59,26 @@ bash build/release.sh --dry-run resume-main 1.2.3 --bundle /tmp/sslctl-v1.2.3
 ```
 
 不要脱离 `skills/remote-release.md` 直接运行非 dry-run 发布阶段。正式版 tag 创建后的恢复只允许传入原持久 bundle，`resume-main` 不提供构建选项。tag 前的未完成 prepare 只有在确认版本 tag 和节点正式目录都不存在后，才可显式执行 `abort-main <version> --bundle <原路径>`；该动作删除残留 bundle，但保留 aborted 状态和尝试次数。
+
+## 变异测试
+
+变异框架固定为 `gomutants v0.6.0`。它与项目依赖分离，不写入 `go.mod`；先安装精确版本，再执行按变更规划的入口：
+
+```bash
+go install github.com/szhekpisov/gomutants@v0.6.0
+make mutation
+```
+
+`make mutation` 读取提交、暂存区、工作区和未跟踪文件。生产 Go 代码只变异本次 changed lines，要求每个可执行 mutant 都被测试杀死；关键包测试发生变化时，再独立执行 `mutation-canaries.txt` 中对应的稳定哨兵。生产代码和测试同时变化时两项都跑。`go.mod`、`go.sum` 和 `--full` 只扩大普通测试、lint 与构建范围，不触发全量变异。
+
+changed-line 允许不可编译、等价和无可变异点结果；`LIVED`、`NOT COVERED`、超时和基础设施错误均失败。哨兵必须精确命中一个 mutant 且状态为 `KILLED`。两类变异共享一个 20 分钟硬截止时间，默认使用 2 个 worker。
+
+运行器校验二进制内嵌模块版本，并把工作区副本、独立 Git 索引、`GOCACHE`、`GOTMPDIR`、`TMPDIR`、变异文件、运行时 cache 和详细报告放入临时内存盘；`GOMODCACHE` 持久复用以避免重复下载，小型 gomutants cache 在开始时复制进 RAM，结束时只原子写回一次。Linux 使用 `/dev/shm`，macOS 自动创建 3 GiB APFS RAM Disk，退出时清理。可用 `MUTATION_RAM_MB` 调整容量，用 `MUTATION_RAM_ROOT` 指定可验证的内存文件系统，用 `MUTATION_REPORT_DIR` 导出最终报告。
+
+常用入口：
+
+```bash
+make finish-check          # 全部完成检查，自动选择范围
+make mutation             # 只执行计划内变异门禁
+make mutation-test        # 快速离线契约测试
+```

@@ -225,4 +225,17 @@ if grep -Eq '__RELEASE_URL__|sed .*install\.(sh|ps1)' "$SCRIPT_DIR/release.sh"; 
     exit 1
 fi
 
+install_ps1="$ROOT/deploy/install.ps1"
+if grep -Fq -- '-notlike "*$InstallDir*"' "$install_ps1"; then
+    echo "Windows 安装脚本仍使用子串判断 PATH，可能把 sslctlw 误认为 sslctl" >&2
+    exit 1
+fi
+grep -Fq 'function Test-PathContainsDirectory' "$install_ps1"
+grep -Fq '$PathValue -split ";"' "$install_ps1"
+grep -Fq '[System.StringComparison]::OrdinalIgnoreCase' "$install_ps1"
+if [[ "$(grep -Fc 'Ensure-InstallDirOnPath -Directory $InstallDir' "$install_ps1")" -ne 2 ]]; then
+    echo "Windows 安装脚本未同时覆盖同版本自愈和安装后 PATH 写入" >&2
+    exit 1
+fi
+
 echo "发布离线回归测试通过"

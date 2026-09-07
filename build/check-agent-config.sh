@@ -90,7 +90,7 @@ fi
 
 grep -Fq 'bash build/check-agent-config.sh' .github/workflows/ci.yml || fail "CI 未执行智能体防漂移检查"
 grep -Fq 'bash build/test-release.sh' .github/workflows/ci.yml || fail "CI 未执行发布行为回归检查"
-[[ "$(grep -Fc "go-version: '1.26.8'" .github/workflows/ci.yml)" == 3 ]] || fail "CI Go 版本未全部固定为 1.26.8"
+[[ "$(grep -Fc "go-version: '1.26.8'" .github/workflows/ci.yml)" == 4 ]] || fail "CI Go 版本未全部固定为 1.26.8"
 [[ "$(grep -Fc "go-version: '1.26.8'" .github/workflows/e2e.yml)" == 2 ]] || fail "E2E Go 版本未全部固定为 1.26.8"
 grep -Fxq 'FROM golang:1.26.8-alpine AS builder' docker/test/mock-api/Dockerfile || fail "mock API Go 版本未固定为 1.26.8"
 grep -Fq 'github.com/szhekpisov/gomutants@v0.6.0' .github/workflows/mutation.yml || fail "mutation CI 未固定 gomutants 版本"

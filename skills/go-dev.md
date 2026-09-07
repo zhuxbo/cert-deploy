@@ -88,6 +88,8 @@ CGO_ENABLED=0 go build -ldflags="-s -w" -o sslctl ./cmd
 
 本地使用 finish-check 规划的包集合进行 Linux/Windows lint；CI 保留全仓检查。不要在定向检查后再复制执行全仓命令。
 
+`Windows Apache parser` job 在 Windows runner 原生执行 ServerRoot/Define 与包含文件回归，验证 Windows 路径解析；它不代表 Windows Apache 服务部署 E2E。
+
 ---
 
 ## 代码质量

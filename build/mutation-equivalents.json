@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "equivalents": [
+    {
+      "id": "cmd/setup/setup.go:getAndValidatePrivateKey:INVERT_LOOP_CTRL#2",
+      "original": "break",
+      "replacement": "continue",
+      "sources": {
+        "cmd/setup/setup.go": "e56bb76e3153a1d4df550330862439284eeeeb2c270f9a7c2a0c6e118aa67ec0",
+        "pkg/config/config.go": "3a6af5a7ab788fe13967520601ab60f8dda36eab6695197ba90e8366f5479f4f"
+      },
+      "reason": "此循环只对 Docker copy 绑定将 defaultKeyPath 置空，谓词无副作用；找到一个后继续迭代只会再次置空，循环后的路径和所有后续行为相同。"
+    }
+  ]
+}

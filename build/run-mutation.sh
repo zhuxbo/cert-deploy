@@ -193,7 +193,9 @@ PY
 
 validate_report() {
     python3 - "$1" "$2" <<'PY'
+import hashlib
 import json
+from pathlib import Path
 import sys
 
 path, mode = sys.argv[1:]
@@ -218,11 +220,49 @@ if mode == "canary":
         print(f"mutation 运行失败: canary 必须唯一且为 KILLED（实际: {status}）", file=sys.stderr)
         raise SystemExit(1)
     raise SystemExit(0)
+# 只认可逐项证明且依赖源码未变的等价项；原始报告和框架缓存保持原样。
+manifest = Path("build/mutation-equivalents.json")
+entries = {}
+try:
+    if manifest.exists():
+        document = json.loads(manifest.read_text(encoding="utf-8"))
+        if document.get("version") != 1 or not isinstance(document.get("equivalents"), list):
+            raise ValueError("等价清单格式无效")
+        for entry in document["equivalents"]:
+            if set(entry) != {"id", "original", "replacement", "sources", "reason"}:
+                raise ValueError("等价条目字段无效")
+            ident = entry["id"]
+            if not isinstance(ident, str) or ident in entries or not entry["reason"].strip():
+                raise ValueError("等价条目重复或缺少证明")
+            if not isinstance(entry["sources"], dict) or ident.split(":", 1)[0] not in entry["sources"]:
+                raise ValueError("等价条目未绑定变异源码")
+            entries[ident] = entry
+    approved = []
+    for mutation in mutations:
+        entry = entries.get(mutation.get("id"))
+        if entry is None or mutation.get("status") != "LIVED":
+            continue
+        if any(mutation.get(field) != entry[field] for field in ("original", "replacement")):
+            raise ValueError("等价条目的原文或替换内容已变化: " + entry["id"])
+        for source, digest in entry["sources"].items():
+            file = Path(source)
+            if file.is_absolute() or ".." in file.parts or not file.resolve().is_relative_to(Path.cwd()):
+                raise ValueError("等价证明的源码路径无效")
+            if hashlib.sha256(file.read_bytes()).hexdigest() != digest:
+                raise ValueError("等价证明的源码已变化: " + source)
+        approved.append(entry["id"])
+        print("mutation: approved-equivalent " + entry["id"] + " — " + entry["reason"])
+except (ValueError, TypeError, KeyError, AttributeError, OSError) as err:
+    print("mutation 运行失败: " + str(err), file=sys.stderr)
+    raise SystemExit(1)
 allowed = {"KILLED", "NOT VIABLE", "EQUIVALENT"}
-invalid = sorted({m.get("status", "MISSING").replace("_", " ") for m in mutations} - allowed)
+invalid = sorted({m.get("status", "MISSING").replace("_", " ") for m in mutations
+                  if not (m.get("status") == "LIVED" and m.get("id") in approved)} - allowed)
 if invalid:
     print("mutation 运行失败: 不允许状态: " + ", ".join(invalid), file=sys.stderr)
     raise SystemExit(1)
+# 20 仅表示验证通过且使用了人工等价证明，不用于错误或超时状态。
+raise SystemExit(20 if approved else 0)
 PY
 }
 
@@ -240,6 +280,11 @@ run_gomutants() {
     else
         echo "mutation 运行失败: gomutants 未生成 JSON 报告" >&2
         validation_status=1
+    fi
+    if [[ "$validation_status" -eq 20 ]]; then
+        # efficacy 阈值仍为 100；只有剩余项均已证明等价才接受 exit 10。
+        [[ "$command_status" -eq 0 || "$command_status" -eq 10 ]] || return "$command_status"
+        return 0
     fi
     [[ "$command_status" -eq 0 ]] || return "$command_status"
     return "$validation_status"
@@ -294,10 +339,21 @@ git add -A
 echo "mutation: framework=gomutants@$GOMUTANTS_VERSION mode=$MODE budget=${TIMEOUT_SECONDS}s ram=$RAM_MOUNT"
 
 COMMON_ARGS=(--workers="${MUTATION_WORKERS:-2}" --detect-equivalent)
+# v0.6.0 的 per-test map 按完整导入路径索引；相对路径会退化为逐 mutant 跑整包。
+resolve_targets() {
+    local output target
+    output="$(run_with_deadline go list -f '{{.ImportPath}}' "$@")" || fail "无法解析 mutation 包目标"
+    RESOLVED_TARGETS=()
+    while IFS= read -r target; do
+        [[ -n "$target" ]] && RESOLVED_TARGETS+=("$target")
+    done <<<"$output"
+    [[ ${#RESOLVED_TARGETS[@]} -gt 0 ]] || fail "mutation 包目标为空"
+}
 if [[ "$MODE" == changed-lines ]]; then
+    resolve_targets "${TARGETS[@]}"
     run_gomutants "$RUN_ROOT/reports/changed-lines.json" changed-lines \
         --changed-since "$BASE" --threshold-efficacy=100 --threshold-mcover=100 \
-        "${COMMON_ARGS[@]}" "${TARGETS[@]}"
+        "${COMMON_ARGS[@]}" "${RESOLVED_TARGETS[@]}"
 else
     [[ -f "$CANARY_FILE" ]] || fail "缺少 mutation canary 清单: $CANARY_FILE"
     canary_count=0
@@ -309,8 +365,9 @@ else
             [[ "$package" == "$target" ]] || continue
             package_count=$((package_count + 1))
             canary_count=$((canary_count + 1))
+            resolve_targets "$package"
             run_gomutants "$RUN_ROOT/reports/canary-$canary_count.json" canary \
-                --run-mutant-id "$mutant_id" "${COMMON_ARGS[@]}" "$package"
+                --run-mutant-id "$mutant_id" "${COMMON_ARGS[@]}" "${RESOLVED_TARGETS[@]}"
         done <"$CANARY_FILE"
         [[ "$package_count" -gt 0 ]] || fail "$target 没有匹配的 mutation canary"
     done

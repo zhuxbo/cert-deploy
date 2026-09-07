@@ -40,7 +40,7 @@ make finish-check-full
 - 沙箱阻止 Go cache 或 httptest loopback 属环境问题。使用可写临时 `GOCACHE`/lint cache，在允许 loopback 的环境重跑受阻项；不修改测试迁就环境。
 - 需要构建时产物写临时目录。三平台交叉编译不代表真实 Windows 运行；修改版本注入时额外运行本机 `--version` 验证注入值，产物契约见 `skills/build-release.md`。
 - 完整 Docker E2E 是 Nginx/Apache × ubuntu/debian/alpine/rocky 的 8 项和 DinD；`--no-dind`/单环境只算定向证据，不能冒充发布门禁。异步 daemon 用例分别等待操作开始和目标回调完成。
-- 变异仅在显式选中、完整检查或独立 `make mutation`/CI 时运行。`gomutants v0.6.0`、RAM 隔离、changed-line 与稳定哨兵、20 分钟共享截止时间及失败判定保持不变，运行细节见 `build/README.md`。不升级全仓变异，不将超时、存活 mutant 或基础设施错误视为成功。
+- 变异仅在显式选中、完整检查或独立 `make mutation`/CI 时运行。`gomutants v0.6.0`、RAM 隔离、changed-line 与稳定哨兵、20 分钟共享截止时间及失败判定保持不变，运行细节见 `build/README.md`。不升级全仓变异，不将超时、未经逐项证明等价的存活 mutant 或基础设施错误视为成功。人工等价仅按 `build/mutation-equivalents.json` 的精确条目和源码哈希校验；源码变化后重新证明，不豁免未覆盖或哨兵。
 - 普通检查不会修改 CI 的强门禁。正式发布仍遵守 `skills/remote-release.md` 与 `deploy-spec.md`，不以快速检查替代精确 commit CI/E2E、签名或全节点验收。
 
 ## 复核与停止

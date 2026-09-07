@@ -16,6 +16,13 @@ import (
 	"github.com/zhuxbo/sslctl/pkg/validator"
 )
 
+// 文件系统边界集中保留，便于验证快照失败时必须停止部署。
+var (
+	containerWriteFile = os.WriteFile
+	containerChmod     = os.Chmod
+	containerStat      = os.Stat
+)
+
 // DeployDockerCopy 使用容器路径完成备份、部署及失败恢复，供 CLI 和自动续签共用。
 func DeployDockerCopy(ctx context.Context, binding *config.SiteBinding, data *fetcher.CertData, key string, manager *backup.Manager, log *logger.Logger) error {
 	return deployDockerCopy(ctx, binding, data, key, manager, log, nil)
@@ -55,10 +62,10 @@ func deployDockerCopy(ctx context.Context, binding *config.SiteBinding, data *fe
 	defer func() { _ = os.RemoveAll(dir) }()
 	certFile, keyFile := filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem")
 	for file, snapshot := range map[string]docker.ContainerFile{certFile: oldCert, keyFile: oldKey} {
-		if err := os.WriteFile(file, snapshot.Data, snapshot.Mode); err != nil {
+		if err := containerWriteFile(file, snapshot.Data, snapshot.Mode); err != nil {
 			return err
 		}
-		if err := os.Chmod(file, snapshot.Mode); err != nil {
+		if err := containerChmod(file, snapshot.Mode); err != nil {
 			return err
 		}
 	}
@@ -74,10 +81,10 @@ func deployDockerCopy(ctx context.Context, binding *config.SiteBinding, data *fe
 	if restore != nil {
 		restoreCert, restoreKey := filepath.Join(dir, "restore-cert.pem"), filepath.Join(dir, "restore-key.pem")
 		for file, snapshot := range map[string]docker.ContainerFile{restoreCert: restore[0], restoreKey: restore[1]} {
-			if err := os.WriteFile(file, snapshot.Data, snapshot.Mode); err != nil {
+			if err := containerWriteFile(file, snapshot.Data, snapshot.Mode); err != nil {
 				return err
 			}
-			if err := os.Chmod(file, snapshot.Mode); err != nil {
+			if err := containerChmod(file, snapshot.Mode); err != nil {
 				return err
 			}
 		}
@@ -103,13 +110,13 @@ func RestoreDockerBackup(ctx context.Context, manager *backup.Manager, backupPat
 		if err != nil {
 			return err
 		}
-		info, err := os.Stat(file)
+		info, err := containerStat(file)
 		if err != nil {
 			return err
 		}
 		files[i] = docker.ContainerFile{Data: content, Mode: info.Mode().Perm()}
 	}
-	defer clear(files[1].Data)
+	defer clearDockerSnapshots(&files)
 	binding := &config.SiteBinding{
 		ServerName: meta.ServerName, ServerType: config.ServerTypeDockerNginx,
 		Docker: &config.DockerInfo{ContainerName: meta.ContainerName, DeployMode: "copy"},
@@ -117,4 +124,11 @@ func RestoreDockerBackup(ctx context.Context, manager *backup.Manager, backupPat
 		Reload: config.ReloadConfig{TestCommand: "docker exec " + meta.ContainerName + " nginx -t", ReloadCommand: "docker exec " + meta.ContainerName + " nginx -s reload"},
 	}
 	return deployDockerCopy(ctx, binding, &fetcher.CertData{Cert: string(files[0].Data)}, string(files[1].Data), manager, nil, &files)
+}
+
+// 回滚结束后清除已读取的快照，避免私钥缓冲区残留。
+func clearDockerSnapshots(files *[2]docker.ContainerFile) {
+	for i := range files {
+		clear(files[i].Data)
+	}
 }

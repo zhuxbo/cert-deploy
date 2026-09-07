@@ -151,7 +151,7 @@ func (c *Client) replaceCertificateFiles(ctx context.Context, certPath, keyPath 
 	lockPath := path.Join(path.Dir(certPath), fmt.Sprintf(".sslctl-lock-%x", lockHash[:12]))
 	var stages []string
 	defer func() {
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), 35*time.Second)
+		cleanupCtx, cleanupCancel := newCopyCleanupContext(ctx)
 		defer cleanupCancel()
 		for _, stage := range stages {
 			_, cleanupErr := c.runFileScript(cleanupCtx, copyLockScript+`rm -f -- "$1/new"; rmdir -- "$1"`, lockPath, stage)
@@ -194,4 +194,9 @@ mv -f -- "$3/new" "$1"
 mv -f -- "$4/new" "$2"
 `, lockPath, keyPath, certPath, stages[0], stages[1], fmt.Sprintf("%o", key.Mode.Perm()), fmt.Sprintf("%o", cert.Mode.Perm()))
 	return err
+}
+
+// 清理必须独立于已取消的部署，并给容器锁的 30 秒等待留出完成清理的时间。
+func newCopyCleanupContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), 35*time.Second)
 }

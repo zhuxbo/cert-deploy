@@ -40,8 +40,7 @@ func GetPrivateKey(ctx context.Context, cert *config.CertConfig, apiPrivateKey s
 		return "", fmt.Errorf("读取已有私钥失败: %w", err)
 	}
 
-	result := string(keyData)
-	clear(keyData) // 清零原始字节切片，减少内存中私钥副本
+	result := consumePrivateKey(keyData)
 
 	if log != nil {
 		log.Debug("使用绑定私钥: %s", keyPath)
@@ -83,8 +82,7 @@ func GetPrivateKeyForCert(ctx context.Context, workDir string, cert *config.Cert
 				continue
 			}
 			data, err := ReadBindingPrivateKey(ctx, binding)
-			candidate := string(data)
-			clear(data)
+			candidate := consumePrivateKey(data)
 			if err == nil && v.ValidateCertKeyPair(certPEM, candidate) == nil {
 				return candidate, nil
 			}
@@ -142,4 +140,18 @@ func hasDockerCopyBinding(cert *config.CertConfig) bool {
 		}
 	}
 	return false
+}
+
+// consumePrivateKey 在取得独立字符串后清零读取缓冲区，供各取钥入口共用。
+func consumePrivateKey(data []byte) string {
+	key := string(data)
+	clear(data)
+	return key
+}
+
+// matchPrivateKeyAndClear 比较后立即清零缓冲区，不保留额外私钥字符串。
+func matchPrivateKeyAndClear(data []byte, expected string) bool {
+	matches := string(data) == expected
+	clear(data)
+	return matches
 }

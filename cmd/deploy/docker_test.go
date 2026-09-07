@@ -43,3 +43,29 @@ func TestDeployBindingDockerCopyRoutesContainer(t *testing.T) {
 		})
 	}
 }
+
+func TestScannedDockerPathsSelectOnlyMappedVolumeFiles(t *testing.T) {
+	cm, err := config.NewConfigManagerWithDir(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, hostCert, hostKey string
+		volume                  bool
+		wantCert, wantKey       string
+	}{
+		{"mapped-volume", "/host/cert", "/host/key", true, "/host/cert", "/host/key"},
+		{"unmapped-volume", "", "", true, "/container/cert", "/container/key"},
+		{"partial-cert-map", "/host/cert", "", true, "/host/cert", "/container/key"},
+		{"partial-key-map", "", "/host/key", true, "/container/cert", "/host/key"},
+		{"copy-ignores-host-hints", "/host/cert", "/host/key", false, "/container/cert", "/container/key"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			site := &config.ScannedSite{ServerName: "example.com", Source: "docker", ConfigFile: "/etc/nginx/nginx.conf", ContainerName: "web", CertificatePath: "/container/cert", PrivateKeyPath: "/container/key", VolumeMode: tc.volume, HostCertPath: tc.hostCert, HostKeyPath: tc.hostKey}
+			got := buildBindingFromScanResult(site, cm)
+			if got.Paths.Certificate != tc.wantCert || got.Paths.PrivateKey != tc.wantKey {
+				t.Fatalf("目标路径错误: %+v", got.Paths)
+			}
+		})
+	}
+}

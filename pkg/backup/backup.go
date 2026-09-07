@@ -89,6 +89,11 @@ func (m *Manager) Backup(siteName, certPath, keyPath string, certInfo *CertInfo,
 	return m.backupInternal(siteName, certPath, keyPath, certInfo, true, nil, chainPath...)
 }
 
+var (
+	containerSnapshotStat  = os.Stat
+	containerSnapshotChmod = os.Chmod
+)
+
 // BackupContainer 从受保护的本地快照保存容器备份，元数据保留容器身份和容器内路径。
 func (m *Manager) BackupContainer(siteName, containerName, certPath, keyPath, localCert, localKey string) (*BackupResult, error) {
 	result, err := m.backupInternal(siteName, localCert, localKey, nil, true, &Metadata{
@@ -99,11 +104,11 @@ func (m *Manager) BackupContainer(siteName, containerName, certPath, keyPath, lo
 	}
 	// CopyFile 创建文件会受 umask 影响；容器回滚必须保留原文件权限。
 	for name, source := range map[string]string{"cert.pem": localCert, "key.pem": localKey} {
-		info, err := os.Stat(source)
+		info, err := containerSnapshotStat(source)
 		if err != nil {
 			return nil, err
 		}
-		if err := os.Chmod(filepath.Join(result.BackupPath, name), info.Mode().Perm()); err != nil {
+		if err := containerSnapshotChmod(filepath.Join(result.BackupPath, name), info.Mode().Perm()); err != nil {
 			return nil, err
 		}
 	}

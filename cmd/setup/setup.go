@@ -54,6 +54,9 @@ type setupParams struct {
 	nonCriticalRetryAfter int
 }
 
+// exitSetup 保留部署预检失败的进程边界，测试可观察退出码。
+var exitSetup = os.Exit
+
 // orderPattern --order 参数形态（deploy-spec §2.3）：仅订单 ID，单个或英文逗号分隔多个
 var orderPattern = regexp.MustCompile(`^\d+(,\d+)*$`)
 
@@ -394,7 +397,7 @@ func runSingle(p *setupParams, orderID int) {
 		for i := range bindings {
 			if config.IsDockerCopyBinding(&bindings[i]) {
 				fmt.Fprintln(os.Stderr, "Docker copy 暂不支持文件验证，请使用 DNS 委托验证")
-				os.Exit(1)
+				exitSetup(1)
 			}
 		}
 
@@ -533,7 +536,7 @@ func runSingle(p *setupParams, orderID int) {
 	if successCount == 0 && failCount > 0 {
 		p.log.Error("setup 失败: 所有 %d 个站点部署均失败", failCount)
 		fmt.Fprintln(os.Stderr, "\n一键部署失败! 所有站点部署均失败")
-		os.Exit(1)
+		exitSetup(1)
 	}
 
 	p.log.Info("setup 部署完成: 成功=%d, 失败=%d", successCount, failCount)

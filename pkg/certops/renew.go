@@ -853,8 +853,7 @@ func (s *Service) matchingActiveKey(ctx context.Context, cert *config.CertConfig
 	if err != nil {
 		return "", false
 	}
-	privateKey := string(keyData)
-	clear(keyData)
+	privateKey := consumePrivateKey(keyData)
 	if err := validator.New("").ValidateCertKeyPair(certData.Cert, privateKey); err != nil {
 		return "", false
 	}
@@ -1874,8 +1873,7 @@ func CommitPendingKeyIfMatches(workDir string, cert *config.CertConfig, deployed
 				continue
 			}
 			current, readErr := ReadBindingPrivateKey(ctx, binding)
-			matches := readErr == nil && string(current) == deployedKey
-			clear(current)
+			matches := matchPrivateKeyAndClear(current, deployedKey) && readErr == nil
 			if matches {
 				if err := cleanupPendingKey(workDir, cert.CertName); err != nil && log != nil {
 					log.Warn("清理 pending 私钥失败: %v", err)

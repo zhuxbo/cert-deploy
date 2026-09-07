@@ -229,7 +229,7 @@ func runBatch(p *setupParams, query string) {
 		if len(needKeyNames) > 0 {
 			fmt.Fprintf(os.Stderr, "  需要私钥的证书: %s\n", strings.Join(needKeyNames, ", "))
 		}
-		os.Exit(1)
+		exitSetup(1)
 	}
 
 	// 6/7: 保存配置

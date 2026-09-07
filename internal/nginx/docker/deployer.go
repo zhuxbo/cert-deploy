@@ -310,12 +310,14 @@ func validateContainerPath(path string) error {
 	return nil
 }
 
+var backupFileStat = os.Stat
+
 func readBackupFile(filePath string) (ContainerFile, error) {
 	data, err := util.SafeReadFile(filePath, 10<<20)
 	if err != nil {
 		return ContainerFile{}, err
 	}
-	info, err := os.Stat(filePath)
+	info, err := backupFileStat(filePath)
 	if err != nil {
 		return ContainerFile{}, err
 	}

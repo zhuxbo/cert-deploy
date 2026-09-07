@@ -7,3 +7,5 @@
 ./pkg/fetcher	pkg/fetcher/api.go:isRetryable:CONDITIONALS_BOUNDARY#1
 ./pkg/certops	pkg/certops/renew.go:(*Service).tryUpdateRenewBeforeDays:CONDITIONALS_BOUNDARY#1
 ./pkg/certops	pkg/certops/renew.go:(*Service).tryUpdateRenewBeforeDays:CONDITIONALS_NEGATION#1
+./internal/nginx/docker	internal/nginx/docker/files.go:NewRunningClient:REMOVE_LOGICAL_NOT#2
+./pkg/config	pkg/config/config.go:IsDockerCopyBinding:RETURN_FALSE#1

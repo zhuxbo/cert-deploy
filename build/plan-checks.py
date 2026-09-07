@@ -29,6 +29,7 @@ SHARED_CONTRACT_FILES = {
 MUTATION_INFRA_FILES = {
     "Makefile",
     "build/mutation-canaries.txt",
+    "build/mutation-equivalents.json",
     "build/plan-checks.py",
     "build/run-changed-checks.sh",
     "build/run-mutation.sh",

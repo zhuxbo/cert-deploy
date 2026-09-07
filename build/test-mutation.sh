@@ -49,6 +49,12 @@ if [[ "${1:-}" == env && "${2:-}" == GOMODCACHE ]]; then
     printf '%s\n' "$MUTATION_TEST_GOMODCACHE"
     exit 0
 fi
+if [[ "${1:-}" == list && "${2:-}" == -f && "${3:-}" == '{{.ImportPath}}' ]]; then
+    [[ "${MUTATION_TEST_LIST_FAIL:-0}" == 0 ]] || exit 1
+    [[ "${MUTATION_TEST_LIST_EMPTY:-0}" == 0 ]] || exit 0
+    printf '%s\n' example.test/fixture example.test/fixture/sub
+    exit 0
+fi
 exit 99
 EOF
 cat >"$fixture/bin/gomutants" <<'EOF'
@@ -77,7 +83,8 @@ for arg in "${args[@]}"; do
         echo "gomutants flag 出现在 package 之后: $arg" >&2
         exit 88
     fi
-    [[ "$arg" == ./* ]] && seen_target=1
+    [[ "$arg" != ./* ]] || { echo "gomutants 收到相对包路径: $arg" >&2; exit 89; }
+    [[ "$arg" == example.test/* ]] && seen_target=1
 done
 for ((i=0; i<${#args[@]}; i++)); do
     case "${args[$i]}" in
@@ -94,7 +101,7 @@ status="${MUTATION_TEST_STATUS:-KILLED}"
         printf '{"files":[],"mutants_total":0,"mutants_suppressed":%s,"mutants_suppressed_by_calls":%s}\n' \
             "$suppressed" "$suppressed_by_calls" >"$report"
     else
-        printf '{"files":[{"mutations":[{"id":"test-id","status":"%s"}]}],"mutants_suppressed":%s,"mutants_suppressed_by_calls":%s}\n' \
+        printf '{"files":[{"mutations":[{"id":"value.go:Value:INVERT_LOOP_CTRL#1","original":"break","replacement":"continue","status":"%s"}]}],"mutants_suppressed":%s,"mutants_suppressed_by_calls":%s}\n' \
             "$status" "$suppressed" "$suppressed_by_calls" >"$report"
 fi
 printf '{"updated":true}\n' >"$cache"
@@ -134,6 +141,21 @@ grep -Fq '"updated":true' "$fixture/repo/build/.gomutants-cache.json" || fail "�
 for option in --changed-since HEAD --workers=2 --detect-equivalent --threshold-efficacy=100 --threshold-mcover=100; do
     grep -Fxq -- "$option" "$fixture/args-record" || fail "changed-line 缺少参数: $option"
 done
+for target in example.test/fixture example.test/fixture/sub; do
+    grep -Fxq -- "$target" "$fixture/args-record" || fail "遗漏解析后的包: $target"
+done
+
+fixture="$(make_fixture list-failed)"
+if MUTATION_TEST_LIST_FAIL=1 run_fixture "$fixture" changed-lines --base HEAD ./... >"$fixture/output" 2>&1; then
+    fail "包解析失败被错误接受"
+fi
+[[ ! -f "$fixture/args-record" ]] || fail "包解析失败后仍调用 gomutants"
+
+fixture="$(make_fixture list-empty)"
+if MUTATION_TEST_LIST_EMPTY=1 run_fixture "$fixture" changed-lines --base HEAD ./... >"$fixture/output" 2>&1; then
+    fail "空包集合被错误接受"
+fi
+[[ ! -f "$fixture/args-record" ]] || fail "空包集合后仍调用 gomutants"
 
 fixture="$(make_fixture no-mutants)"
 MUTATION_TEST_STATUS=EMPTY run_fixture "$fixture" changed-lines --base HEAD ./... >"$fixture/output"
@@ -174,6 +196,56 @@ if MUTATION_TEST_STATUS=LIVED run_fixture "$fixture" changed-lines --base HEAD .
     fail "LIVED 状态被错误接受"
 fi
 grep -Fq '不允许状态: LIVED' "$fixture/output" || fail "LIVED 失败原因不明确"
+
+make_equivalent() {
+    python3 - "$1/repo" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import sys
+root = Path(sys.argv[1])
+entry = {"id": "value.go:Value:INVERT_LOOP_CTRL#1", "original": "break", "replacement": "continue",
+         "sources": {"value.go": hashlib.sha256((root / "value.go").read_bytes()).hexdigest()},
+         "reason": "契约测试的等价证明占位，仅验证严格匹配和失效机制。"}
+(root / "build/mutation-equivalents.json").write_text(json.dumps({"version": 1, "equivalents": [entry]}))
+PY
+}
+
+fixture="$(make_fixture equivalent)"
+make_equivalent "$fixture"
+MUTATION_TEST_STATUS=LIVED MUTATION_TEST_EXIT=10 run_fixture "$fixture" changed-lines --base HEAD ./... >"$fixture/output"
+grep -Fq 'approved-equivalent value.go:Value:INVERT_LOOP_CTRL#1' "$fixture/output" || fail "等价证明未记录"
+grep -Fq '"status":"LIVED"' "$fixture/reports/changed-lines.json" || fail "原始报告被改写"
+
+for failure in stale mismatch duplicate missing-proof uncovered timed-out infrastructure canary; do
+    fixture="$(make_fixture "equivalent-$failure")"
+    make_equivalent "$fixture"
+    status=LIVED
+    exit_code=10
+    mode=changed-lines
+    case "$failure" in
+        stale) printf '\n// changed\n' >>"$fixture/repo/value.go" ;;
+        mismatch) sed -i.bak 's/"break"/"return"/' "$fixture/repo/build/mutation-equivalents.json" ;;
+        duplicate) python3 - "$fixture/repo/build/mutation-equivalents.json" <<'PY'
+import json, sys
+path = sys.argv[1]
+data = json.load(open(path))
+data["equivalents"] *= 2
+open(path, "w").write(json.dumps(data))
+PY
+        ;;
+        missing-proof) sed -i.bak 's/"sources": {[^}]*}/"sources": {}/' "$fixture/repo/build/mutation-equivalents.json" ;;
+        uncovered) status='NOT COVERED' ;;
+        timed-out) status='TIMED OUT' ;;
+        infrastructure) exit_code=124 ;;
+        canary) mode=canaries ;;
+    esac
+    args=("$mode")
+    [[ "$mode" != changed-lines ]] || args+=(--base HEAD)
+    if MUTATION_TEST_STATUS="$status" MUTATION_TEST_EXIT="$exit_code" run_fixture "$fixture" "${args[@]}" ./... >"$fixture/output" 2>&1; then
+        fail "等价清单错误放行: $failure"
+    fi
+done
 
 fixture="$(make_fixture non-ram)"
 if MUTATION_TEST_FS_TYPE=ext4 run_fixture "$fixture" changed-lines --base HEAD ./... >"$fixture/output" 2>&1; then

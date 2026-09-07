@@ -753,6 +753,13 @@ var isTerminalFunc = func() bool {
 	return fi.Mode()&os.ModeCharDevice != 0
 }
 
+// 回滚入口的系统边界独立保留，测试可使用临时配置并观察退出状态。
+var (
+	rollbackCheckRoot        = util.CheckRootPrivilege
+	rollbackNewConfigManager = config.NewConfigManager
+	rollbackExit             = os.Exit
+)
+
 // runRollback 回滚命令
 func runRollback(args []string) {
 	fs := flag.NewFlagSet("rollback", flag.ExitOnError)
@@ -771,18 +778,18 @@ func runRollback(args []string) {
 
 	if *siteName == "" {
 		fs.Usage()
-		os.Exit(1)
+		rollbackExit(1)
 	}
 
-	if err := util.CheckRootPrivilege(); err != nil {
+	if err := rollbackCheckRoot(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		rollbackExit(1)
 	}
 
-	cfgManager, err := config.NewConfigManager()
+	cfgManager, err := rollbackNewConfigManager()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "初始化配置失败: %v\n", err)
-		os.Exit(1)
+		rollbackExit(1)
 	}
 
 	backupMgr := backup.NewManager(cfgManager.GetBackupDir(), 5)
@@ -792,7 +799,7 @@ func runRollback(args []string) {
 		backups, err := backupMgr.ListBackups(*siteName)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "获取备份列表失败: %v\n", err)
-			os.Exit(1)
+			rollbackExit(1)
 		}
 		if len(backups) == 0 {
 			fmt.Printf("站点 %s 没有备份记录\n", *siteName)
@@ -820,7 +827,7 @@ func runRollback(args []string) {
 		fmt.Fprintf(os.Stderr, "警告: %v，继续执行\n", lockErr)
 	} else if !acquired {
 		fmt.Fprintln(os.Stderr, "守护进程正在续签（或另一部署进程正在运行），请稍后再试")
-		os.Exit(1)
+		rollbackExit(1)
 	} else {
 		defer release()
 	}
@@ -831,12 +838,12 @@ func runRollback(args []string) {
 	backupPath, err := backupMgr.ResolveBackupPath(*siteName, *versionTS)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "回滚失败: %v\n", err)
-		os.Exit(1)
+		rollbackExit(1)
 	}
 	metadata, err := backupMgr.LoadMetadata(backupPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "读取备份失败: %v\n", err)
-		os.Exit(1)
+		rollbackExit(1)
 	}
 	parsedCert, parseErr := parseRollbackCert(filepath.Join(backupPath, "cert.pem"))
 	if metadata.ContainerName != "" {
@@ -846,7 +853,7 @@ func runRollback(args []string) {
 	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "回滚失败: %v\n", err)
-		os.Exit(1)
+		rollbackExit(1)
 	}
 
 	if parseErr != nil {

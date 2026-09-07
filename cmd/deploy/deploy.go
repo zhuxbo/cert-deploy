@@ -199,7 +199,7 @@ func fetchAndDeployCert(ctx context.Context, cfgManager *config.ConfigManager, c
 
 	// 获取私钥：优先使用 API 返回，否则从本地读取（pending 感知，配对校验；
 	// 续签部署全失败后 pending 私钥尚未转正，手动 deploy 须能用它补救）
-	privateKey, err := certops.GetPrivateKeyForCert(cfgManager.GetWorkDir(), cert, certData.Cert, certData.PrivateKey, log)
+	privateKey, err := certops.GetPrivateKeyForCert(ctx, cfgManager.GetWorkDir(), cert, certData.Cert, certData.PrivateKey, log)
 	if err != nil {
 		return err
 	}
@@ -343,7 +343,10 @@ func applyDeployRenewBeforeDays(cm *config.ConfigManager, log *logger.Logger, va
 
 // deployToBinding 部署到绑定（带备份和回滚）
 func deployToBinding(ctx context.Context, binding *config.SiteBinding, certData *fetcher.CertData, privateKey string, backupMgr *backup.Manager, log *logger.Logger) error {
-	// Docker 站点：校验可安全部署（挂载卷模式 + 容器重载命令），否则如实报错而非静默成功
+	if config.IsDockerCopyBinding(binding) {
+		return certops.DeployDockerCopy(ctx, binding, certData, privateKey, backupMgr, log)
+	}
+	// volume 绑定校验宿主机路径与容器重载命令；copy 已在上方分流。
 	if config.IsDockerType(binding.ServerType) {
 		if err := config.ValidateDockerBinding(binding); err != nil {
 			return err
@@ -495,6 +498,9 @@ func findSiteForBinding(cfgManager *config.ConfigManager, siteName string) (*con
 // installSSLForSite 为未启用 SSL 的站点安装 HTTPS 配置
 // 需要先写入证书文件，否则 nginx -t / apachectl -t 会失败
 func installSSLForSite(ctx context.Context, site *config.ScannedSite, binding *config.SiteBinding, cfgManager *config.ConfigManager, cert *config.CertConfig, f *fetcher.Fetcher) error {
+	if config.IsDockerCopyBinding(binding) {
+		return fmt.Errorf("容器 copy 仅支持已有 HTTPS 配置的站点")
+	}
 	// 获取证书数据
 	api := cert.GetAPI(nil)
 	if api.URL == "" || api.Token == "" {
@@ -510,7 +516,7 @@ func installSSLForSite(ctx context.Context, site *config.ScannedSite, binding *c
 	}
 
 	// 获取私钥（pending 感知，配对校验）
-	privateKey, err := certops.GetPrivateKeyForCert(cfgManager.GetWorkDir(), cert, certData.Cert, certData.PrivateKey, nil)
+	privateKey, err := certops.GetPrivateKeyForCert(ctx, cfgManager.GetWorkDir(), cert, certData.Cert, certData.PrivateKey, nil)
 	if err != nil {
 		return err
 	}
@@ -800,10 +806,10 @@ func buildBindingFromScanResult(site *config.ScannedSite, cfgManager *config.Con
 	// 确定证书路径
 	certPath := site.CertificatePath
 	keyPath := site.PrivateKeyPath
-	if site.HostCertPath != "" {
+	if site.VolumeMode && site.HostCertPath != "" {
 		certPath = site.HostCertPath
 	}
-	if site.HostKeyPath != "" {
+	if site.VolumeMode && site.HostKeyPath != "" {
 		keyPath = site.HostKeyPath
 	}
 

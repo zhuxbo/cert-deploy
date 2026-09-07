@@ -147,7 +147,7 @@ CI 覆盖 linux/amd64、linux/arm64、windows/amd64 三平台交叉编译验证�
 
 开发与发布的权威入口：项目规则见 `AGENTS.md`，任务路由见 `skills/SKILL.md`；构建/签名契约见 `skills/build-release.md`，远程发布与中断恢复见 `skills/remote-release.md`，完整完成检查见 `skills/finish-check.md`。脚本参数速查见 `build/README.md`。发布规则不在 README 中重复维护。
 
-支持自动检测 Docker 容器 Nginx；统一 setup/deploy/续签自动链当前只支持可验证宿主机路径的挂载卷模式。
+支持自动检测 Docker 容器 Nginx；setup/deploy/续签支持宿主机挂载卷和已有 HTTPS 站点的 copy 模式。
 
 ## Debug 模式
 
@@ -310,6 +310,8 @@ sslctl status
 
 ## Docker 支持
 
+Nginx 容器扫描直接按已发现的容器 ID 执行 `docker exec`，包括由 Compose 创建的容器，无需安装独立的 `docker-compose` 命令，也不依赖原始 Compose 文件。
+
 ```bash
 sslctl scan              # 自动检测本地或 Docker
 sslctl deploy --cert <cert_name> --site example.com  # 根据配置选择部署方式
@@ -337,16 +339,17 @@ Docker 站点绑定由通用路径、重载命令和 `docker` 字段共同描述
 }
 ```
 
-配置结构允许记录 `volume`（挂载卷）或 `copy`（docker cp）；当前 setup/deploy/续签统一自动部署链只接受可验证宿主机路径的 `volume` 绑定。
+配置支持 `volume`（写入已验证的宿主机挂载路径）和 `copy`（通过 Docker 在容器内读写）。扫描优先选择可映射宿主机路径的 `volume`；Nginx 证书未挂载到宿主机或使用命名卷时，可使用 `copy`。
+
+`copy` 模式的 `paths.certificate` 和 `paths.private_key` 必须是容器内已有证书、私钥的绝对路径；部署时持久备份原文件，两份新文件暂存成功后替换，再执行容器内 `nginx -t` 和 `nginx -s reload`。失败会恢复旧文件并重新检查、重载。API 不返回私钥时，从容器读取现有私钥；本地 CSR 续签也支持 pending 私钥。`sslctl rollback --site <站点>` 可以恢复容器备份。
+
+第一阶段仅支持已有 HTTPS 配置的 Nginx，要求容器具有 `sh`、`stat`、`head`、`mktemp` 等标准工具，并允许通过 Docker 以 root 执行文件操作。证书文件及父目录不能是符号链接；只读、单文件和 tmpfs 挂载不支持 copy。暂不支持 Apache copy、新建容器 HTTPS 配置或容器内文件验证，请使用 DNS 委托验证。
+
+容器可写层中的证书会随容器删除而消失；重建容器后需恢复原 HTTPS 文件布局并重新部署。命名卷中的文件可随卷保留，sslctl 不自动修复容器重建。
 
 ### 存量 Docker 绑定升级说明
 
-自动部署链（setup/deploy/续签）现在对 Docker 站点执行部署前校验：要求证书目录挂载为宿主机卷（`volume` 模式）且具备容器化重载命令（`docker exec <容器> nginx -s reload` 等）。不满足的绑定会**如实报失败**，而不再像旧版本那样静默写错位置并误报成功。
-
-由旧版本 setup 创建的存量 Docker 绑定（copy 模式、或缺少容器重载命令）升级后会持续报部署失败，属预期行为。处理方式：
-
-- 重新执行 `sslctl setup` 让扫描器补齐容器命令与宿主机挂载路径校验；
-- 证书目录未挂载为卷的容器，需调整容器挂载后重跑 setup（copy 模式暂不支持自动部署链）。
+重新执行 `sslctl setup` 可补齐容器名称、部署模式和容器内检查/重载命令。旧配置中若 copy 路径曾被写成宿主机路径，应重新扫描；缺少容器信息或命令的绑定会明确失败。
 
 已知项：Apache 容器内若仅有 `httpd`/`apache2ctl` 而无 `apachectl`，容器重载会明确报错（不会误报成功），容器内命令自动探测待后续版本支持。
 

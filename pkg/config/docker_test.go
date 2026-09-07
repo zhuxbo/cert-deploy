@@ -86,3 +86,33 @@ func TestValidateDockerBinding(t *testing.T) {
 		t.Errorf("挂载卷 + 重载命令 + 宿主机路径齐全的 Docker 绑定应放行: %v", err)
 	}
 }
+
+func TestValidateDockerBinding_CopyNginxRequiresExistingTLSPaths(t *testing.T) {
+	for _, tc := range []struct {
+		name, serverType, container, certPath, keyPath string
+		wantError                                      bool
+	}{
+		{"nginx", ServerTypeDockerNginx, "web", "/etc/nginx/ssl/cert.pem", "/etc/nginx/ssl/key.pem", false},
+		{"apache remains unsupported", ServerTypeDockerApache, "web", "/ssl/cert.pem", "/ssl/key.pem", true},
+		{"missing certificate", ServerTypeDockerNginx, "web", "", "/ssl/key.pem", true},
+		{"missing private key", ServerTypeDockerNginx, "web", "/ssl/cert.pem", "", true},
+		{"relative path", ServerTypeDockerNginx, "web", "ssl/cert.pem", "/ssl/key.pem", true},
+		{"same file", ServerTypeDockerNginx, "web", "/ssl/key.pem", "/ssl/key.pem", true},
+		{"invalid container", ServerTypeDockerNginx, "web;id", "/ssl/cert.pem", "/ssl/key.pem", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			binding := &SiteBinding{
+				ServerType: tc.serverType,
+				Docker:     &DockerInfo{ContainerName: tc.container, DeployMode: "copy"},
+				Paths:      BindingPaths{Certificate: tc.certPath, PrivateKey: tc.keyPath},
+				Reload: ReloadConfig{
+					TestCommand:   "docker exec web nginx -t",
+					ReloadCommand: "docker exec web nginx -s reload",
+				},
+			}
+			if err := ValidateDockerBinding(binding); (err != nil) != tc.wantError {
+				t.Fatalf("ValidateDockerBinding() = %v, wantError = %v", err, tc.wantError)
+			}
+		})
+	}
+}

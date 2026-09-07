@@ -42,12 +42,13 @@ func computeFileHash(path string) (string, error) {
 
 // Metadata 备份元数据
 type Metadata struct {
-	ServerName string    `json:"server_name"`
-	BackupAt   time.Time `json:"backup_at"`
-	CertInfo   CertInfo  `json:"cert_info"`
-	CertPath   string    `json:"cert_path"`
-	KeyPath    string    `json:"key_path"`
-	ChainPath  string    `json:"chain_path,omitempty"`
+	ServerName    string    `json:"server_name"`
+	ContainerName string    `json:"container_name,omitempty"`
+	BackupAt      time.Time `json:"backup_at"`
+	CertInfo      CertInfo  `json:"cert_info"`
+	CertPath      string    `json:"cert_path"`
+	KeyPath       string    `json:"key_path"`
+	ChainPath     string    `json:"chain_path,omitempty"`
 }
 
 // CertInfo 证书信息
@@ -85,16 +86,37 @@ func NewManager(backupDir string, keepVersions int) *Manager {
 // chainPath 可选，用于 Apache 备份证书链文件
 // 使用文件内容哈希进行 TOCTOU 保护，比时间戳更可靠
 func (m *Manager) Backup(siteName, certPath, keyPath string, certInfo *CertInfo, chainPath ...string) (*BackupResult, error) {
-	return m.backupInternal(siteName, certPath, keyPath, certInfo, true, chainPath...)
+	return m.backupInternal(siteName, certPath, keyPath, certInfo, true, nil, chainPath...)
+}
+
+// BackupContainer 从受保护的本地快照保存容器备份，元数据保留容器身份和容器内路径。
+func (m *Manager) BackupContainer(siteName, containerName, certPath, keyPath, localCert, localKey string) (*BackupResult, error) {
+	result, err := m.backupInternal(siteName, localCert, localKey, nil, true, &Metadata{
+		ContainerName: containerName, CertPath: certPath, KeyPath: keyPath,
+	})
+	if err != nil {
+		return nil, err
+	}
+	// CopyFile 创建文件会受 umask 影响；容器回滚必须保留原文件权限。
+	for name, source := range map[string]string{"cert.pem": localCert, "key.pem": localKey} {
+		info, err := os.Stat(source)
+		if err != nil {
+			return nil, err
+		}
+		if err := os.Chmod(filepath.Join(result.BackupPath, name), info.Mode().Perm()); err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
 }
 
 // backupWithoutCleanup 备份但不清理旧版本（Restore 内部使用，防止清理掉正在恢复的目标备份）
 func (m *Manager) backupWithoutCleanup(siteName, certPath, keyPath string, certInfo *CertInfo, chainPath ...string) (*BackupResult, error) {
-	return m.backupInternal(siteName, certPath, keyPath, certInfo, false, chainPath...)
+	return m.backupInternal(siteName, certPath, keyPath, certInfo, false, nil, chainPath...)
 }
 
 // backupInternal 备份核心实现
-func (m *Manager) backupInternal(siteName, certPath, keyPath string, certInfo *CertInfo, doCleanup bool, chainPath ...string) (*BackupResult, error) {
+func (m *Manager) backupInternal(siteName, certPath, keyPath string, certInfo *CertInfo, doCleanup bool, target *Metadata, chainPath ...string) (*BackupResult, error) {
 	// 0. 计算源文件哈希（用于检测并发修改，比时间戳更可靠）
 	certHash, err := computeFileHash(certPath)
 	if err != nil {
@@ -107,6 +129,9 @@ func (m *Manager) backupInternal(siteName, certPath, keyPath string, certInfo *C
 
 	// 1. 创建备份目录
 	timestamp := time.Now().Format("20060102-150405")
+	if target != nil {
+		timestamp = time.Now().Format("20060102-150405.000000000")
+	}
 	backupPath := filepath.Join(m.backupDir, siteName, timestamp)
 
 	// 备份目录包含私钥文件，使用 0700 更安全
@@ -184,6 +209,12 @@ func (m *Manager) backupInternal(siteName, certPath, keyPath string, certInfo *C
 		CertPath:   certPath,
 		KeyPath:    keyPath,
 		ChainPath:  actualChainPath,
+	}
+
+	if target != nil {
+		metadata.ContainerName = target.ContainerName
+		metadata.CertPath = target.CertPath
+		metadata.KeyPath = target.KeyPath
 	}
 
 	if certInfo != nil {
@@ -312,10 +343,8 @@ func (m *Manager) saveMetadata(path string, metadata *Metadata) error {
 	return os.WriteFile(path, data, 0600)
 }
 
-// Restore 从备份恢复证书文件
-// timestamp 可选，为空时恢复最新备份
-// 恢复前自动备份当前文件
-func (m *Manager) Restore(siteName string, timestamp ...string) (*Metadata, error) {
+// ResolveBackupPath 安全解析指定版本或最新备份，供宿主机与容器恢复共用。
+func (m *Manager) ResolveBackupPath(siteName string, timestamp ...string) (string, error) {
 	var backupPath string
 	var err error
 
@@ -323,22 +352,38 @@ func (m *Manager) Restore(siteName string, timestamp ...string) (*Metadata, erro
 		var joinErr error
 		backupPath, joinErr = util.JoinUnderDir(m.backupDir, filepath.Join(siteName, timestamp[0]))
 		if joinErr != nil {
-			return nil, fmt.Errorf("invalid backup path: %w", joinErr)
+			return "", fmt.Errorf("invalid backup path: %w", joinErr)
 		}
 		if _, statErr := os.Stat(backupPath); os.IsNotExist(statErr) {
-			return nil, fmt.Errorf("备份不存在: %s/%s", siteName, timestamp[0])
+			return "", fmt.Errorf("备份不存在: %s/%s", siteName, timestamp[0])
 		}
 	} else {
 		backupPath, err = m.GetLatestBackup(siteName)
 		if err != nil {
-			return nil, fmt.Errorf("获取最新备份失败: %w", err)
+			return "", fmt.Errorf("获取最新备份失败: %w", err)
 		}
+	}
+
+	return backupPath, nil
+}
+
+// Restore 从备份恢复证书文件
+// timestamp 可选，为空时恢复最新备份
+// 恢复前自动备份当前文件
+func (m *Manager) Restore(siteName string, timestamp ...string) (*Metadata, error) {
+	backupPath, err := m.ResolveBackupPath(siteName, timestamp...)
+	if err != nil {
+		return nil, err
 	}
 
 	// 加载备份元数据
 	metadata, err := m.LoadMetadata(backupPath)
 	if err != nil {
 		return nil, fmt.Errorf("加载备份元数据失败: %w", err)
+	}
+
+	if metadata.ContainerName != "" {
+		return nil, fmt.Errorf("容器备份必须通过 Docker 恢复，拒绝写入宿主机同名路径")
 	}
 
 	// 获取备份文件路径

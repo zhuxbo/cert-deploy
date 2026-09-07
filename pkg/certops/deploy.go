@@ -48,7 +48,7 @@ func (s *Service) DeployOne(ctx context.Context, certName string) (*DeployResult
 	}
 
 	// 获取私钥：优先使用 API 返回，否则从本地读取（pending 感知，配对校验）
-	privateKey, err := GetPrivateKeyForCert(s.cfgManager.GetWorkDir(), cert, certData.Cert, certData.PrivateKey, s.log)
+	privateKey, err := GetPrivateKeyForCert(ctx, s.cfgManager.GetWorkDir(), cert, certData.Cert, certData.PrivateKey, s.log)
 	if err != nil {
 		return nil, err
 	}
@@ -155,7 +155,10 @@ func (s *Service) DeployToBinding(ctx context.Context, binding *config.SiteBindi
 
 // deployToBinding 部署证书到绑定（带备份和回滚）
 func (s *Service) deployToBinding(ctx context.Context, binding *config.SiteBinding, certData *fetcher.CertData, privateKey string) error {
-	// Docker 站点：校验可安全部署（挂载卷模式 + 容器重载命令），否则如实报错而非静默成功
+	if config.IsDockerCopyBinding(binding) {
+		return DeployDockerCopy(ctx, binding, certData, privateKey, s.backupMgr, s.log)
+	}
+	// volume 绑定校验宿主机路径与容器重载命令；copy 已在上方分流。
 	if config.IsDockerType(binding.ServerType) {
 		if err := config.ValidateDockerBinding(binding); err != nil {
 			return errors.NewStructuredDeployError(errors.DeployErrorConfig, errors.PhaseWriteCert, err.Error(), nil)

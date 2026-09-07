@@ -391,6 +391,13 @@ func runSingle(p *setupParams, orderID int) {
 
 	// 校验验证方式与域名兼容性（在部署前检查，避免部署后配置保存失败导致状态不一致）
 	if useFileValidation {
+		for i := range bindings {
+			if config.IsDockerCopyBinding(&bindings[i]) {
+				fmt.Fprintln(os.Stderr, "Docker copy 暂不支持文件验证，请使用 DNS 委托验证")
+				os.Exit(1)
+			}
+		}
+
 		for _, domain := range certDomains {
 			if errMsg := config.ValidateValidationMethod(domain, config.ValidationMethodFile); errMsg != "" {
 				fmt.Fprintf(os.Stderr, "域名 %s: %s\n", domain, errMsg)
@@ -473,6 +480,12 @@ func runSingle(p *setupParams, orderID int) {
 			}
 		}
 		if binding == nil || !binding.Enabled {
+			continue
+		}
+
+		if config.IsDockerCopyBinding(binding) {
+			fmt.Fprintf(os.Stderr, "    %s: Docker copy 仅支持已有 HTTPS 配置的站点\n", site.ServerName)
+			binding.Enabled = false
 			continue
 		}
 
@@ -786,7 +799,7 @@ func createBinding(site *matcher.ScannedSiteInfo, cm *config.ConfigManager) conf
 	keyPath := site.KeyPath
 
 	// Docker 站点：证书写入宿主机侧挂载路径（容器内路径不能直接写）
-	if isDocker {
+	if isDocker && site.VolumeMode {
 		if site.HostCertPath != "" {
 			certPath = site.HostCertPath
 		}
@@ -1034,16 +1047,16 @@ func getAndValidatePrivateKey(keyFile string, bindings []config.SiteBinding, cer
 		defaultKeyPath = bindings[0].Paths.PrivateKey
 	}
 
-	// 3. 默认路径存在则读取验证
-	if defaultKeyPath != "" {
-		if _, err := os.Stat(defaultKeyPath); err == nil {
-			fmt.Printf("  本地私钥: %s\n", defaultKeyPath)
-			privateKey, err := readAndValidateKeyFile(defaultKeyPath, certData.Cert, v)
-			if err != nil {
-				fmt.Printf("  ⚠ 本地私钥不可用: %v\n", err)
-			} else {
-				return privateKey, nil
-			}
+	// 3. 从绑定的实际位置读取默认私钥（包含 Docker copy）。
+	if key, err := certops.GetPrivateKey(context.Background(), &config.CertConfig{Bindings: bindings}, "", nil); err == nil {
+		if err := v.ValidateCertKeyPair(certData.Cert, key); err == nil {
+			return key, nil
+		}
+	}
+	for i := range bindings {
+		if config.IsDockerCopyBinding(&bindings[i]) {
+			defaultKeyPath = ""
+			break
 		}
 	}
 

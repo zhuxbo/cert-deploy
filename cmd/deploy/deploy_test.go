@@ -709,3 +709,26 @@ func TestDetectServerType(t *testing.T) {
 		})
 	}
 }
+
+func TestBuildBindingDockerPartialMountKeepsContainerPaths(t *testing.T) {
+	cm, err := config.NewConfigManagerWithDir(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	site := &config.ScannedSite{
+		ServerName: "partial.example.com", Source: "docker", ContainerName: "nginx",
+		CertificatePath: "/etc/nginx/ssl/cert.pem", PrivateKeyPath: "/etc/nginx/ssl/key.pem",
+		HostCertPath: "/host/cert.pem", VolumeMode: false,
+	}
+	binding := buildBindingFromScanResult(site, cm)
+	if binding.Paths.Certificate != site.CertificatePath || binding.Paths.PrivateKey != site.PrivateKeyPath || !config.IsDockerCopyBinding(binding) {
+		t.Fatalf("部分挂载的 copy 绑定必须保留两个容器路径: %+v", binding)
+	}
+}
+
+func TestInstallSSLForSiteRejectsCopyBeforeHostWrites(t *testing.T) {
+	binding := &config.SiteBinding{ServerType: config.ServerTypeDockerNginx, Docker: &config.DockerInfo{DeployMode: "copy", ContainerName: "web"}}
+	if err := installSSLForSite(t.Context(), nil, binding, nil, nil, nil); err == nil || !strings.Contains(err.Error(), "已有 HTTPS") {
+		t.Fatalf("新增 HTTPS 必须在文件操作与 API 前拒绝: %v", err)
+	}
+}

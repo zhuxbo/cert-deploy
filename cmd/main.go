@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -827,19 +828,27 @@ func runRollback(args []string) {
 	// 执行回滚
 	fmt.Printf("正在回滚站点 %s...\n", *siteName)
 
-	var metadata *backup.Metadata
-	if *versionTS != "" {
-		metadata, err = backupMgr.Restore(*siteName, *versionTS)
+	backupPath, err := backupMgr.ResolveBackupPath(*siteName, *versionTS)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "回滚失败: %v\n", err)
+		os.Exit(1)
+	}
+	metadata, err := backupMgr.LoadMetadata(backupPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "读取备份失败: %v\n", err)
+		os.Exit(1)
+	}
+	parsedCert, parseErr := parseRollbackCert(filepath.Join(backupPath, "cert.pem"))
+	if metadata.ContainerName != "" {
+		err = certops.RestoreDockerBackup(context.Background(), backupMgr, backupPath, metadata)
 	} else {
-		metadata, err = backupMgr.Restore(*siteName)
+		metadata, err = backupMgr.Restore(*siteName, *versionTS)
 	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "回滚失败: %v\n", err)
 		os.Exit(1)
 	}
 
-	// 更新配置中的证书元数据（非关键路径，失败仅提示）
-	parsedCert, parseErr := parseRollbackCert(metadata.CertPath)
 	if parseErr != nil {
 		fmt.Fprintf(os.Stderr, "警告: %v\n", parseErr)
 	}
@@ -865,6 +874,10 @@ func runRollback(args []string) {
 		fmt.Printf("  证书链: %s\n", metadata.ChainPath)
 	}
 
+	if metadata.ContainerName != "" {
+		fmt.Printf("  容器 %s 已通过配置检查并重载\n", metadata.ContainerName)
+		return
+	}
 	// 提示用户重载 Web 服务器
 	serverType := webserver.DetectWebServerType()
 	if serverType == "nginx" {

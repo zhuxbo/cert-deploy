@@ -169,7 +169,7 @@ func TestCreateBinding_DockerNginx_Volume(t *testing.T) {
 }
 
 // TestCreateBinding_DockerNginx_NoMount 验证无宿主机挂载路径的 Docker 站点为 copy 模式，
-// 部署校验会拒绝（不可通过通用路径安全部署）。
+// 已有 HTTPS 路径可通过容器专用流程部署。
 func TestCreateBinding_DockerNginx_NoMount(t *testing.T) {
 	tmpDir := t.TempDir()
 	cfgManager, _ := config.NewConfigManagerWithDir(tmpDir)
@@ -190,8 +190,8 @@ func TestCreateBinding_DockerNginx_NoMount(t *testing.T) {
 	if binding.Docker == nil || binding.Docker.DeployMode != "copy" {
 		t.Errorf("无挂载卷应为 copy 模式: %+v", binding.Docker)
 	}
-	if err := config.ValidateDockerBinding(&binding); err == nil {
-		t.Error("copy 模式 Docker 绑定应被部署校验拒绝")
+	if err := config.ValidateDockerBinding(&binding); err != nil {
+		t.Errorf("已有 HTTPS 的 copy 绑定应可部署: %v", err)
 	}
 }
 
@@ -906,5 +906,44 @@ func TestPrewriteKeyThenCert_Success(t *testing.T) {
 	}
 	if fi, err := os.Stat(keyPath); err == nil && fi.Mode().Perm() != 0600 {
 		t.Errorf("私钥权限 = %o, want 0600", fi.Mode().Perm())
+	}
+}
+
+func TestCreateBindingDockerPartialMountKeepsContainerPaths(t *testing.T) {
+	cm, err := config.NewConfigManagerWithDir(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	site := &matcher.ScannedSiteInfo{
+		ServerName: "partial.example.com", ServerType: config.ServerTypeDockerNginx,
+		ContainerName: "nginx", HasSSL: true,
+		CertPath: "/etc/nginx/ssl/cert.pem", KeyPath: "/etc/nginx/ssl/key.pem",
+		HostCertPath: "/host/cert.pem", VolumeMode: false,
+	}
+	binding := createBinding(site, cm)
+	if binding.Paths.Certificate != site.CertPath || binding.Paths.PrivateKey != site.KeyPath || !config.IsDockerCopyBinding(&binding) {
+		t.Fatalf("部分挂载的 copy 绑定必须保留两个容器路径: %+v", binding)
+	}
+}
+
+func TestInstallSSLForBatchRejectsCopyBeforeHostWrites(t *testing.T) {
+	dir := t.TempDir()
+	certPath, keyPath := filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem")
+	for _, file := range []string{certPath, keyPath} {
+		if err := os.WriteFile(file, []byte("host-sentinel"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	site := &matcher.ScannedSiteInfo{ServerName: "copy.example.com"}
+	plan := &certDeployPlan{Bindings: []config.SiteBinding{{ServerName: site.ServerName, ServerType: config.ServerTypeDockerNginx, Enabled: true, Docker: &config.DockerInfo{DeployMode: "copy", ContainerName: "web"}, Paths: config.BindingPaths{Certificate: certPath, PrivateKey: keyPath}}}}
+	installSSLForBatch(site, plan, &setupParams{})
+	if plan.Bindings[0].Enabled {
+		t.Fatal("不支持的 HTTP-only copy 绑定应禁用")
+	}
+	for _, file := range []string{certPath, keyPath} {
+		data, err := os.ReadFile(file)
+		if err != nil || string(data) != "host-sentinel" {
+			t.Fatal("禁止向宿主机写入容器证书")
+		}
 	}
 }

@@ -197,12 +197,16 @@ def has_build_constraint(root: Path, path: str) -> bool:
         return False
 
 
-def build_plan(root: Path, base: str | None, force_full: bool) -> dict[str, Any]:
+def build_plan(
+    root: Path, base: str | None, force_full: bool,
+    with_mutation: bool = False, with_e2e: bool = False,
+) -> dict[str, Any]:
     selected_base, base_reasons = determine_base(root, base)
     files = changed_files(root, selected_base)
-    packages, by_import = package_graph(root)
-
     changed_go = [path for path in files if path.endswith(".go")]
+    dependency_changed = any(path in {"go.mod", "go.sum"} for path in files)
+    # 文档与脚本治理不需要 Go 环境，也不应承担依赖图加载成本。
+    packages, by_import = package_graph(root) if changed_go or dependency_changed or force_full else ([], {})
     changed_test_go = [path for path in changed_go if path.endswith("_test.go")]
     changed_prod_go = [path for path in changed_go if not path.endswith("_test.go")]
     direct_packages = {
@@ -224,11 +228,16 @@ def build_plan(root: Path, base: str | None, force_full: bool) -> dict[str, Any]
     }
 
     affected_imports = set(direct_packages)
-    if direct_packages:
+    # 测试文件不会被下游生产包导入；只扩展生产代码的反向依赖。
+    production_imports = {
+        package["import_path"] for path in changed_prod_go
+        if (package := package_for_file(packages, path)) is not None
+    }
+    if production_imports:
         affected_imports.update(
             package["import_path"]
             for package in packages
-            if package["deps"].intersection(direct_packages)
+            if package["deps"].intersection(production_imports)
         )
 
     test_targets = sorted(by_import[item]["target"] for item in affected_imports if item in by_import)
@@ -240,6 +249,12 @@ def build_plan(root: Path, base: str | None, force_full: bool) -> dict[str, Any]
     )
 
     reasons = list(base_reasons)
+    mutation_enabled = force_full or with_mutation
+    if not mutation_enabled:
+        if mutation_targets or canary_targets:
+            reasons.append("日常检查不运行变异；测试有效性风险使用 --with-mutation，CI 仍保留定向变异")
+        mutation_targets = []
+        canary_targets = []
     full_reasons: list[str] = []
     if force_full:
         full_reasons.append("调用方显式要求全量检查")
@@ -252,6 +267,12 @@ def build_plan(root: Path, base: str | None, force_full: bool) -> dict[str, Any]
         full_reasons.append("共享接口或核心配置契约发生变化")
     if len(direct_prod_packages) >= 4 or len(affected_imports) >= 10:
         full_reasons.append("变更影响面超过定向检查阈值")
+    if changed_go and any(package_for_file(packages, path) is None for path in changed_go):
+        full_reasons.append("变更包含当前宿主依赖图无法定位的 Go 包")
+    if ".golangci.yml" in files:
+        full_reasons.append("静态检查配置发生变化")
+        if not packages:
+            packages, by_import = package_graph(root)
 
     mutation_mode = "changed-lines" if mutation_targets else "none"
     if mutation_targets:
@@ -270,39 +291,54 @@ def build_plan(root: Path, base: str | None, force_full: bool) -> dict[str, Any]
     )
 
     shell_files = sorted(path for path in files if path.endswith(".sh") and (root / path).is_file())
+    docker_changed = any(
+        (path.startswith("docker/") and not path.endswith(".md"))
+        or (path.startswith(("internal/nginx/docker/", "internal/apache/docker/"))
+            and path.endswith(".go") and not path.endswith("_test.go"))
+        or path == ".github/workflows/e2e.yml"
+        for path in files
+    )
+    deploy_changed = any(
+        path.endswith(".go") and not path.endswith("_test.go")
+        and any(path.startswith(prefix) for prefix in DEPLOY_E2E_PREFIXES)
+        for path in files
+    )
+    if deploy_changed and not (force_full or with_e2e or docker_changed):
+        reasons.append("部署链局部变更：复核直接调用链；涉及实际写入、重载或回滚语义时补 --with-e2e")
     return {
         "schema_version": 1,
         "root": str(root),
         "base": selected_base,
+        "profile": "full" if force_full else "targeted",
         "changed_files": files,
         "go": {
             "changed": bool(changed_go or any(path in {"go.mod", "go.sum"} for path in files)),
             "test_packages": test_targets,
             "lint_packages": test_targets,
             "build_all": build_all,
+            "coverage": bool(full_reasons),
         },
         "contracts": {
             "shell_files": shell_files,
-            "mutation": any(path in MUTATION_INFRA_FILES for path in files),
-            "agent_config": any(
+            "mutation": force_full or any(path in MUTATION_INFRA_FILES for path in files),
+            "agent_config": force_full or any(
                 path in {"AGENTS.md", "CLAUDE.md", "Makefile", "build/check-agent-config.sh"}
                 or path.startswith("skills/")
                 or path.startswith(".agents/skills/")
+                or path.startswith(".claude/commands/")
                 or path.startswith(".github/workflows/")
                 for path in files
             ),
-            "release": any(
+            "release": force_full or any(
                 path == "deploy-spec.md"
                 or path == "build/test-release.sh"
                 or path == "build/build.sh"
+                or path in {"build/sign-release.sh", "build/generate-keys.sh", "build/release.conf.example"}
+                or (path.startswith("deploy/") and not path.endswith(".md"))
                 or path.startswith("build/release")
                 for path in files
             ),
-            "docker_e2e": any(
-                path.endswith(".go") and not path.endswith("_test.go")
-                and any(path.startswith(prefix) for prefix in DEPLOY_E2E_PREFIXES)
-                for path in files
-            ),
+            "docker_e2e": force_full or with_e2e or docker_changed,
         },
         "mutation": {
             "mode": mutation_mode,
@@ -318,11 +354,13 @@ def main() -> int:
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent.parent)
     parser.add_argument("--base", help="Git 对比基线；默认按 upstream、工作区和 HEAD^ 推导")
     parser.add_argument("--full", action="store_true", help="强制生成全量计划")
+    parser.add_argument("--with-mutation", action="store_true", help="增加按变更定向的变异门禁")
+    parser.add_argument("--with-e2e", action="store_true", help="增加完整 Docker E2E")
     args = parser.parse_args()
 
     root = args.root.resolve()
     try:
-        plan = build_plan(root, args.base, args.full)
+        plan = build_plan(root, args.base, args.full, args.with_mutation, args.with_e2e)
     except RuntimeError as error:
         print(f"生成检查计划失败: {error}", file=sys.stderr)
         return 1

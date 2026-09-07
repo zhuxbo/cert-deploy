@@ -30,7 +30,7 @@ help:
 	@echo "  make clean           清理构建产物"
 	@echo "  make compress        gzip 压缩所有二进制文件"
 	@echo "  make test            运行测试"
-	@echo "  make finish-check    先分析变更，再执行定向/分级完成检查"
+	@echo "  make finish-check    日常定向检查，变异/E2E 按风险增加"
 	@echo "  make finish-check-full 执行发布前全量完成检查"
 	@echo "  make mutation        在临时内存盘运行 changed-line/哨兵变异测试"
 	@echo "  make mutation-test   测试规划、路由与 RAM 隔离契约"

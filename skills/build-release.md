@@ -53,6 +53,8 @@ main 正式发布必须在 `build/release.conf` 配置仓库外的 `BUNDLE_ROOT`
 
 ## 本地检查
 
+以下仅为构建/发布实现变化时的命令参考，适用范围与同任务证据复用统一遵循 `skills/finish-check.md`；不因加载本文重复已通过的门禁。
+
 ```bash
 bash build/check-agent-config.sh
 bash build/test-release.sh

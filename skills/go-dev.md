@@ -1,186 +1,15 @@
 # Go 开发规范
 
-## 项目结构
+只读取与本次修改相关的章节。检查范围和执行入口统一见 `skills/finish-check.md`，本文不追加全仓门禁。
 
-```
-sslctl/
-├── cmd/
-│   ├── main.go           # 统一入口
-│   ├── setup/            # 一键部署命令
-│   ├── daemon/           # 守护进程
-│   └── deploy/           # 证书部署
-├── internal/
-│   ├── nginx/            # Nginx 扫描/部署
-│   ├── apache/           # Apache 扫描/部署
-│   └── executor/         # 统一命令执行器（白名单）
-├── pkg/
-│   ├── certops/          # 证书操作服务层（含私钥管理）
-│   ├── config/           # 配置管理（深拷贝并发安全）
-│   ├── fetcher/          # API 客户端（含 SSRF 防护）
-│   ├── backup/           # 备份管理（原子性检查）
-│   ├── logger/           # 日志模块（敏感信息过滤）
-│   ├── matcher/          # 域名匹配
-│   ├── validator/        # 证书验证
-│   ├── service/          # 系统服务管理
-│   ├── upgrade/          # 升级模块（版本检查/下载/安装）
-│   └── util/             # 工具函数（文件操作/权限检查）
-└── go.mod
-```
+## 项目约定
 
----
+- CLI 入口为 `cmd/`，服务器实现为 `internal/nginx/`、`internal/apache/`，部署编排为 `pkg/certops/`，共享接口为 `pkg/webserver/`。从变更的调用链定位实现，避免泛读全仓。
+- 沿用标准 `testing`、表驱动用例和现有 `testdata/` 辅助；只为需要证明的行为补回归，不为文案或机械改动写镜像测试。
+- Go 版本与依赖以 `go.mod` 为准；仅确实引入依赖时运行 `go mod tidy`。
+- 部署错误使用 `pkg/errors.StructuredDeployError`；回调传输失败只记录日志，不阻断主流程。日志使用 `pkg/logger`，不要输出完整配置或私钥。
 
-## 代码风格
-
-### 包命名
-
-- 小写单词，不使用下划线或驼峰
-- 包名应与目录名一致
-- 避免使用 `common`、`util` 等通用名称
-
-### 错误处理
-
-```go
-// 使用 errors.New 或 fmt.Errorf
-if err != nil {
-    return fmt.Errorf("failed to load config: %w", err)
-}
-
-// 不要忽略错误
-result, _ := doSomething() // 错误
-result, err := doSomething()
-if err != nil {
-    // 处理错误
-}
-```
-
-**结构化部署错误**：部署路径的错误使用 `pkg/errors` 的 `StructuredDeployError`，支持类型分类、阶段定位和可重试判断；API 回调错误仅记录日志，不阻断主流程。
-
-### 日志
-
-```go
-// 使用 pkg/logger
-logger.Info("starting deployment for site: %s", siteName)
-logger.Debug("loaded config: %+v", config)
-logger.Error("failed to reload nginx: %v", err)
-```
-
----
-
-## CLI 架构
-
-### 子命令模式
-
-```go
-// cmd/main.go
-switch cmd {
-case "nginx":
-    nginx.Run(subArgs, version, buildTime, debug)
-case "apache":
-    apache.Run(subArgs, version, buildTime, debug)
-}
-```
-
-### 全局标志
-
-- `--debug`: 启用 debug 模式，输出详细日志
-- `--version`: 显示版本信息
-
-### 子命令标志
-
-每个子命令使用独立的 `flag.FlagSet`：
-
-```go
-func Run(args []string, version, buildTime string, debug bool) {
-    fs := flag.NewFlagSet("nginx", flag.ExitOnError)
-    site := fs.String("site", "", "Site name")
-    fs.Parse(args)
-}
-```
-
----
-
-## 依赖管理
-
-### go.mod
-
-```go
-module github.com/example/sslctl
-
-go 1.21
-
-require (
-    golang.org/x/crypto v0.17.0
-)
-```
-
-### 添加依赖
-
-```bash
-go get github.com/example/package
-go mod tidy
-```
-
----
-
-## 测试
-
-### 单元测试
-
-```go
-// foo_test.go
-func TestFoo(t *testing.T) {
-    result := Foo()
-    if result != expected {
-        t.Errorf("expected %v, got %v", expected, result)
-    }
-}
-```
-
-### 运行测试
-
-```bash
-go test ./...                            # 运行全部测试
-go test -v ./pkg/cert/                   # 运行指定包测试
-go test -cover ./...                     # 显示覆盖率
-go test -coverprofile=coverage.out ./... # 生成覆盖率文件
-go tool cover -func=coverage.out         # 查看各函数覆盖率
-go tool cover -html=coverage.out         # 生成 HTML 报告
-```
-
-### 测试覆盖率
-
-核心包覆盖率（实测基线，`go test -coverprofile` 全量运行）：
-
-| 包             | 覆盖率 |
-|----------------|--------|
-| pkg/errors     | 98.6%  |
-| pkg/matcher    | 93.3%  |
-| pkg/csr        | 91.7%  |
-| pkg/logger     | 86.8%  |
-| pkg/backup     | 85.9%  |
-| pkg/validator  | 85.9%  |
-| pkg/config     | 83.7%  |
-| pkg/fetcher    | 81.8%  |
-| pkg/upgrade    | 79.5%  |
-| pkg/certops    | 78.5%  |
-| pkg/webserver  | 66.4%  |
-| pkg/util       | 55.8%  |
-| pkg/service    | 39.0%  |
-| **整体**       | **53.5%** |
-
-> **整体低于多数核心包属正常**：整体值为 `go tool cover -func` 的全量语句加权，含 `cmd/*`、`internal/deployer` 等低覆盖入口包（CLI 装配层难以单测）。核心业务包普遍在 78%+。internal 侧参考：apache/installer 92.6%、nginx/installer 79.9%、apache/scanner 70.4%、nginx/scanner 59.0%、nginx/docker 51.2%、executor 76.7%。
-
-### 变异测试
-
-覆盖率只说明代码被执行，变异测试用于确认断言能识别行为被破坏。项目固定使用 `gomutants v0.6.0`，默认按 Git 变更执行分钟级门禁：
-
-```bash
-make mutation
-```
-
-必须通过 `build/run-changed-checks.sh` 规划并由 `build/run-mutation.sh` 执行。生产 Go 代码只变异 changed lines；关键包测试变更时执行少量稳定哨兵；混合变更两项都跑。changed-line 的 `LIVED`、`NOT COVERED`、超时和基础设施错误均失败，哨兵必须为 `KILLED`。`--full` 只扩大普通测试、lint 与构建，不升级为全量变异。
-
-真实工作区只作为种子复制一次；gomutants 改写的源码副本、Git 索引、Go build cache、临时文件、运行时 cache 与详细报告都位于一次性 tmpfs/RAM Disk，模块 cache 仅持久复用，小型 gomutants cache 只在结束时写回一次。Linux 默认使用 `/dev/shm`，macOS 使用自动销毁的 3 GiB APFS RAM Disk；不得用普通磁盘目录绕过验证。changed-line 与哨兵共享 20 分钟硬截止时间，默认 2 个 worker；`make mutation-test` 离线验证这些契约。
+## 测试资源
 
 ### 测试目录结构
 
@@ -257,14 +86,7 @@ CGO_ENABLED=0 go build -ldflags="-s -w" -o sslctl ./cmd
 
 `staticcheck` 关闭 `QF*`（quickfix 建议）。测试文件（`_test.go`）已排除 gosec 和 errcheck，`docker/test/mock-api/` 已排除 gosec。
 
-**多平台 lint**：本项目含 Windows 专属源（`//go:build windows`），CI 与本地都需双平台 lint：
-
-```bash
-golangci-lint run --timeout=5m ./...                # Linux 视角
-GOOS=windows golangci-lint run --timeout=5m ./...   # Windows 视角（含 svc/mgr、kernel32 调用）
-```
-
-CI 在 lint job 中按顺序跑 Linux + Windows 两次，任一失败即整个 job 失败。本地提交前应同时跑这两条命令。
+本地使用 finish-check 规划的包集合进行 Linux/Windows lint；CI 保留全仓检查。不要在定向检查后再复制执行全仓命令。
 
 ---
 

@@ -60,6 +60,19 @@ bash build/release.sh --dry-run resume-main 1.2.3 --bundle /tmp/sslctl-v1.2.3
 
 不要脱离 `skills/remote-release.md` 直接运行非 dry-run 发布阶段。正式版 tag 创建后的恢复只允许传入原持久 bundle，`resume-main` 不提供构建选项。tag 前的未完成 prepare 只有在确认版本 tag 和节点正式目录都不存在后，才可显式执行 `abort-main <version> --bundle <原路径>`；该动作删除残留 bundle，但保留 aborted 状态和尝试次数。
 
+## 分级完成检查
+
+`make finish-check` 默认运行相关契约、定向 race 与 Linux/Windows lint。纯文档不加载 Go；仅测试修改只检查所属包。Docker 实现/测试环境变更自动触发完整 E2E，其他部署语义风险按 `skills/finish-check.md` 判断后加 `--with-e2e`。普通小改不自动跑变异。
+
+```bash
+bash build/run-changed-checks.sh --base HEAD --plan-only
+bash build/run-changed-checks.sh --base HEAD --with-mutation  # 断言有效性风险
+bash build/run-changed-checks.sh --base HEAD --with-e2e       # 部署集成风险
+make finish-check-full                                    # 正式发布前完整检查
+```
+
+基线须覆盖本任务全部未验收提交；只有工作区任务才用 HEAD。普通检查的输入未变且已有同任务证据时可以复用，不重复跑。运行器把路由、阶段耗时、退出码保存在忽略的 `.superpowers/finish-check/run.*/`，用于定位瓶颈与改进规则，不自动缓存通过结果。
+
 ## 变异测试
 
 变异框架固定为 `gomutants v0.6.0`。它与项目依赖分离，不写入 `go.mod`；先安装精确版本，再执行按变更规划的入口：
@@ -69,7 +82,7 @@ go install github.com/szhekpisov/gomutants@v0.6.0
 make mutation
 ```
 
-`make mutation` 读取提交、暂存区、工作区和未跟踪文件。生产 Go 代码只变异本次 changed lines，要求每个可执行 mutant 都被测试杀死；关键包测试发生变化时，再独立执行 `mutation-canaries.txt` 中对应的稳定哨兵。生产代码和测试同时变化时两项都跑。`go.mod`、`go.sum` 和 `--full` 只扩大普通测试、lint 与构建范围，不触发全量变异。
+`make mutation` 读取提交、暂存区、工作区和未跟踪文件。生产 Go 代码只变异本次 changed lines，要求每个可执行 mutant 都被测试杀死；关键包测试发生变化时，再独立执行 `mutation-canaries.txt` 中对应的稳定哨兵。生产代码和测试同时变化时两项都跑。`go.mod`、`go.sum` 只扩大普通测试、lint 与构建范围。`--full` 还执行契约与完整 E2E，变异始终按实际变更定向，不触发全量变异。
 
 changed-line 允许不可编译、等价和无可变异点结果；`LIVED`、`NOT COVERED`、超时和基础设施错误均失败。哨兵必须精确命中一个 mutant 且状态为 `KILLED`。两类变异共享一个 20 分钟硬截止时间，默认使用 2 个 worker。
 
@@ -78,7 +91,7 @@ changed-line 允许不可编译、等价和无可变异点结果；`LIVED`、`NO
 常用入口：
 
 ```bash
-make finish-check          # 全部完成检查，自动选择范围
+make finish-check          # 日常定向完成检查，按风险增加重门禁
 make mutation             # 只执行计划内变异门禁
 make mutation-test        # 快速离线契约测试
 ```

@@ -1,5 +1,7 @@
 # 部署运维规范
 
+这是领域参考，按任务读取相关章节：CLI/服务、Manager API、部署链与回调、续签、集成测试。示例命令不表示执行授权；本地验证由 `skills/finish-check.md` 决定，外部写入测试需对应授权。
+
 ## 安装方式
 
 ### 一键安装
@@ -313,7 +315,7 @@ sslctl                    Manager API                    CA
 - **手动 `sslctl deploy` 上报一次部署结果**（deploy-spec §5.1 步骤 6）：CLI 无 deadline，回调显式限定 `certops.CallbackFallbackBudget`（90s）。
 - **回调脱离取消传播**（`certops.callbackContext`）：回调是部署结果的唯一出口，父 ctx 取消（daemon SIGTERM、检查超时）时沿用会让整轮结果凭空消失，因此基于 `context.WithoutCancel` 重建，并按四条分支定预算——已取消 → 90s 兜底（**必须先于余量判断**，`cancel()` 不改变 deadline，此时父预算余量可能仍有几十分钟）；余量 ≤90s → 90s 兜底；余量充裕 → 保留父 deadline；无 deadline → 不设限，由单次请求超时与重试上限兜底。90s ≈ 一次完整 POST + 约 1s 退避 + 被截断的第二次尝试，daemon 60s 关停预算可能将其截断。
 - **`sslctl setup` 上报部署结果**（deploy-spec §5.1 步骤 6）：单证书尝试一次，批量中每个有资格的证书逐一尝试；本轮回调熔断后允许余下结果缺行并在汇总中说明。`success`/`failure` 由该证书是否有失败站点决定。调用位置有硬性要求——必须紧跟部署循环，早于全失败 `os.Exit(1)` 与保存门禁；放到保存阶段会被这两道关卡同时吃掉，而它们拦下的恰是最该上报的那批。三条未发生部署的 `continue`（无绑定、缺私钥、私钥验证失败）不上报，其中"需要私钥"按 deploy-spec §5.3 属区别于"失败"的第三类。
-- **已知偏离**：`retryFailedBindings` 的 `QueryOrder` 失败出口在未发生部署时仍报 failure（查询失败不是部署结果，与 deploy-spec §2.8 不符），本次维持现状不扩大——触顶后停止。
+- **已知偏离**：`retryFailedBindings` 的 `QueryOrder` 失败出口在未发生部署时仍报 failure（查询失败不是部署结果，与 deploy-spec §2.8 不符）；触顶后停止。该现状不是统一契约的例外，涉及此路径时按当前代码核实。
 
 ### 部署链语义（setup/deploy/续签）
 
